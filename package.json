@@ -1,0 +1,25 @@
+{
+  "name": "perimeter-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "可完全私有部署的 code agent 运行时 —— 代码与凭据永不出客户网络边界，浏览器只是零安装的操作面",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "gateway": "node src/gateway/server.ts",
+    "modelgw": "node src/modelgw/server.ts",
+    "gitproxy": "node src/gitproxy/server.ts",
+    "demo": "node scripts/demo.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  }
+}
