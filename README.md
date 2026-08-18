@@ -2,7 +2,7 @@
 
 > 一个可完全私有部署的 code agent 运行时，代码与凭据永不出客户网络边界，浏览器只是零安装的操作面。
 
-本仓库是 [`browser-code-agent-strategy.md`](../browser-code-agent-strategy.md) 里工程部分的实现。Phase 0 的三个技术穿刺各自可跑，其中**穿刺 A（网关 + 策略 + 审批门 + 审计）串成了一条可演示链路**；模型网关与 git 代理是独立进程，**接线由部署侧完成，仓库里没有做这件事的代码**（见「边界与已知缺口」）。商业动作（客户访谈、融资、付费 POC）不在本仓库范围内。
+本仓库是 [`browser-code-agent-strategy.md`](../browser-code-agent-strategy.md) 里工程部分的实现。浏览器 → 网关 → pi → **模型网关** → 上游是一条真实跑通的链路：网关为每个会话生成隔离的 pi HOME，`models.json` 指向模型网关、apiKey 是会话 token，上游凭据只存在于模型网关进程里。git 代理的接线（`insteadOf` 重写）已实现但**未接到 demo 上**，见「边界与已知缺口」。商业动作（客户访谈、融资、付费 POC）不在本仓库范围内。
 
 底层 agent 用 [pi](https://github.com/badlogic/pi-mono)（MIT）的 RPC 模式，走策略文档 §5 的**路线 C**。
 
@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 164 个测试
+npm test          # 172 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -80,9 +80,12 @@ deploy/           K8s 清单
 
 因此「每会话独占沙箱」与「egress 默认 deny」这两条边界目前是**设计承诺，不是运行中的事实**：演示环境里 agent 的 bash 能访问网关宿主机的文件系统与公网。四条铁律里今天在代码中真正成立的只有「凭据不进沙箱」与「工具调用过策略且留痕」。
 
-**组件尚未接线：**
+**接线：模型网关已接，git 代理未接到 demo：**
 
-`ModelGateway` 与 `GitCredentialProxy` 各自可跑、各有测试，但**网关从不实例化或路由到它们**。demo 里 pi 直连 mock provider 的 `models.json`，不经过模型网关；也没有任何代码去写沙箱侧的 git remote 或 credential helper。接线（`models.json` 的 baseUrl 指向模型网关、git remote 指向代理）目前全靠部署侧手工完成。
+网关会为每个会话生成沙箱侧配置（`src/gateway/sandbox-config.ts`）：`models.json` 的 baseUrl 指向模型网关、apiKey 写会话 token；git 的 `insteadOf` 规则把上游 SCM 重写到 git 代理并关掉本地 credential helper。
+
+- **模型网关**：已在 demo 与端到端测试里跑通。测试遍历沙箱能看到的全部文件，断言其中既无上游凭据、也无网关 token，只有代理 token；请求确实经过模型网关（有计量记录）。**三个 token 刻意取不同的值** —— 代理 token 若等于网关 token，agent 读到 models.json 就能连回网关批准自己挂起的审批，网关构造时会拒绝这种配置。
+- **git 代理**：配置生成有测试覆盖，但 demo 没有起 git 代理，也没有真实上游仓库可指 —— 这条链路**未端到端验证**。
 
 **其余未在真实环境验证：**
 
@@ -97,7 +100,7 @@ deploy/           K8s 清单
 **能力边界（不是缺口，是设计上的取舍）：**
 
 - **路径 deny 规则只对带 `path` 参数的工具（write/edit 等）生效。** bash 按命令模式匹配，`echo x > .github/workflows/ci.yml` 在本引擎眼里没有路径。也就是说 `config/policy.yaml` 里那份 deny_paths 清单（CI、IaC、`.pi/**`、`AGENTS.md`、`.git/config`）**对 bash 写文件不成立**，只能靠命令黑名单兜 —— 而黑名单如下一条所述不是安全边界。要让路径规则真正统一，需要 Phase 2 在 FS 层（RemoteExecutionEnv）收口。`tests/redteam.test.ts` 里有一条测试专门断言这个局限。
-- **只读工具豁免路径规则**，因此 `read .env` / `read ~/.aws/credentials` 是放行的，内容会进模型上下文。这是为避免审批疲劳的有意取舍（每次读 `package.json` 都要人批，几轮后操作员就会无脑点同意），缓解手段是模型网关的凭据检测 —— 而它当前不在链路上。
+- **只读工具豁免路径规则**，因此 `read .env` / `read ~/.aws/credentials` 是放行的，内容会进模型上下文。这是为避免审批疲劳的有意取舍（每次读 `package.json` 都要人批，几轮后操作员就会无脑点同意），缓解手段是模型网关的凭据检测，它现已在链路上，但只告警不阻断。
 - **命令黑名单是启发式，不是安全边界。** shell 的求值方式（变量展开、base64、别名、间接调用）注定它可被绕过。设计上的真边界是 egress 默认 deny + 凭据不进沙箱 + 每会话独占沙箱，而其中两条目前尚未运行（见上）。`tests/redteam.test.ts` 里有一条测试**刻意断言黑名单拦不住**。
 - **egress allowlist 即便部署了，也只杀掉「直连任意外部主机」这一类外泄。** 生成的策略必须放通 DNS（否则内部主机名都解析不了），DNS 隧道仍然可行；经模型网关的请求体本身也是一条合法外泄通道（凭据检测是 audit-only，不阻断不改写）。
 - **哈希链防的是意外损坏与粗糙篡改，不防有文件写权限的攻击者** —— 那种攻击者能从头重算整条链，也能截断尾部。要升级为防恶意篡改需要外部锚点（链头是纯元数据，可以出 Data Plane），`AuditLog.verify(path, expectedHead)` 已留入口，上报由部署侧接。安全白皮书里必须同口径表述，不要写成「防篡改」。

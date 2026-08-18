@@ -5,6 +5,7 @@ import { extname, join, normalize, resolve, sep } from "node:path";
 import { type WebSocket, WebSocketServer } from "ws";
 import { AuditLog } from "../audit/log.ts";
 import type { ClientCommand, ClientEvent } from "../protocol/types.ts";
+import type { SandboxWiring } from "./sandbox-config.ts";
 import { Session } from "./session.ts";
 
 export interface GatewayConfig {
@@ -31,6 +32,12 @@ export interface GatewayConfig {
 	maxSessions?: number;
 	/** 每个会话可用的 repo/team。策略作用域必须由服务端决定，不能让客户端自选 */
 	resolveScope?: (actor: string) => { repo: string; team: string };
+	/**
+	 * 沙箱接线：模型网关与 git 代理的地址 + 代理 token。给了就为每个会话
+	 * 生成隔离的 pi HOME，让 agent 只能经这两个代理出网。
+	 * proxyToken 必须与本网关的 token 不同 —— 构造时断言，理由见 SandboxWiring。
+	 */
+	wiring?: SandboxWiring;
 }
 
 const MIME: Record<string, string> = {
@@ -71,6 +78,12 @@ export class Gateway {
 	constructor(cfg: GatewayConfig) {
 		this.#cfg = cfg;
 		this.#webRoot = resolve(cfg.webRoot);
+		// 代理 token 会写进沙箱可读的 models.json。它若等于网关 token，
+		// agent 就能连回网关、以任意 actor 接入会话并批准自己挂起的审批 ——
+		// 等于把审批门的钥匙交给被审批的一方。这条必须在启动时炸掉。
+		if (cfg.wiring && cfg.wiring.proxyToken === cfg.token) {
+			throw new Error("wiring.proxyToken 不能等于网关 token：它会写进沙箱可读的配置，agent 读到就能连回网关批准自己的审批");
+		}
 		mkdirSync(cfg.workspaceRoot, { recursive: true });
 		this.#audit = AuditLog.open(cfg.auditFile);
 
@@ -177,6 +190,10 @@ export class Gateway {
 			piArgs: this.#cfg.piArgs,
 			piEnv: this.#cfg.piEnv,
 			approvalTimeoutMs: this.#cfg.approvalTimeoutMs,
+			wiring: this.#cfg.wiring,
+			// HOME 放在 workspace 之外：放在里面的话，agent 一句
+			// git add -A && git commit 就把含 token 的 .gitconfig 提交进仓库
+			sandboxHome: join(this.#cfg.workspaceRoot, ".homes", sessionId),
 			send: (ev, seq, target) => broadcast(session, ev, seq, target),
 		});
 		this.#sessions.set(sessionId, session);
@@ -267,7 +284,9 @@ if (process.argv[1] && import.meta.filename === process.argv[1]) {
 		webRoot: join(root, "web"),
 		piArgs: process.env.PERIMETER_PI_ARGS?.split(" ").filter(Boolean),
 		// 显式白名单：pi 只拿到跑起来必需的变量，网关的 token 不在其中
-		piEnv: { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG },
+		// 刻意不传 HOME：这个入口没配 wiring，传了的话 agent 一句
+		// cat ~/.pi/agent/models.json 就拿到操作员真实的 provider API key
+		piEnv: { PATH: process.env.PATH, LANG: process.env.LANG },
 	});
 	const port = await gw.listen();
 	console.log(`网关已启动 http://127.0.0.1:${port}/?token=${token}`);

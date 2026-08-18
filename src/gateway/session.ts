@@ -15,6 +15,7 @@ import {
 	toPiCommand,
 } from "../protocol/translate.ts";
 import { PiSession } from "../rpc/pi-session.ts";
+import { type SandboxWiring, writeSandboxConfig } from "./sandbox-config.ts";
 import { APPROVE, AUDIT_PREFIX, REJECT } from "./policy-extension.ts";
 
 export interface SessionOptions {
@@ -29,6 +30,13 @@ export interface SessionOptions {
 	piArgs?: string[];
 	piEnv?: NodeJS.ProcessEnv;
 	approvalTimeoutMs?: number;
+	/**
+	 * 沙箱侧接线：模型网关与 git 代理的地址 + 会话 token。
+	 * 给了就为本会话生成隔离的 pi HOME，让 agent 只能经这两个代理出网。
+	 */
+	wiring?: SandboxWiring;
+	/** 沙箱 HOME 的位置。必须在 workspace 之外，否则含 token 的配置会被 commit 进仓库 */
+	sandboxHome?: string;
 	/** 断线续接的事件缓存条数 */
 	backlogSize?: number;
 	/** target 非空时只投递给该传输（resume 的重放不该洪泛给其他标签页） */
@@ -87,15 +95,21 @@ export class Session {
 		this.#opts = opts;
 		mkdirSync(opts.workspace, { recursive: true });
 
+		// 接线：沙箱只拿到指向两个代理的配置，真凭据留在代理进程里
+		const wired =
+			opts.wiring && opts.sandboxHome ? writeSandboxConfig(opts.sandboxHome, opts.wiring) : null;
+
 		this.#pi = new PiSession({
 			cwd: opts.workspace,
 			bin: opts.piBin,
-			args: [...(opts.piArgs ?? []), "-e", extensionPath()],
+			args: [...(opts.piArgs ?? []), ...(wired?.piArgs ?? []), "-e", extensionPath()],
 			// 只传显式给定的环境变量。继承 process.env 会把网关的共享 token
 			// 与模型 key 一起交给 pi，而 pi 会执行 agent 的 bash 工具 ——
 			// agent 跑一句 env 就拿到了，与「凭据不进沙箱」正面冲突。
 			env: {
 				...(opts.piEnv ?? {}),
+				// 接线生成的 HOME 覆盖调用方给的：pi 从这里读 models.json 与 .gitconfig
+				...(wired ? { HOME: wired.home } : {}),
 				PERIMETER_POLICY_FILE: opts.policyFile,
 				PERIMETER_REPO: opts.repo,
 				PERIMETER_TEAM: opts.team,

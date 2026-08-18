@@ -1,11 +1,17 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AuditLog } from "../src/audit/log.ts";
 import { Gateway } from "../src/gateway/server.ts";
+import { ModelGateway } from "../src/modelgw/server.ts";
 
 /**
- * 一键起演示环境：mock 模型 + 网关 + 一个预置了 bug 的工作区。
+ * 一键起演示环境：mock 模型 → 模型网关 → 网关 → pi。
+ *
+ * 三个进程按真实架构接线，而不是让 pi 直连 provider：
+ * agent 只拿到一个指向模型网关的 baseUrl，apiKey 是会话 token；
+ * 「上游凭据」只存在于模型网关进程里。演示时可以当场 `env` 给客户看。
  *
  * 用 mock 模型而不是真实 provider，是因为策略文档要求 demo 有
  * 「演示环境挂掉时的保险」—— 这条链路在零凭据、零外网的机器上也跑得通。
@@ -26,8 +32,12 @@ if (probe.error || probe.status !== 0) {
 	);
 	process.exit(1);
 }
-console.log(`pi ${probe.stdout.trim()}`);
+
 const TOKEN = process.env.PERIMETER_TOKEN ?? "demo-token";
+// 代理 token 与网关 token 必须不同 —— 演示时这正是最有说服力的一点：
+// 打开沙箱的 models.json，里面那串和浏览器地址栏里的不一样，
+// 说明「连网关的身份」与「访问代理的凭据」是两个域。
+const PROXY_TOKEN = process.env.PERIMETER_PROXY_TOKEN ?? "demo-proxy-token";
 const real = process.env.PERIMETER_DEMO_REAL === "1";
 
 // 演示脚本：agent 先改一个源码文件（放行），再试图改 CI（拒绝），最后 push（审批）
@@ -38,66 +48,85 @@ const script = [
 	{ text: "已把登录超时从 5 秒调整为 30 秒。CI 配置的改动被策略拒绝，推送在等你批准。" },
 ];
 
+mkdirSync(join(root, "audit-data"), { recursive: true });
+const auditFile = join(root, "audit-data/demo.jsonl");
 const workspaceRoot = mkdtempSync(join(tmpdir(), "perimeter-demo-"));
-const piEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG };
+const piEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH, LANG: process.env.LANG };
+// 真实模型模式下不接线，pi 需要操作员的 HOME 才能读到常规 provider 配置
+if (real) piEnv.HOME = process.env.HOME;
+
+let wiring: { proxyToken: string; modelGatewayUrl: string; model: string } | undefined;
 let piArgs = process.env.PERIMETER_PI_ARGS?.split(" ").filter(Boolean) ?? [];
 
 if (!real) {
+	// ① mock 模型端点 —— 扮演 Bedrock / Vertex / vLLM 的位置
 	const mock = spawn(process.execPath, [join(root, "tests/fixtures/mock-model.mjs"), "0", JSON.stringify(script)], {
 		stdio: ["ignore", "pipe", "inherit"],
 	});
-	const port: number = await new Promise((r) => mock.stdout.once("data", (d) => r(JSON.parse(d.toString()).port)));
-	const home = mkdtempSync(join(tmpdir(), "perimeter-pihome-"));
-	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
-	writeFileSync(
-		join(home, ".pi", "agent", "models.json"),
-		JSON.stringify({
-			providers: {
-				mock: {
-					baseUrl: `http://127.0.0.1:${port}/v1`,
-					api: "openai-completions",
-					apiKey: "dummy",
-					compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
-					models: [{ id: "mock-model" }],
-				},
-			},
-		}),
-	);
-	piEnv.HOME = home;
-	piArgs = ["--no-session", "--provider", "mock", "--model", "mock-model"];
+	const mockPort: number = await new Promise((r) => mock.stdout.once("data", (d) => r(JSON.parse(d.toString()).port)));
 	process.on("exit", () => mock.kill());
+
+	// ② 模型网关 —— 唯一持有上游凭据的进程
+	const modelAudit = AuditLog.open(join(root, "audit-data/modelgw.jsonl"));
+	const modelGw = new ModelGateway({
+		port: 0,
+		host: "127.0.0.1",
+		token: PROXY_TOKEN,
+		upstreams: [
+			{
+				id: "upstream",
+				baseUrl: `http://127.0.0.1:${mockPort}/v1`,
+				// 这把「上游密钥」从头到尾不出这个进程
+				apiKey: "UPSTREAM-SECRET-KEY-never-leaves-this-process",
+			},
+		],
+		egressAllowlist: ["127.0.0.1"],
+		audit: modelAudit,
+	});
+	const modelPort = await modelGw.listen();
+	process.on("exit", () => void modelGw.close());
+
+	// ③ 接线：沙箱只看到模型网关的地址 + 会话 token
+	wiring = { proxyToken: PROXY_TOKEN, modelGatewayUrl: `http://127.0.0.1:${modelPort}/v1`, model: "mock-model" };
+	piArgs = ["--no-session"];
 }
 
-mkdirSync(join(root, "audit-data"), { recursive: true });
 const gw = new Gateway({
 	port: Number(process.env.PORT ?? 8787),
 	host: "127.0.0.1",
 	token: TOKEN,
 	policyFile: join(root, "config/policy.yaml"),
-	auditFile: join(root, "audit-data/demo.jsonl"),
+	auditFile,
 	workspaceRoot,
 	webRoot: join(root, "web"),
 	piArgs,
 	piEnv,
+	wiring,
 	approvalTimeoutMs: 120_000,
 	resolveScope: () => ({ repo: "demo-app", team: "platform" }),
 });
 
 const port = await gw.listen();
 console.log(`
-演示环境就绪（${real ? "真实模型" : "mock 模型，无需凭据"}）
+演示环境就绪（pi ${probe.stdout.trim()}${real ? "，真实模型" : "，mock 模型，无需凭据"}）
 
   打开：http://127.0.0.1:${port}/?token=${TOKEN}
   工作区：${workspaceRoot}
-  审计日志：${join(root, "audit-data/demo.jsonl")}
-
+  审计日志：${auditFile}
+${real ? "" : `
+链路：浏览器 → 网关 → pi（沙箱）→ 模型网关 → mock 模型
+上游凭据只在模型网关进程里。沙箱侧的 models.json 写的是代理 token
+（${PROXY_TOKEN}），与浏览器用的网关 token（${TOKEN}）是**不同的两个值** ——
+演示时当场打开给客户看，这是「凭据域分离」最直观的证据。
+HOME 在 workspace 之外，agent 的 git commit 带不走它。
+`}
 试着发一句「修复登录超时的 bug」，会看到：
   1. 改源码 → 放行，审计里出现 policy.verdict allow
   2. 改 .github/workflows/ → 被策略拒绝，界面上出现红色条目
   3. git push → 审批门拦下，等你点批准或拒绝（超时按拒绝）
 
 校验审计链完整性：
-  node -e "import('./src/audit/log.ts').then(async m => console.log(await m.AuditLog.verify('audit-data/demo.jsonl')))"
+  node -e "import('./src/audit/log.ts').then(async m => console.log(await m.AuditLog.verify('${auditFile}')))"
 `);
 
 process.on("SIGINT", () => {

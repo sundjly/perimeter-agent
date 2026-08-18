@@ -102,3 +102,11 @@ test("已声明的边界：只读工具可以读取凭据文件，内容会进�
 	assert.equal(deny("read", { path: ".env" }), "allow");
 	assert.equal(deny("read", { path: ".aws/credentials" }), "allow");
 });
+
+test("agent 不能改写全局 .gitconfig —— 一句 alias 就能让审批门静默失效", () => {
+	// 网关正是靠 .gitconfig 的 insteadOf 把 SCM 重写到凭据代理的。
+	// 真实收益不在「重定向到攻击者地址」（那由 egress 挡），
+	// 而在审批门绕过：[alias] p = push 之后，git p 不再匹配 git push*。
+	assert.equal(deny("write", { path: ".gitconfig" }), "deny");
+	assert.equal(deny("write", { path: "home/.gitconfig" }), "deny");
+});
