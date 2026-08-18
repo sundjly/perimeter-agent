@@ -83,3 +83,22 @@ test("正常开发操作不被误伤 —— 误报会把审批门变成噪音", 
 		assert.equal(deny("bash", { command: cmd }), "allow", cmd);
 	}
 });
+
+test("已声明的边界：路径 deny 规则对 bash 完全不生效", () => {
+	// 上面那些 deny 断言全部走 write/edit —— 它们带 path 参数。
+	// bash 是按命令模式匹配的，一条重定向就绕开整份 deny_paths 清单。
+	// 这不是「黑名单可被绕过」的衍生问题，而是「白纸黑字的 deny 清单在
+	// 一半场景里根本不执行」，必须固定成可见事实。
+	assert.equal(deny("bash", { command: 'echo "on: push" > .github/workflows/deploy.yml' }), "allow");
+	assert.equal(deny("bash", { command: "echo x > .pi/extensions/backdoor.ts" }), "allow");
+	assert.equal(deny("bash", { command: "git config credential.helper store" }), "allow");
+	// 要让路径规则真正统一，得等 Phase 2 在 FS 层（RemoteExecutionEnv）收口
+});
+
+test("已声明的边界：只读工具可以读取凭据文件，内容会进模型上下文", () => {
+	// read 被排除在路径规则之外是有意的（否则每次读 package.json 都要人批，
+	// 审批疲劳本身就是安全失效），代价是凭据文件可被读进上下文。
+	// 唯一的缓解是模型网关的 audit-only 检测 —— 而它当前不在网关链路上。
+	assert.equal(deny("read", { path: ".env" }), "allow");
+	assert.equal(deny("read", { path: ".aws/credentials" }), "allow");
+});

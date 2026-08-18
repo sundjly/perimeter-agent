@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,20 @@ import { Gateway } from "../src/gateway/server.ts";
  */
 
 const root = join(import.meta.dirname, "..");
+
+// pi 不是 npm 依赖（本仓库只用它的 RPC 模式，不锁版本）。不预检的话，
+// 失败形态是最难排查的那种：banner 与地址照常打印，客户点开链接才收到
+// 「spawn pi ENOENT」—— 演示时看起来一切正常，一开口就死。
+const probe = spawnSync("pi", ["--version"], { encoding: "utf8" });
+if (probe.error || probe.status !== 0) {
+	console.error(
+		"找不到 pi。请先全局安装（实测版本 0.84.2）：\n" +
+			"  npm i -g @earendil-works/pi-coding-agent\n" +
+			"装好后确认 pi 在 PATH 上：pi --version",
+	);
+	process.exit(1);
+}
+console.log(`pi ${probe.stdout.trim()}`);
 const TOKEN = process.env.PERIMETER_TOKEN ?? "demo-token";
 const real = process.env.PERIMETER_DEMO_REAL === "1";
 

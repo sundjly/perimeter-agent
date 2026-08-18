@@ -208,3 +208,59 @@ test("同一批次里的多个待审批调用被串行 preflight —— 网关�
 	h.session.send({ type: "extension_ui_response", id: dialogs(h)[0]!.id, value: "拒绝" });
 	await h.waitFor(() => toolEnd(h) !== undefined);
 });
+
+test("前提复核：pi 对未知事件名静默失败 —— 钩子不生效且无任何错误信号", async () => {
+	// 这条不是在测我们的代码，而是在固定 hook-armed 握手存在的理由。
+	// 若哪天 pi 改为对未知事件名报错，这条会失败，届时可以简化握手逻辑。
+	const { port } = await startMock([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
+	const home = mkdtempSync(join(tmpdir(), "pihome-"));
+	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+	writeFileSync(
+		join(home, ".pi", "agent", "models.json"),
+		JSON.stringify({
+			providers: {
+				mock: {
+					baseUrl: `http://127.0.0.1:${port}/v1`,
+					api: "openai-completions",
+					apiKey: "dummy",
+					compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+					models: [{ id: "mock-model" }],
+				},
+			},
+		}),
+	);
+	const workspace = mkdtempSync(join(tmpdir(), "ws-"));
+	const events: PiEvent[] = [];
+	const session = new PiSession({
+		cwd: workspace,
+		args: [
+			"--no-session",
+			"--provider",
+			"mock",
+			"--model",
+			"mock-model",
+			"-e",
+			join(REPO, "tests/fixtures/wrong-hook-ext.ts"),
+		],
+		env: { ...process.env, HOME: home },
+		onEvent: (e) => events.push(e),
+		onResponse: () => {},
+		onExit: () => {},
+	});
+	cleanups.push(() => void session.stop());
+
+	await session.request({ type: "prompt", message: "改" });
+	const deadline = Date.now() + 15_000;
+	while (!events.some((e) => e.type === "tool_execution_end")) {
+		if (Date.now() > deadline) throw new Error("等待工具执行超时");
+		await new Promise((r) => setTimeout(r, 20));
+	}
+
+	// 三条断言合起来说明：注册没生效、pi 不报错、工具照常执行
+	assert.equal(existsSync(join(workspace, "package.json")), true, "钩子没生效，写入照常发生");
+	assert.ok(!events.some((e) => e.type === "extension_error"), "pi 不会为未知事件名发 extension_error");
+	assert.ok(
+		!events.some((e) => e.type === "extension_ui_request"),
+		"没有任何审批对话 —— 静默全量放行正是 hook-armed 握手要防的状态",
+	);
+});
