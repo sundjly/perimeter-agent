@@ -117,7 +117,8 @@ test("allow：普通命令照常执行，并留下判决记录", async () => {
 	assert.equal(end.isError, false);
 	assert.match(JSON.stringify(end.result), /命中允许分支/);
 	assert.equal(dialogs(h).length, 0, "allow 不应打扰用户");
-	assert.equal(audits(h)[0]?.kind, "allow");
+	assert.ok(audits(h).some((a) => a.kind === "hook-armed"), "扩展必须宣告钩子已挂载");
+	assert.equal(audits(h).find((a) => a.kind === "allow")?.kind, "allow");
 });
 
 test("deny：策略拒绝的写入不会落到磁盘上", async () => {
@@ -183,4 +184,27 @@ test("审批对话被取消也按拒绝处理", async () => {
 	h.session.send({ type: "extension_ui_response", id: dialogs(h)[0]!.id, cancelled: true });
 	await h.waitFor(() => toolEnd(h) !== undefined);
 	assert.equal(existsSync(join(h.workspace, "package.json")), false);
+});
+
+test("钩子事件名写错时不会静默放行 —— 这是「0 例绕过」唯一的运行时证据", async () => {
+	// pi 0.84.2 对未知事件名不报错、不发 extension_error，工具照常执行。
+	// 也就是说钩子失效是静默的，只能靠握手信号发现。这条测试锁住这个前提：
+	// 只要没有 hook-armed，网关就该拒绝下发 prompt。
+	const h = await start([{ tool: "bash", args: { command: "echo x" } }, { text: "完成" }]);
+	await h.waitFor(() => audits(h).some((a) => a.kind === "hook-armed"));
+	const armed = audits(h).find((a) => a.kind === "hook-armed")!;
+	assert.equal(typeof armed.rules, "number");
+	assert.ok((armed.rules as number) > 0, "握手要带上实际加载的规则数，空策略同样是危险状态");
+});
+
+test("同一批次里的多个待审批调用被串行 preflight —— 网关的绑定逻辑依赖这个外部行为", async () => {
+	// 绑定本身已改为按 callId 显式关联，不再依赖此不变量；
+	// 但把 pi 的这个行为钉死，将来它变化时能第一时间发现。
+	const h = await start([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
+	await h.session.request({ type: "prompt", message: "改" });
+	await h.waitFor(() => dialogs(h).length > 0);
+	await new Promise((r) => setTimeout(r, 300));
+	assert.equal(dialogs(h).length, 1, "同时挂起的审批对话应只有一个");
+	h.session.send({ type: "extension_ui_response", id: dialogs(h)[0]!.id, value: "拒绝" });
+	await h.waitFor(() => toolEnd(h) !== undefined);
 });

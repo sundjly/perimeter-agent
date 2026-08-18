@@ -26,7 +26,7 @@ interface Env {
 	gateway: Gateway;
 }
 
-async function startGateway(script: unknown[]): Promise<Env> {
+async function startGateway(script: unknown[], extra: Partial<ConstructorParameters<typeof Gateway>[0]> = {}): Promise<Env> {
 	const mock: ChildProcess = spawn(process.execPath, [MOCK, "0", JSON.stringify(script)], {
 		stdio: ["ignore", "pipe", "inherit"],
 	});
@@ -62,8 +62,9 @@ async function startGateway(script: unknown[]): Promise<Env> {
 		workspaceRoot,
 		webRoot: join(REPO, "web"),
 		piArgs: ["--no-session", "--provider", "mock", "--model", "mock-model"],
-		piEnv: { ...process.env, HOME: home },
+		piEnv: { PATH: process.env.PATH, HOME: home },
 		approvalTimeoutMs: 30_000,
+		...extra,
 	});
 	cleanups.push(() => gateway.close());
 	const listening = await gateway.listen();
@@ -74,6 +75,7 @@ interface Client {
 	ws: WebSocket;
 	events: ClientEvent[];
 	seqs: number[];
+	controls: Record<string, unknown>[];
 	waitFor: (pred: () => boolean, ms?: number) => Promise<void>;
 	find: <T extends ClientEvent["type"]>(type: T) => Extract<ClientEvent, { type: T }> | undefined;
 	send: (cmd: unknown) => void;
@@ -83,10 +85,15 @@ async function connect(env: Env, query = ""): Promise<Client> {
 	const ws = new WebSocket(`${env.url.replace("http", "ws")}/?token=${TOKEN}${query}`);
 	const events: ClientEvent[] = [];
 	const seqs: number[] = [];
+	const controls: Record<string, unknown>[] = [];
 	ws.on("message", (raw) => {
-		const { seq, event } = JSON.parse(String(raw));
-		events.push(event);
-		seqs.push(seq);
+		const msg = JSON.parse(String(raw));
+		if (msg.type === "control") {
+			controls.push(msg);
+			return;
+		}
+		events.push(msg.event);
+		seqs.push(msg.seq);
 	});
 	await new Promise((r, j) => {
 		ws.once("open", r);
@@ -104,6 +111,7 @@ async function connect(env: Env, query = ""): Promise<Client> {
 		ws,
 		events,
 		seqs,
+		controls,
 		waitFor,
 		find: (type) => events.find((e) => e.type === type) as never,
 		send: (cmd) => ws.send(JSON.stringify(cmd)),
@@ -240,13 +248,103 @@ test("静态文件服务挡住路径穿越", async () => {
 	assert.equal(res2.status, 404);
 });
 
-test("非法 JSON 命令不会打死会话", async () => {
+test("畸形命令不会打死网关进程", async () => {
 	const env = await startGateway([{ text: "x" }]);
 	const c = await connect(env);
 	await c.waitFor(() => c.find("session.ready") !== undefined);
+
+	// 非 JSON
 	c.ws.send("这不是 JSON");
-	await c.waitFor(() => c.events.some((e) => e.type === "error" && e.code === "command_failed"));
+	await c.waitFor(() => c.controls.some((m) => m.control === "error"));
+
+	// 合法 JSON 但字段缺失 —— 这类曾经能一条消息打死整个网关，
+	// 连带杀掉所有其他会话的 pi 进程
+	for (const bad of [{ type: "prompt" }, { type: "approve" }, { type: "resume" }, { type: "nope" }, null, 42]) {
+		c.ws.send(JSON.stringify(bad));
+	}
+	await c.waitFor(() => c.events.filter((e) => e.type === "error" && e.code === "command_failed").length >= 6);
+
 	// 会话仍然可用
 	c.send({ type: "prompt", text: "还活着吗" });
 	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
+});
+
+test("sessionId 不能穿越工作区 —— 它直接参与路径拼接", async () => {
+	const env = await startGateway([{ text: "x" }]);
+	const ws = new WebSocket(`${env.url.replace("http", "ws")}/?token=${TOKEN}&session=../../../../tmp/pwned`);
+	const msgs: Record<string, unknown>[] = [];
+	ws.on("message", (raw) => msgs.push(JSON.parse(String(raw))));
+	await new Promise((r) => ws.once("open", r));
+	await new Promise((r) => setTimeout(r, 200));
+	assert.ok(msgs.some((m) => m.control === "error"), "非法 session id 必须被拒");
+	assert.equal(existsSync("/tmp/pwned"), false, "绝不能在工作区之外创建目录");
+});
+
+test("会话归属：知道 id 也不能接管别人的会话", async () => {
+	const env = await startGateway([{ text: "x" }]);
+	const owner = await connect(env, "&actor=alice@corp");
+	await owner.waitFor(() => owner.find("session.ready") !== undefined);
+	const sessionId = owner.find("session.ready")!.sessionId;
+
+	const intruder = await connect(env, `&actor=mallory@corp&session=${sessionId}`);
+	await intruder.waitFor(() => intruder.controls.some((m) => m.control === "error"));
+	assert.match(String(intruder.controls.find((m) => m.control === "error")?.message), /无权接入/);
+});
+
+test("策略作用域由服务端决定，客户端自选 repo/team 无效", async () => {
+	const env = await startGateway([{ text: "x" }], { resolveScope: () => ({ repo: "locked-repo", team: "locked-team" }) });
+	const c = await connect(env, "&repo=attacker-chosen&team=attacker-chosen");
+	await c.waitFor(() => c.find("session.ready") !== undefined);
+
+	const entries = [];
+	for await (const e of AuditLog.replay(env.auditFile)) entries.push(e);
+	assert.equal(entries[0]?.repo, "locked-repo");
+	assert.ok(!JSON.stringify(entries).includes("attacker-chosen"));
+});
+
+test("attach 控制帧不参与 seq 序列，否则 resume 补发的事件会被全部丢弃", async () => {
+	const env = await startGateway([{ text: "结果" }]);
+	const c = await connect(env);
+	await c.waitFor(() => c.find("session.ready") !== undefined);
+	c.send({ type: "prompt", text: "跑" });
+	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
+
+	// attach 时收到的是控制帧，不带 seq
+	assert.ok(c.controls.some((m) => m.control === "attached"));
+	// 事件 seq 从 1 开始严格递增，没有重复
+	assert.deepEqual(c.seqs, [...c.seqs].sort((a, b) => a - b));
+	assert.equal(new Set(c.seqs).size, c.seqs.length);
+	assert.equal(c.seqs[0], 1);
+});
+
+test("resume 只补发 since 之后的事件，且只回发起方", async () => {
+	const env = await startGateway([{ text: "结果" }]);
+	const c = await connect(env);
+	await c.waitFor(() => c.find("session.ready") !== undefined);
+	const mid = c.seqs.at(-1)!;
+	c.send({ type: "prompt", text: "跑" });
+	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
+
+	const before = c.seqs.length;
+	c.send({ type: "resume", since: mid });
+	await c.waitFor(() => c.seqs.length > before);
+	// 补发的都是 mid 之后的
+	assert.ok(c.seqs.slice(before).every((s) => s > mid));
+});
+
+test("钩子未挂上之前不下发 prompt —— 否则会在无策略保护下跑工具", async () => {
+	const env = await startGateway([{ text: "x" }]);
+	const c = await connect(env);
+	await c.waitFor(() => c.events.some((e) => e.type === "audit.entry" && e.entry.summary.includes("策略钩子已挂载")));
+	const armed = c.events.find((e) => e.type === "audit.entry" && e.entry.summary.includes("策略钩子已挂载"));
+	assert.ok(armed, "扩展必须宣告钩子已挂载，否则网关无法确认策略生效");
+});
+
+test("会话数上限拦住无限拉起 pi 进程", async () => {
+	const env = await startGateway([{ text: "x" }], { maxSessions: 1 });
+	const first = await connect(env);
+	await first.waitFor(() => first.find("session.ready") !== undefined);
+	const second = await connect(env);
+	await second.waitFor(() => second.controls.some((m) => m.control === "error"));
+	assert.match(String(second.controls.find((m) => m.control === "error")?.message), /上限/);
 });

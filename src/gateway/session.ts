@@ -1,20 +1,21 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { AuditLog, contentHash } from "../audit/log.ts";
-import type { ClientCommand, ClientEvent } from "../protocol/types.ts";
+import type { AuditInput, AuditLog } from "../audit/log.ts";
+import { contentHash } from "../audit/log.ts";
+import type { ActionDescriptor, ClientCommand, ClientEvent } from "../protocol/types.ts";
 import {
 	type PiEvent,
 	type PiResponse,
 	type TranslateState,
 	newTranslateState,
+	summarizeAction,
 	toActionDescriptor,
 	toClientEvent,
 	toClientEventFromResponse,
 	toPiCommand,
-	summarizeAction,
 } from "../protocol/translate.ts";
 import { PiSession } from "../rpc/pi-session.ts";
-import { AUDIT_PREFIX } from "./policy-extension.ts";
+import { APPROVE, AUDIT_PREFIX, REJECT } from "./policy-extension.ts";
 
 export interface SessionOptions {
 	sessionId: string;
@@ -30,17 +31,28 @@ export interface SessionOptions {
 	approvalTimeoutMs?: number;
 	/** 断线续接的事件缓存条数 */
 	backlogSize?: number;
-	send: (event: ClientEvent, seq: number) => void;
+	/** target 非空时只投递给该传输（resume 的重放不该洪泛给其他标签页） */
+	send: (event: ClientEvent, seq: number, target?: unknown) => void;
+}
+
+interface PendingApproval {
+	callId: string;
+	action: ActionDescriptor;
+	rule: string;
+	reason: string;
 }
 
 /**
  * 一个浏览器会话：把 pi 进程、策略引擎、审批门、审计日志串成一条链路。
  *
- * 两条纪律：
+ * 三条纪律：
  * - 出口只有 ClientEvent。pi 的事件格式一律经 translate 转换，
  *   本文件之外（尤其是前端）看不到 pi 的字段名。
  * - 审计日志只有网关一个写入者。策略扩展跑在 pi 进程内，它的判决经
  *   扩展 UI 的 notify 通道回传到这里再落盘，而不是自己开一个 fd。
+ * - **钩子未确认挂上之前不跑任何 prompt**。扩展加载失败是 fail-closed 的
+ *   （pi 直接退出），但「注册了一个 pi 不认识的事件名」是静默失败 ——
+ *   那种状态下 agent 会在完全无策略保护的情况下执行工具。
  */
 export class Session {
 	#opts: SessionOptions;
@@ -50,8 +62,25 @@ export class Session {
 	#backlog: ClientEvent[] = [];
 	#seq = 0;
 	#model: string | null = null;
-	/** 待人工审批的对话：approvalId → 尚未回答 */
-	#pendingApprovals = new Set<string>();
+	#alive = true;
+	#lastActivity = Date.now();
+
+	/** 待人工审批的对话：approvalId → 它对应的工具调用 */
+	#pendingApprovals = new Map<string, PendingApproval>();
+	/**
+	 * 最近一条尚未配上对话框的 approval.request。
+	 * 扩展在 select 之前紧邻发出它，据此把 callId 与对话框 id 绑定 ——
+	 * 不靠「同时只有一个挂起审批」这种外部不变量去反推。那个假设当前成立
+	 * （pi 串行 preflight，实测确认），但它是 pi 的内部行为，不该被正确性依赖。
+	 */
+	#awaitingDialog: PendingApproval | null = null;
+	/** callId → 已回答的对话框 id 与实际审批人，供判决回传时对上号 */
+	#resolved = new Map<string, { approvalId: string; actor: string }>();
+
+	/** 钩子存活握手 */
+	#hookArmed = false;
+	#queuedWhileDisarmed: ClientCommand[] = [];
+
 	#toolNames = new Map<string, string>();
 
 	constructor(opts: SessionOptions) {
@@ -62,8 +91,11 @@ export class Session {
 			cwd: opts.workspace,
 			bin: opts.piBin,
 			args: [...(opts.piArgs ?? []), "-e", extensionPath()],
+			// 只传显式给定的环境变量。继承 process.env 会把网关的共享 token
+			// 与模型 key 一起交给 pi，而 pi 会执行 agent 的 bash 工具 ——
+			// agent 跑一句 env 就拿到了，与「凭据不进沙箱」正面冲突。
 			env: {
-				...(opts.piEnv ?? process.env),
+				...(opts.piEnv ?? {}),
 				PERIMETER_POLICY_FILE: opts.policyFile,
 				PERIMETER_REPO: opts.repo,
 				PERIMETER_TEAM: opts.team,
@@ -72,6 +104,9 @@ export class Session {
 			onEvent: (e) => this.#onPiEvent(e),
 			onResponse: (r) => this.#onPiResponse(r),
 			onExit: (info) => this.#onExit(info),
+			// pi 的致命错误（扩展加载失败等）只出现在 stderr。不接就等于
+			// 「会话起不来，日志里什么都没有」。
+			onStderr: (text) => this.#onStderr(text),
 			onProtocolError: (line, err) =>
 				this.#emit({ type: "error", code: "command_failed", message: `协议错误：${String(err)}（${line.slice(0, 80)}）` }),
 		});
@@ -83,6 +118,14 @@ export class Session {
 
 	get lastSeq(): number {
 		return this.#seq;
+	}
+
+	get alive(): boolean {
+		return this.#alive;
+	}
+
+	get idleMs(): number {
+		return Date.now() - this.#lastActivity;
 	}
 
 	/**
@@ -99,7 +142,10 @@ export class Session {
 				this.#emit(ev);
 			}
 		} catch (err) {
-			this.#emit({ type: "error", code: "command_failed", message: `会话启动失败：${String(err)}` });
+			// 起不来就别宣告 ready：前端显示「就绪」而 pi 已死是最难排查的状态
+			this.#alive = false;
+			this.#emit({ type: "error", code: "agent_error", message: `会话启动失败：${String(err)}` });
+			return;
 		}
 		this.#emit({
 			type: "session.ready",
@@ -109,13 +155,32 @@ export class Session {
 		});
 	}
 
-	handle(cmd: ClientCommand): void {
+	/** actor 是发出这条命令的连接身份；from 用于把 resume 的重放只回给发起方 */
+	handle(cmd: ClientCommand, actor = this.#opts.actor, from?: unknown): void {
+		this.#lastActivity = Date.now();
+
+		const invalid = validate(cmd);
+		if (invalid) {
+			// 不校验就用的话，一条畸形消息能打死整个网关进程，连带杀掉所有其他会话
+			this.#emit({ type: "error", code: "command_failed", message: invalid });
+			return;
+		}
+		if (!this.#alive) {
+			this.#emit({ type: "error", code: "agent_error", message: "会话已终止，请新建会话" });
+			return;
+		}
+
 		if (cmd.type === "resume") {
-			this.#replay(cmd.since);
+			this.#replay(cmd.since, from);
 			return;
 		}
 		if (cmd.type === "approve") {
-			this.#resolveApproval(cmd.approvalId, cmd.decision);
+			this.#resolveApproval(cmd.approvalId, cmd.decision, actor);
+			return;
+		}
+		// 钩子未确认挂上之前，prompt 先排队：此时执行工具等于无策略保护
+		if (!this.#hookArmed && (cmd.type === "prompt" || cmd.type === "steer")) {
+			this.#queuedWhileDisarmed.push(cmd);
 			return;
 		}
 		if (cmd.type === "prompt") {
@@ -126,15 +191,17 @@ export class Session {
 	}
 
 	async stop(): Promise<void> {
-		this.#audit({ kind: "session.end", summary: "会话结束" });
+		if (this.#alive) this.#audit({ kind: "session.end", summary: "会话结束" });
+		this.#alive = false;
 		await this.#pi.stop();
 	}
 
-	/** 重放 since 之后的事件。pi 侧的 transcript 另有 session 文件，这里只补事件流。 */
-	#replay(since: number): void {
-		const start = Math.max(0, since - (this.#seq - this.#backlog.length));
-		for (let i = start; i < this.#backlog.length; i++) {
-			this.#opts.send(this.#backlog[i]!, this.#seq - this.#backlog.length + i + 1);
+	/** 重放 since 之后的事件。只回发起方，避免洪泛给其他标签页。 */
+	#replay(since: number, to?: unknown): void {
+		const firstSeq = this.#seq - this.#backlog.length + 1;
+		for (let i = 0; i < this.#backlog.length; i++) {
+			const seq = firstSeq + i;
+			if (seq > since) this.#opts.send(this.#backlog[i]!, seq, to);
 		}
 	}
 
@@ -192,6 +259,14 @@ export class Session {
 		}
 	}
 
+	#onStderr(text: string): void {
+		const trimmed = text.trim();
+		if (!trimmed) return;
+		// 扩展加载失败会让 pi 直接退出（fail-closed，方向是对的），
+		// 但错误只在 stderr —— 不透出来，现场就只剩一个「起不来」
+		this.#emit({ type: "error", code: "agent_error", message: `pi: ${trimmed.slice(0, 500)}` });
+	}
+
 	/**
 	 * 扩展 UI 子协议是策略扩展与网关之间的唯一通道：
 	 * select 是审批门，带 AUDIT_PREFIX 的 notify 是判决上报。
@@ -206,13 +281,18 @@ export class Session {
 		if (method !== "select") return;
 
 		const approvalId = String(ev.id ?? "");
-		this.#pendingApprovals.add(approvalId);
+		const pending = this.#awaitingDialog ?? { callId: "", action: { tool: "unknown" }, rule: "", reason: "" };
+		this.#awaitingDialog = null;
+		this.#pendingApprovals.set(approvalId, pending);
+
 		const timeout = typeof ev.timeout === "number" ? ev.timeout : (this.#opts.approvalTimeoutMs ?? 120_000);
 		this.#emit({
 			type: "approval.request",
 			approvalId,
-			action: { tool: "unknown" },
-			reason: String(ev.title ?? "需要人工确认"),
+			// 审批人必须看得到批的是什么：只给规则模式的话，
+			// `git push --force origin main` 与 `git push origin feature` 长得一样
+			action: pending.action,
+			reason: pending.reason || String(ev.title ?? "需要人工确认"),
 			expiresAt: Date.now() + timeout,
 		});
 	}
@@ -224,14 +304,22 @@ export class Session {
 		} catch {
 			return;
 		}
-		const action = (v.action ?? { tool: "unknown" }) as { tool: string; path?: string; command?: string };
+		const action = (v.action ?? { tool: "unknown" }) as ActionDescriptor;
 		const kind = String(v.kind ?? "");
+		const callId = String(v.callId ?? "");
+
+		if (kind === "hook-armed") {
+			this.#hookArmed = true;
+			this.#audit({ kind: "session.start", summary: `策略钩子已挂载（${String(v.rules)} 条规则）` });
+			for (const cmd of this.#queuedWhileDisarmed.splice(0)) this.handle(cmd);
+			return;
+		}
 
 		if (kind === "deny") {
 			this.#audit({
 				kind: "policy.verdict",
 				summary: `拒绝：${summarizeAction(action)}`,
-				callId: String(v.callId ?? ""),
+				callId,
 				tool: action.tool,
 				path: action.path,
 				command: action.command,
@@ -239,63 +327,80 @@ export class Session {
 				rule: String(v.rule ?? ""),
 			});
 			this.#emit({ type: "policy.denied", action, rule: String(v.rule ?? ""), reason: String(v.reason ?? "") });
-		} else if (kind === "allow") {
-			this.#audit({
-				kind: "policy.verdict",
-				summary: `放行：${summarizeAction(action)}`,
-				callId: String(v.callId ?? ""),
-				tool: action.tool,
-				verdict: "allow",
-			});
-		} else if (kind === "approval.request") {
+			return;
+		}
+
+		if (kind === "allow") {
+			this.#audit({ kind: "policy.verdict", summary: `放行：${summarizeAction(action)}`, callId, tool: action.tool, verdict: "allow" });
+			return;
+		}
+
+		if (kind === "approval.request") {
+			// 记下来，等紧随其后的 select 把它与对话框 id 绑定
+			this.#awaitingDialog = { callId, action, rule: String(v.rule ?? ""), reason: String(v.reason ?? "") };
 			this.#audit({
 				kind: "approval.request",
 				summary: `待审批：${summarizeAction(action)}`,
-				callId: String(v.callId ?? ""),
+				callId,
 				tool: action.tool,
 				path: action.path,
 				command: action.command,
 				rule: String(v.rule ?? ""),
 			});
-		} else if (kind === "approval.decision") {
+			return;
+		}
+
+		if (kind === "approval.decision") {
 			const approved = v.approved === true;
 			const timedOut = v.timedOut === true;
+			const resolved = this.#resolved.get(callId);
+			this.#resolved.delete(callId);
+			const approvalId = resolved?.approvalId ?? this.#findPendingByCallId(callId) ?? "";
+			this.#pendingApprovals.delete(approvalId);
+
 			this.#audit({
 				kind: "approval.decision",
 				summary: `${approved ? "已批准" : timedOut ? "超时拒绝" : "已拒绝"}：${summarizeAction(action)}`,
-				callId: String(v.callId ?? ""),
+				callId,
 				tool: action.tool,
 				verdict: approved ? "allow" : "deny",
 				rule: String(v.rule ?? ""),
 				// 超时不是任何人做的决定，此时不该记一个审批人
-				approver: approved || !timedOut ? this.#opts.actor : undefined,
+				approver: timedOut ? undefined : resolved?.actor,
 			});
-			// pi 对同一批工具调用是串行 preflight 的，因此同时最多挂起一个审批对话，
-			// 判决上报（只带 callId）与对话（只带 UI id）可以据此对上。
-			const approvalId = [...this.#pendingApprovals][0] ?? "";
-			this.#pendingApprovals.delete(approvalId);
 			this.#emit({
 				type: "approval.resolved",
 				approvalId,
 				decision: approved ? "allow" : "deny",
-				actor: timedOut ? "system(timeout)" : this.#opts.actor,
+				actor: timedOut ? "system(timeout)" : (resolved?.actor ?? "unknown"),
 			});
 		}
 	}
 
-	#resolveApproval(approvalId: string, decision: "allow" | "deny"): void {
-		if (!this.#pendingApprovals.delete(approvalId)) return;
-		this.#pi.send({ type: "extension_ui_response", id: approvalId, value: decision === "allow" ? "批准" : "拒绝" });
+	#resolveApproval(approvalId: string, decision: "allow" | "deny", actor: string): void {
+		const pending = this.#pendingApprovals.get(approvalId);
+		if (!pending) return;
+		this.#pendingApprovals.delete(approvalId);
+		this.#resolved.set(pending.callId, { approvalId, actor });
+		this.#pi.send({ type: "extension_ui_response", id: approvalId, value: decision === "allow" ? APPROVE : REJECT });
+	}
+
+	#findPendingByCallId(callId: string): string | undefined {
+		for (const [id, p] of this.#pendingApprovals) if (p.callId === callId) return id;
+		return undefined;
 	}
 
 	#onExit(info: { code: number | null; signal: NodeJS.Signals | null }): void {
 		// 在途审批随进程一起消失，不能让前端一直挂着对话框
-		for (const id of this.#pendingApprovals) {
+		for (const id of this.#pendingApprovals.keys()) {
 			this.#emit({ type: "approval.resolved", approvalId: id, decision: "deny", actor: "system(session-exit)" });
 		}
 		this.#pendingApprovals.clear();
-		this.#audit({ kind: "session.end", summary: `pi 进程退出 code=${info.code} signal=${info.signal}` });
-		this.#emit({ type: "error", code: "agent_error", message: `会话已终止（code=${info.code}）` });
+		if (this.#alive) {
+			this.#alive = false;
+			this.#audit({ kind: "session.end", summary: `pi 进程退出 code=${info.code} signal=${info.signal}` });
+			this.#emit({ type: "error", code: "agent_error", message: `会话已终止（code=${info.code}）` });
+		}
 	}
 
 	#emit(ev: ClientEvent): void {
@@ -306,7 +411,7 @@ export class Session {
 		this.#opts.send(ev, this.#seq);
 	}
 
-	#audit(input: Omit<Parameters<AuditLog["append"]>[0], "sessionId" | "actor" | "repo" | "team">): void {
+	#audit(input: Omit<AuditInput, "sessionId" | "actor" | "repo" | "team">): void {
 		const entry = this.#opts.audit.append({
 			...input,
 			sessionId: this.#opts.sessionId,
@@ -318,6 +423,26 @@ export class Session {
 			type: "audit.entry",
 			entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, verdict: entry.verdict },
 		});
+	}
+}
+
+/** 客户端命令的最小校验。返回错误说明，或 null 表示通过。 */
+function validate(cmd: unknown): string | null {
+	if (typeof cmd !== "object" || cmd === null) return "命令必须是对象";
+	const c = cmd as Record<string, unknown>;
+	switch (c.type) {
+		case "prompt":
+		case "steer":
+			return typeof c.text === "string" && c.text.length > 0 ? null : `${String(c.type)} 缺少 text`;
+		case "abort":
+			return null;
+		case "approve":
+			if (typeof c.approvalId !== "string") return "approve 缺少 approvalId";
+			return c.decision === "allow" || c.decision === "deny" ? null : "approve 的 decision 只能是 allow/deny";
+		case "resume":
+			return typeof c.since === "number" && Number.isFinite(c.since) ? null : "resume 的 since 必须是数字";
+		default:
+			return `未知命令：${String(c.type)}`;
 	}
 }
 

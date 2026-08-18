@@ -16,6 +16,8 @@ const state = {
 	seq: 0,
 	sessionId: params.get("session") ?? null,
 	messages: new Map(),
+	approvals: [],
+	retryMs: 0,
 	tools: new Map(),
 	auditCount: 0,
 	countdownTimer: null,
@@ -35,18 +37,27 @@ function connect() {
 
 	ws.onopen = () => {
 		setDot("on");
+		state.retryMs = 0;
 		// 断线期间任务仍在服务端跑，重连后补齐错过的事件
 		if (state.seq > 0) send({ type: "resume", since: state.seq });
 	};
 	ws.onclose = () => {
 		setDot("");
-		setTimeout(connect, 1500);
+		// 指数退避：固定 1.5s 重试在网关拒绝（401、越权、超上限）时会变成死循环
+		state.retryMs = Math.min((state.retryMs || 750) * 2, 30_000);
+		setTimeout(connect, state.retryMs);
 	};
 	ws.onmessage = (e) => {
-		const { seq, event } = JSON.parse(e.data);
-		if (seq <= state.seq) return; // resume 会重放，去重
-		state.seq = seq;
-		render(event);
+		const msg = JSON.parse(e.data);
+		// 控制帧不参与 seq 序列：让它参与的话，attach 时那条帧会把 state.seq
+		// 顶到最新，随后 resume 补发的事件全被去重逻辑丢掉
+		if (msg.type === "control") {
+			if (msg.control === "error") errorRow({ code: "gateway", message: msg.message });
+			return;
+		}
+		if (msg.seq <= state.seq) return; // resume 会重放，去重
+		state.seq = msg.seq;
+		render(msg.event);
 	};
 }
 
@@ -58,6 +69,9 @@ function render(ev) {
 	switch (ev.type) {
 		case "session.ready":
 			state.sessionId = ev.sessionId;
+			// 不写回 URL 的话，用户一刷新就是一个全新会话、一个全新 pi 进程，
+			// 旧会话连同进程泄漏 —— 也就没有「刷新后恢复会话」这回事了
+			rememberSession(ev.sessionId);
 			$("model").textContent = ev.model ?? "未配置模型";
 			break;
 
@@ -187,8 +201,14 @@ function toolEl(callId, summary) {
 	return el;
 }
 
+const MAX_TOOL_OUTPUT = 64 * 1024;
+
 function setToolOutput(callId, text) {
-	toolEl(callId).querySelector(".out").textContent = text;
+	// tool.progress 是累计快照，每次整体重写。长构建输出不截断的话，
+	// DOM 重写是 O(n²)，几 MB stdout 就能把页面卡死。
+	const shown = text.length > MAX_TOOL_OUTPUT ? `…（略去前 ${text.length - MAX_TOOL_OUTPUT} 字符）
+${text.slice(-MAX_TOOL_OUTPUT)}` : text;
+	toolEl(callId).querySelector(".out").textContent = shown;
 }
 
 function denied(ev) {
@@ -242,8 +262,23 @@ function auditRow(entry) {
 
 // ── 审批门 ──────────────────────────────────────────────────
 
+/** 审批按队列处理：第二条请求不能静默覆盖第一条 */
 function openApproval(ev) {
-	$("approval-reason").textContent = ev.reason;
+	state.approvals.push(ev);
+	if (state.approvals.length === 1) showApproval();
+}
+
+function showApproval() {
+	const ev = state.approvals[0];
+	if (!ev) {
+		$("approval-backdrop").hidden = true;
+		clearInterval(state.countdownTimer);
+		return;
+	}
+	// 审批人必须看得清批的是什么：工具 + 具体目标，不只是命中的规则
+	const target = ev.action?.command ?? ev.action?.path ?? "";
+	$("approval-reason").textContent = target ? `${ev.action.tool}: ${target}
+${ev.reason}` : ev.reason;
 	$("approval-backdrop").hidden = false;
 	$("approve-allow").onclick = () => decide(ev.approvalId, "allow");
 	$("approve-deny").onclick = () => decide(ev.approvalId, "deny");
@@ -251,7 +286,8 @@ function openApproval(ev) {
 	clearInterval(state.countdownTimer);
 	const tick = () => {
 		const left = Math.max(0, Math.round((ev.expiresAt - Date.now()) / 1000));
-		$("approval-countdown").textContent = left > 0 ? `${left} 秒后自动拒绝` : "已超时，按拒绝处理";
+		const n = state.approvals.length > 1 ? `（还有 ${state.approvals.length - 1} 条待审）` : "";
+		$("approval-countdown").textContent = (left > 0 ? `${left} 秒后自动拒绝` : "已超时，按拒绝处理") + n;
 		if (left === 0) clearInterval(state.countdownTimer);
 	};
 	tick();
@@ -260,13 +296,22 @@ function openApproval(ev) {
 
 function decide(approvalId, decision) {
 	send({ type: "approve", approvalId, decision });
-	$("approval-backdrop").hidden = true;
-	clearInterval(state.countdownTimer);
+	closeApproval({ approvalId });
 }
 
-function closeApproval() {
-	$("approval-backdrop").hidden = true;
-	clearInterval(state.countdownTimer);
+/** 只关掉对应 id 的那一条，然后展示队列里的下一条 */
+function closeApproval(ev) {
+	const i = state.approvals.findIndex((a) => a.approvalId === ev.approvalId);
+	if (i >= 0) state.approvals.splice(i, 1);
+	showApproval();
+}
+
+/** 会话 id 写回 URL：刷新后仍连回同一个会话，而不是新建一个 */
+function rememberSession(id) {
+	const url = new URL(location.href);
+	if (url.searchParams.get("session") === id) return;
+	url.searchParams.set("session", id);
+	history.replaceState(null, "", url);
 }
 
 // ── 输入 ────────────────────────────────────────────────────

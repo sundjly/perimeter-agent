@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync } from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { extname, join, normalize } from "node:path";
-import { WebSocketServer, type WebSocket } from "ws";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
+import { extname, join, normalize, resolve, sep } from "node:path";
+import { type WebSocket, WebSocketServer } from "ws";
 import { AuditLog } from "../audit/log.ts";
 import type { ClientCommand, ClientEvent } from "../protocol/types.ts";
 import { Session } from "./session.ts";
@@ -18,8 +18,19 @@ export interface GatewayConfig {
 	webRoot: string;
 	piBin?: string;
 	piArgs?: string[];
+	/**
+	 * 传给 pi 子进程的环境变量。**刻意不默认继承 process.env** ——
+	 * pi 会执行 agent 的 bash 工具，继承等于把网关的共享 token 与模型 key
+	 * 一并交给 agent，一句 env 就拿到了。
+	 */
 	piEnv?: NodeJS.ProcessEnv;
 	approvalTimeoutMs?: number;
+	/** 会话空闲多久后回收（连同 pi 进程） */
+	idleTimeoutMs?: number;
+	/** 同时存活的会话上限，防止一条 token 把节点打满 */
+	maxSessions?: number;
+	/** 每个会话可用的 repo/team。策略作用域必须由服务端决定，不能让客户端自选 */
+	resolveScope?: (actor: string) => { repo: string; team: string };
 }
 
 const MIME: Record<string, string> = {
@@ -29,11 +40,22 @@ const MIME: Record<string, string> = {
 	".svg": "image/svg+xml",
 };
 
+/** sessionId 会直接参与工作区路径拼接，必须限死字符集 */
+const SESSION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+interface Conn {
+	ws: WebSocket;
+	actor: string;
+}
+
 /**
  * 会话网关。浏览器经 WebSocket 连到这里，网关为每个会话拉起一个 pi 进程。
  *
  * 身份这块 Phase 1 只做到共享 token：它的作用是把演示环境关起来，
  * 不是企业级身份。OIDC/SAML + RBAC 在 Phase 2，不要拿现在这个去过安全评审。
+ * 但即便身份只有共享 token，两件事也必须由服务端决定而不是客户端自选：
+ * **会话归属**与**策略作用域（repo/team）**。后者尤其重要 —— 让客户端挑
+ * 适用于自己的策略，等于给了一条一键降级的路。
  */
 export class Gateway {
 	#cfg: GatewayConfig;
@@ -41,9 +63,14 @@ export class Gateway {
 	#http = createServer();
 	#wss = new WebSocketServer({ noServer: true });
 	#sessions = new Map<string, Session>();
+	/** sessionId → 创建它的身份。别人拿到 id 也接不进来 */
+	#owners = new Map<string, string>();
+	#reaper: NodeJS.Timeout;
+	#webRoot: string;
 
 	constructor(cfg: GatewayConfig) {
 		this.#cfg = cfg;
+		this.#webRoot = resolve(cfg.webRoot);
 		mkdirSync(cfg.workspaceRoot, { recursive: true });
 		this.#audit = AuditLog.open(cfg.auditFile);
 
@@ -56,6 +83,10 @@ export class Gateway {
 			}
 			this.#wss.handleUpgrade(req, socket, head, (ws) => this.#onConnection(ws, req));
 		});
+
+		// 空闲回收：没有它，会话与 pi 进程只增不减
+		this.#reaper = setInterval(() => this.#reap(), 30_000);
+		this.#reaper.unref();
 	}
 
 	async listen(): Promise<number> {
@@ -65,8 +96,10 @@ export class Gateway {
 	}
 
 	async close(): Promise<void> {
+		clearInterval(this.#reaper);
 		for (const s of this.#sessions.values()) await s.stop();
 		this.#sessions.clear();
+		this.#owners.clear();
 		// 必须先断开在途连接：http.close() 要等所有连接关闭才回调，
 		// 而 WebSocket 是长连接，不主动断开就会一直等下去。
 		for (const client of this.#wss.clients) client.terminate();
@@ -74,6 +107,22 @@ export class Gateway {
 		this.#http.closeAllConnections();
 		await new Promise<void>((r) => this.#http.close(() => r()));
 		this.#audit.close();
+	}
+
+	get sessionCount(): number {
+		return this.#sessions.size;
+	}
+
+	/** 回收空闲会话与已死会话，连同它们的 pi 进程 */
+	#reap(): void {
+		const idleLimit = this.#cfg.idleTimeoutMs ?? 30 * 60_000;
+		for (const [id, session] of this.#sessions) {
+			if (!session.alive || session.idleMs > idleLimit) {
+				this.#sessions.delete(id);
+				this.#owners.delete(id);
+				void session.stop();
+			}
+		}
 	}
 
 	#authorized(req: IncomingMessage): boolean {
@@ -87,22 +136,40 @@ export class Gateway {
 	#onConnection(ws: WebSocket, req: IncomingMessage): void {
 		const url = new URL(req.url ?? "/", "http://localhost");
 		const actor = url.searchParams.get("actor") ?? "demo@local";
-		const repo = url.searchParams.get("repo") ?? "demo";
-		const team = url.searchParams.get("team") ?? "demo";
-		const sessionId = url.searchParams.get("session") ?? randomUUID();
+		const requested = url.searchParams.get("session");
 
-		const existing = this.#sessions.get(sessionId);
-		if (existing) {
-			// 断线重连：不重启 pi，重新挂上传输即可
-			attach(ws, existing);
+		if (requested && !SESSION_ID.test(requested)) {
+			// sessionId 参与工作区路径拼接：`../../..` 能把 agent 的 cwd
+			// 指到网关主机上任意目录，顺带让所有按仓库相对路径写的策略脱靶
+			closeWith(ws, "非法的 session id");
 			return;
 		}
 
+		const existing = requested ? this.#sessions.get(requested) : undefined;
+		if (existing) {
+			if (this.#owners.get(requested!) !== actor) {
+				// 会话 id 会出现在 URL、日志与审计里；仅凭知道 id 就能接管
+				// 别人的会话（发 prompt、批准别人挂起的审批）是越权
+				closeWith(ws, "无权接入该会话");
+				return;
+			}
+			attach(ws, existing, actor);
+			return;
+		}
+
+		if (this.#sessions.size >= (this.#cfg.maxSessions ?? 50)) {
+			closeWith(ws, "会话数已达上限");
+			return;
+		}
+
+		const sessionId = requested ?? randomUUID();
+		// 策略作用域由服务端决定：客户端自选 repo/team 等于自选适用规则
+		const scope = this.#cfg.resolveScope?.(actor) ?? { repo: "default", team: "default" };
 		const session = new Session({
 			sessionId,
 			actor,
-			repo,
-			team,
+			repo: scope.repo,
+			team: scope.team,
 			workspace: join(this.#cfg.workspaceRoot, sessionId),
 			policyFile: this.#cfg.policyFile,
 			audit: this.#audit,
@@ -110,33 +177,41 @@ export class Gateway {
 			piArgs: this.#cfg.piArgs,
 			piEnv: this.#cfg.piEnv,
 			approvalTimeoutMs: this.#cfg.approvalTimeoutMs,
-			send: (ev, seq) => broadcast(session, ev, seq),
+			send: (ev, seq, target) => broadcast(session, ev, seq, target),
 		});
 		this.#sessions.set(sessionId, session);
-		attach(ws, session);
+		this.#owners.set(sessionId, actor);
+		attach(ws, session, actor);
 		void session.start();
 	}
 
 	#serveStatic(req: IncomingMessage, res: ServerResponse): void {
 		const url = new URL(req.url ?? "/", "http://localhost");
-		const rel = url.pathname === "/" ? "/index.html" : url.pathname;
-		// 归一化后必须仍在 webRoot 下，否则 ../ 能读到仓库里的任意文件
-		const file = join(this.#cfg.webRoot, normalize(rel));
-		if (!file.startsWith(this.#cfg.webRoot) || !existsSync(file)) {
+		const rel = url.pathname === "/" ? "/index.html" : decodeURIComponent(url.pathname);
+		const file = resolve(join(this.#webRoot, normalize(rel)));
+		// 带分隔符比较：裸 startsWith 会让 /srv/web 放行 /srv/website/...
+		if (!(file === this.#webRoot || file.startsWith(this.#webRoot + sep)) || !existsSync(file)) {
 			res.writeHead(404).end("not found");
 			return;
 		}
-		res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
+		res.writeHead(200, {
+			"content-type": MIME[extname(file)] ?? "application/octet-stream",
+			// token 在 URL 里是 Phase 1 的已声明取舍，正因如此更需要 CSP 兜住 XSS
+			"content-security-policy": "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:",
+			"x-frame-options": "DENY",
+			"referrer-policy": "no-referrer",
+		});
 		createReadStream(file).pipe(res);
 	}
 }
 
 /** 一个会话可以同时连着多个传输（刷新页面、多标签），事件广播给全部 */
-const transports = new WeakMap<Session, Set<WebSocket>>();
+const transports = new WeakMap<Session, Set<Conn>>();
 
-function attach(ws: WebSocket, session: Session): void {
-	const set = transports.get(session) ?? new Set<WebSocket>();
-	set.add(ws);
+function attach(ws: WebSocket, session: Session, actor: string): void {
+	const set = transports.get(session) ?? new Set<Conn>();
+	const conn: Conn = { ws, actor };
+	set.add(conn);
 	transports.set(session, set);
 
 	ws.on("message", (raw) => {
@@ -144,23 +219,33 @@ function attach(ws: WebSocket, session: Session): void {
 		try {
 			cmd = JSON.parse(String(raw)) as ClientCommand;
 		} catch {
-			ws.send(JSON.stringify({ seq: 0, event: { type: "error", code: "command_failed", message: "非法的命令 JSON" } }));
+			ws.send(JSON.stringify({ type: "control", control: "error", message: "非法的命令 JSON" }));
 			return;
 		}
-		session.handle(cmd);
+		// 审批人是实际点下按钮的那条连接，不是会话创建者
+		session.handle(cmd, actor, conn);
 	});
-	ws.on("close", () => set.delete(ws));
+	ws.on("close", () => set.delete(conn));
 	// 传输层错误不应连带打死会话：任务在服务端继续跑，用户重连即可续上
-	ws.on("error", () => set.delete(ws));
+	ws.on("error", () => set.delete(conn));
 
-	ws.send(JSON.stringify({ seq: session.lastSeq, event: { type: "session.state", streaming: false, messageCount: 0, model: null } }));
+	// 控制帧不参与 seq 序列。之前这里发的是一条 seq=lastSeq 的伪 session.state，
+	// 它会把前端的 state.seq 直接顶到最新，导致随后 resume 补发的事件
+	// 全部被「seq <= state.seq」的去重逻辑丢掉 —— 断线期间的事件实际补不回来。
+	ws.send(JSON.stringify({ type: "control", control: "attached", lastSeq: session.lastSeq }));
 }
 
-function broadcast(session: Session, event: ClientEvent, seq: number): void {
+function broadcast(session: Session, event: ClientEvent, seq: number, target?: unknown): void {
 	const payload = JSON.stringify({ seq, event });
-	for (const ws of transports.get(session) ?? []) {
-		if (ws.readyState === ws.OPEN) ws.send(payload);
+	for (const conn of transports.get(session) ?? []) {
+		if (target && conn !== target) continue;
+		if (conn.ws.readyState === conn.ws.OPEN) conn.ws.send(payload);
 	}
+}
+
+function closeWith(ws: WebSocket, message: string): void {
+	ws.send(JSON.stringify({ type: "control", control: "error", message }));
+	ws.close(4003, message);
 }
 
 function bearer(header: string | undefined): string | null {
@@ -170,17 +255,20 @@ function bearer(header: string | undefined): string | null {
 // 直接运行时按环境变量启动
 if (process.argv[1] && import.meta.filename === process.argv[1]) {
 	const root = join(import.meta.dirname, "..", "..");
+	const token = process.env.PERIMETER_TOKEN ?? "dev-token";
+	mkdirSync(join(root, "audit-data"), { recursive: true });
 	const gw = new Gateway({
 		port: Number(process.env.PORT ?? 8787),
 		host: process.env.HOST ?? "127.0.0.1",
-		token: process.env.PERIMETER_TOKEN ?? "dev-token",
+		token,
 		policyFile: process.env.PERIMETER_POLICY_FILE ?? join(root, "config/policy.yaml"),
 		auditFile: process.env.PERIMETER_AUDIT_FILE ?? join(root, "audit-data/audit.jsonl"),
 		workspaceRoot: process.env.PERIMETER_WORKSPACES ?? join(root, "workspaces"),
 		webRoot: join(root, "web"),
 		piArgs: process.env.PERIMETER_PI_ARGS?.split(" ").filter(Boolean),
+		// 显式白名单：pi 只拿到跑起来必需的变量，网关的 token 不在其中
+		piEnv: { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG },
 	});
-	mkdirSync(join(root, "audit-data"), { recursive: true });
 	const port = await gw.listen();
-	console.log(`网关已启动 http://127.0.0.1:${port}/?token=${process.env.PERIMETER_TOKEN ?? "dev-token"}`);
+	console.log(`网关已启动 http://127.0.0.1:${port}/?token=${token}`);
 }
