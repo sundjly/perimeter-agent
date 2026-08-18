@@ -1,0 +1,82 @@
+# 每会话独占的沙箱 Pod。网关按此模板创建，会话结束即销毁。
+#
+# 三条与安全模型直接对应的设置，改动前请先读 §4.5/§4.6：
+# 1. runtimeClassName: gvisor —— 内核级隔离，且不需要嵌套虚拟化
+#    （Firecracker 冷启更快，但很多客户的云环境不支持嵌套虚拟化，
+#     所以它不是默认选项）
+# 2. 没有任何 secret 挂载、没有 serviceAccount token —— 铁律 2：
+#    凭据永不进沙箱。git 走凭据代理，模型 key 只在模型网关
+# 3. 只读根文件系统 + 非 root + 丢弃全部 capability
+apiVersion: v1
+kind: Pod
+metadata:
+  name: perimeter-sandbox-SESSION_ID
+  labels:
+    app.kubernetes.io/name: perimeter-sandbox
+    perimeter.dev/session: SESSION_ID
+spec:
+  runtimeClassName: gvisor
+  # 不给 Pod 挂 SA token：沙箱没有任何理由访问 K8s API
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  # 会话空闲回收由网关负责；这里兜一个硬上限，防止 Pod 泄漏
+  activeDeadlineSeconds: 14400
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: agent
+      # 客户自带构建镜像：环境保真度是选云沙箱而非浏览器内执行的首要理由
+      image: CUSTOMER_BUILD_IMAGE
+      imagePullPolicy: IfNotPresent
+      command: ["pi", "--mode", "rpc"]
+      workingDir: /workspace
+      env:
+        # 沙箱只知道两个内部地址，不知道任何真实凭据
+        - name: PERIMETER_MODEL_GATEWAY
+          value: http://model-gateway.internal:8080/v1
+        - name: PERIMETER_GIT_PROXY
+          value: http://git-proxy.internal:8080
+        - name: PERIMETER_POLICY_FILE
+          value: /etc/perimeter/policy.yaml
+        # 会话 token 不是 git/模型凭据：它只能用来访问上面两个代理，
+        # 且被代理按 repo allowlist 与 egress allowlist 二次约束
+        - name: PERIMETER_SESSION_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: perimeter-session-SESSION_ID
+              key: token
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: tmp
+          mountPath: /tmp
+        - name: policy
+          mountPath: /etc/perimeter
+          readOnly: true
+  volumes:
+    # 工作区不共享：横向移动的前提之一就是共享卷
+    - name: workspace
+      emptyDir:
+        sizeLimit: 10Gi
+    - name: tmp
+      emptyDir:
+        sizeLimit: 2Gi
+    - name: policy
+      configMap:
+        name: perimeter-policy

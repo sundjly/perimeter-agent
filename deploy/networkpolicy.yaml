@@ -1,0 +1,43 @@
+# 本文件由 `npm run gen:netpol` 从 config/policy.yaml 生成，请勿手改。
+# 唯一事实来源是 policy.yaml 的 egress.deny_all_except。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: perimeter-sandbox-egress
+  namespace: perimeter
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: perimeter-sandbox
+  policyTypes:
+    - Ingress
+    - Egress
+  # 入站全拒：沙箱不需要被任何人连进来，网关是主动连出去的一侧
+  ingress: []
+  egress:
+    # 放通 model-gateway.internal（由 config/policy.yaml 的 egress.deny_all_except 生成）
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: model-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+    # 放通 git-proxy.internal（由 config/policy.yaml 的 egress.deny_all_except 生成）
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: git-proxy
+      ports:
+        - protocol: TCP
+          port: 8080
+    # DNS 必须放通，否则上面那些主机名解析不了
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
