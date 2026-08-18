@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Perimeter Agent</title>
+		<link rel="stylesheet" href="/app.css" />
+	</head>
+	<body>
+		<header>
+			<div class="brand">
+				<span class="dot" id="conn-dot"></span>
+				<strong>Perimeter Agent</strong>
+				<span class="muted" id="model">—</span>
+			</div>
+			<div class="muted" id="usage">token 0</div>
+		</header>
+
+		<main>
+			<section class="pane" id="conversation-pane">
+				<h2>对话</h2>
+				<div id="stream" class="scroll"></div>
+				<form id="composer">
+					<textarea id="input" rows="3" placeholder="描述要做的事，例如：修复登录超时的 bug"></textarea>
+					<div class="row">
+						<button type="submit" id="send">发送</button>
+						<button type="button" id="abort" class="ghost">中止</button>
+					</div>
+				</form>
+			</section>
+
+			<section class="pane" id="audit-pane">
+				<h2>审计日志 <span class="muted" id="audit-count">0 条</span></h2>
+				<div id="audit" class="scroll mono"></div>
+			</section>
+		</main>
+
+		<div id="approval-backdrop" hidden>
+			<div id="approval">
+				<h3>需要人工审批</h3>
+				<p id="approval-reason"></p>
+				<p class="muted" id="approval-countdown"></p>
+				<div class="row">
+					<button id="approve-allow">批准</button>
+					<button id="approve-deny" class="danger">拒绝</button>
+				</div>
+				<p class="muted small">无人应答将按拒绝处理。</p>
+			</div>
+		</div>
+
+		<script type="module" src="/app.js"></script>
+	</body>
+</html>

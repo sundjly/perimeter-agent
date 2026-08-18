@@ -10,6 +10,8 @@ export interface PiSessionOptions {
 	/** 额外的 pi 参数，如 --provider / --model / --extension */
 	args?: string[];
 	sessionDir?: string;
+	/** 传给 pi 进程的环境变量。策略文件路径、会话上下文都经这里注入 */
+	env?: NodeJS.ProcessEnv;
 	requestTimeoutMs?: number;
 	/** 单行字符数上限，超过即判定对端异常并终止会话。默认 6400 万，
 	 * 足以容纳 pi 读大文件产生的 MB 级 tool 结果 */
@@ -55,7 +57,7 @@ export class PiSession {
 		// opts.args 排在强制参数之前，以便 bin 是 wrapper 时透传其自身参数
 		// （如 Phase 2 的 `kubectl exec -it <pod> -- pi`，或测试里的 `node <fake>.mjs`）
 		const args = [...(opts.args ?? []), "--mode", "rpc", ...(opts.sessionDir ? ["--session-dir", opts.sessionDir] : [])];
-		this.#proc = spawn(opts.bin ?? "pi", args, { cwd: opts.cwd, stdio: ["pipe", "pipe", "pipe"] });
+		this.#proc = spawn(opts.bin ?? "pi", args, { cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"] });
 
 		this.#proc.stdout.on("data", (chunk: Buffer) => this.#onStdout(chunk));
 		this.#proc.stderr.on("data", (chunk: Buffer) => opts.onStderr?.(this.#stderrDecoder.write(chunk)));
@@ -103,12 +105,15 @@ export class PiSession {
 		});
 	}
 
-	/** 发送命令，不等待响应 */
+	/**
+	 * 发送命令，不等待响应。
+	 * **保留调用方自带的 id**：extension_ui_response 用 id 关联它要回答的
+	 * 那个对话框，剥掉就等于审批永远送不回去。request() 用 q<N> 自行覆盖 id，
+	 * 撞号风险本就不存在。
+	 */
 	send(cmd: PiCommand): void {
 		if (!this.running) return;
-		// 剥掉调用方自带的 id，避免与 request 的 q<N> 撞号
-		const { id: _id, ...rest } = cmd;
-		this.#write(rest);
+		this.#write(cmd);
 	}
 
 	/** 优雅停止：SIGTERM，超时后 SIGKILL */
