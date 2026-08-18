@@ -45,10 +45,12 @@ rules:
       - "**/.npmrc"
       - "**/.ssh/**"
       - "**/.aws/**"
-      # agent 自己的配置面。pi 会自动发现项目本地的 .pi/extensions/，
-      # 而扩展能注册 tool_call 钩子 —— agent 写一个扩展就等于给自己发了
-      # 一张免检通行证，还能伪造判决上报污染审计。AGENTS.md 则是
-      # prompt injection 的标准载体（红队项就是往仓库里埋一个）。
+      # agent 自己的配置面。pi 会发现项目本地的 .pi/extensions/ 与
+      # .pi/settings.json 里声明的扩展。官方文档注明项目本地扩展要在
+      # 「项目被信任」之后才加载，所以这不是一条无条件可用的提权路径；
+      # 但信任状态取决于部署配置，而扩展能注册 tool_call 钩子、也能伪造
+      # 判决上报污染审计，封掉只要两行 YAML，按纵深防御处理。
+      # AGENTS.md 则是 prompt injection 的标准载体（红队项就是往仓库里埋一个）。
       - "**/.pi/**"
       - "**/AGENTS.md"
       - "**/CLAUDE.md"

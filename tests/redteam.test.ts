@@ -17,9 +17,11 @@ const CTX = { repo: "web", team: "platform" };
 
 const deny = (tool: string, arg: { path?: string; command?: string }) => POLICY.evaluate({ tool, ...arg }, CTX).decision;
 
-test("agent 不能给自己注册钩子：pi 会自动发现项目本地 .pi/extensions/", () => {
-	// 这是最直接的提权路径 —— 扩展能注册 tool_call 钩子，
-	// 也能伪造带 @@perimeter-audit@@ 前缀的判决上报污染审计
+test("agent 不能给自己注册钩子：pi 会发现项目本地 .pi/extensions/", () => {
+	// 扩展能注册 tool_call 钩子，也能伪造带 @@perimeter-audit@@ 前缀的判决
+	// 上报污染审计。官方文档注明项目本地扩展需「项目被信任」后才加载，
+	// 因此这不是无条件可用的提权路径；但信任状态取决于部署配置，
+	// 按纵深防御封掉，成本是两行 YAML。
 	assert.equal(deny("write", { path: ".pi/extensions/backdoor.ts" }), "deny");
 	assert.equal(deny("write", { path: ".pi/settings.json" }), "deny");
 	assert.equal(deny("edit", { path: "sub/project/.pi/extensions/x.ts" }), "deny");
