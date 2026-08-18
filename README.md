@@ -90,4 +90,15 @@ deploy/           K8s 清单
 
 整个 roadmap 里最重要的一条工程纪律：**前端永远不直接消费 pi 的事件格式**。
 
-`src/protocol/translate.ts` 与 `src/rpc/` 是仅有的两处允许知道 pi 存在的地方。Phase 2 把底层从 RPC 子进程换成直接 embed `pi-agent-core` 的 `AgentHarness` 时，只需重写这两处，`src/protocol/types.ts`、`web/`、策略引擎、审计、网关的其余部分零改动。
+**零改动的部分**（已核实无任何 pi 引用）：`src/protocol/types.ts`、`web/`、`src/policy/`、`src/audit/`、`src/modelgw/`、`src/gitproxy/`。前端与协议定义是这条纪律的主要受益者。
+
+**需要重写的部分**：
+
+| 位置 | 涉及的 pi 知识 |
+|---|---|
+| `src/protocol/translate.ts` | 全部事件与命令的格式转换，这是设计上的唯一转换点 |
+| `src/rpc/` | JSONL 成帧与子进程生命周期，路线 A 下整个消失 |
+| `src/gateway/policy-extension.ts` | pi 的扩展 API 与扩展 UI 子协议，改为直接注册 `beforeToolCall` |
+| `src/gateway/session.ts` | **仍直接消费三个 pi 事件类型名**：`extension_ui_request`（审批通道）、`tool_execution_start` / `tool_execution_end`（兜底审计）。这三处是纪律上的例外，Phase 2 要一并处理 |
+
+session.ts 那三处是有意识的取舍而非疏漏：审批通道与兜底审计都需要在 translate 之外做副作用（写审计、发审批），硬塞进纯转换函数会让 translate.ts 变成一个有状态的上帝对象。但它们确实构成迁移成本，不该在文档里被说成零。

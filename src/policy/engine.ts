@@ -43,7 +43,7 @@ const RULE_KEYS = new Set([
 /**
  * 策略引擎 v1。
  *
- * 挂载点是 pi 的 beforeToolCall 钩子与网关的 tool_execution_start 拦截。
+ * 挂载点是 pi 的 tool_call 钩子（见 gateway/policy-extension.ts）。
  * 契约（pi 官方要求）：**钩子不许 throw**。因此 evaluate 内部兜住一切异常，
  * 异常时返回 deny —— 策略引擎自身故障不能变成放行。
  * 与之相对，fromYaml 刻意 fail-fast：策略文件写错要在启动时炸掉，
