@@ -1,0 +1,109 @@
+# 策略引擎 v1 的默认规则集。按 repo/team 生效：给某条规则加 repos/teams 即可限定范围。
+#
+# 三档决策：deny（直接拒）> require_approval（推前端等人工确认）> allow。
+# 命令匹配前会折叠空白、给 shell 操作符补空格、剥掉 sudo/env/VAR=x 这类前导 token，
+# 并把 `a && b` 拆成整条 + 各子命令分别匹配。
+#
+# 未知字段会让加载直接失败（`deny_pattern` 少个 s 曾是静默失效的经典来源）。
+version: 1
+
+# 只读工具不受 deny_paths / require_approval_paths 约束。
+# 反过来说：任何不在这个名单里的工具，只要带 path 参数就按「会改文件」处理 ——
+# pi 新增或改名一个编辑类工具时，路径防线自动覆盖它，而不是静默漏掉。
+read_only_tools: [read, ls, grep, find, glob, tree, image]
+
+# 沙箱 NetworkPolicy 的唯一事实来源（由 deploy/ 的清单生成器消费）。
+# 默认 deny all，只放通两个内部出口 —— 这一条才是真正的安全边界，
+# 它直接杀掉 prompt injection 的数据外泄路径。
+egress:
+  deny_all_except:
+    - model-gateway.internal
+    - git-proxy.internal
+
+rules:
+  # ── 不可越权改动的路径（对所有非只读工具生效）────────────────
+  - name: ci-iac-secrets-off-limits
+    tool: "*"
+    deny_paths:
+      # CI/CD 定义：改了它就等于拿到流水线的执行权
+      - "**/.github/workflows/**"
+      - "**/.gitlab-ci.yml"
+      - "**/Jenkinsfile"
+      - "**/.circleci/**"
+      - "**/azure-pipelines.yml"
+      - "**/.buildkite/**"
+      # 构建与基础设施
+      - "**/Dockerfile"
+      - "**/Dockerfile.*"
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - "**/*.tf.json"
+      # 凭据
+      - "**/secrets/**"
+      - "**/.env"
+      - "**/.env.*"
+      - "**/.npmrc"
+      - "**/.ssh/**"
+      - "**/.aws/**"
+      # .git 内部：写 hooks 等于任意代码执行（之后任何一条 git commit 都会触发），
+      # 写 config 能改 credential.helper 或用 insteadOf 把 git-proxy 重定向走 ——
+      # 这会直接击穿「凭据不进沙箱」这条铁律。
+      - "**/.git/hooks/**"
+      - "**/.git/config"
+
+  # ── 破坏性与外泄类命令 ─────────────────────────────────────
+  - name: destructive-commands
+    tool: bash
+    deny_patterns:
+      - "rm -rf /"
+      # 不写成 `rm -rf /*`：那会连 `rm -rf /workspace/node_modules` 一起拒掉，
+      # 而 deny 没有审批兜底，agent 会在极常见的动作上直接卡死。
+      - "rm -rf /bin*"
+      - "rm -rf /etc*"
+      - "rm -rf /usr*"
+      - "rm -rf /var*"
+      # 反弹 shell 与远程执行。操作符两侧空格由 collapse 补齐，
+      # 所以 `>/dev/tcp/x` 与 `> /dev/tcp/x` 都会命中。
+      - "*/dev/tcp/*"
+      - "curl * | *sh"
+      - "wget * | *sh"
+      - "npm publish*"
+      - "pnpm publish*"
+      - "chmod -R 777 *"
+      - "history -c*"
+
+  # ── 不可逆操作：拦下来问人 ──────────────────────────────────
+  - name: irreversible-operations
+    tool: bash
+    require_approval:
+      # force push 的三种拼写统一到审批档。不 deny 的理由：远端 reflog 仍可挽回，
+      # 而硬拒 --force-with-lease 会逼人退回真正危险的 -f。
+      - "git push*"
+      - "git tag*"
+      - "kubectl *"
+      - "terraform apply*"
+      - "terraform destroy*"
+      - "aws *"
+      - "gcloud *"
+      - "docker push*"
+      - "helm *"
+      # 写 PR/MR 评论同样可能不可逆：Atlantis、Terraform Cloud 这类工具
+      # 监听 issue_comment，一条评论就能触发基础设施变更。
+      - "gh pr comment*"
+      - "gh issue comment*"
+      - "gh pr review*"
+      - "glab mr note*"
+      - "glab mr approve*"
+      - "* /repos/*/issues/*/comments*"
+      - "* /projects/*/merge_requests/*/notes*"
+
+  # ── 高风险路径：允许改但要人过目 ────────────────────────────
+  - name: sensitive-paths-need-review
+    tool: "*"
+    require_approval_paths:
+      - "**/package.json"
+      - "**/pnpm-lock.yaml"
+      - "**/package-lock.json"
+      - "**/go.mod"
+      - "**/pyproject.toml"
+      - "**/requirements.txt"
