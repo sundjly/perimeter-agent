@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 172 个测试
+npm test          # 177 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -36,7 +36,7 @@ npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 | 铁律 | 落地位置 | 现状 |
 |---|---|---|
 | 代码永不离开 Data Plane | 审计只记 hash 不记源码（`src/audit/log.ts`） | ⚠️ 有一处有意例外：`command` 存原文（heredoc 写文件、带凭据的 curl 同样会落库），导出 SIEM 前须视为敏感字段 |
-| 凭据永不进沙箱 | git 凭据代理（`src/gitproxy/`）、模型网关（`src/modelgw/`）、pi 子进程 env 白名单 | ✅ |
+| 凭据永不进沙箱 | git 凭据代理（`src/gitproxy/`）、模型网关（`src/modelgw/`）、pi 子进程 env 白名单 | ✅ 端到端验证：三种凭据分处三地，测试遍历沙箱全部文件断言其中只有代理 token |
 | egress 双出口 + 默认拒绝 | `config/policy.yaml` 的 `egress.deny_all_except` → 生成 `deploy/networkpolicy.yaml` | ❌ **设计承诺，不是运行中的事实**。清单只做了生成与静态校验，没有任何代码去 apply 它 |
 | 每次工具调用过策略且留痕 | pi 扩展注入 `tool_call` 钩子（`src/gateway/policy-extension.ts`） | ✅ 钩子级粒度，见下。但**路径规则对 bash 不生效**，见「边界」 |
 
@@ -85,11 +85,10 @@ deploy/           K8s 清单
 网关会为每个会话生成沙箱侧配置（`src/gateway/sandbox-config.ts`）：`models.json` 的 baseUrl 指向模型网关、apiKey 写会话 token；git 的 `insteadOf` 规则把上游 SCM 重写到 git 代理并关掉本地 credential helper。
 
 - **模型网关**：已在 demo 与端到端测试里跑通。测试遍历沙箱能看到的全部文件，断言其中既无上游凭据、也无网关 token，只有代理 token；请求确实经过模型网关（有计量记录）。**三个 token 刻意取不同的值** —— 代理 token 若等于网关 token，agent 读到 models.json 就能连回网关批准自己挂起的审批，网关构造时会拒绝这种配置。
-- **git 代理**：配置生成有测试覆盖，但 demo 没有起 git 代理，也没有真实上游仓库可指 —— 这条链路**未端到端验证**。
+- **git 代理**：已接上。demo 会起一个真实的上游 git 仓库 + smart HTTP 服务 + 凭据代理，会话启动时网关经代理 clone（审计里有冷启动打点，本机实测 ~120ms）。审批通过后推送真的到达上游仓库，可以当场 `git log` 验证。
 
-**其余未在真实环境验证：**
+**Week 3 验收标准已兑现**（`tests/git-e2e.test.ts`）：真实 git 客户端经凭据代理完成 clone 与 push，改动确实进入上游裸仓库；沙箱侧只有代理 token，上游 git 凭据不在其中；只读仓库的 push 被拒且不到达上游；allowlist 之外的仓库 clone 直接失败。
 
-- git 代理的真实 `git clone` / `git push` 端到端**未自动化验证**（本机系统级 git 配置会干扰无人值守运行）。Week 3 验收里的这一条需要在演示环境用真实 GitLab 手动跑一次
 
 **明确没做：**
 

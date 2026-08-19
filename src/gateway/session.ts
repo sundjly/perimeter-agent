@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AuditInput, AuditLog } from "../audit/log.ts";
@@ -37,6 +38,11 @@ export interface SessionOptions {
 	wiring?: SandboxWiring;
 	/** 沙箱 HOME 的位置。必须在 workspace 之外，否则含 token 的配置会被 commit 进仓库 */
 	sandboxHome?: string;
+	/**
+	 * 会话启动时要 clone 的仓库（上游真实地址，由 insteadOf 重写到凭据代理）。
+	 * 这是策略文档 §4.3 时序里的 `GW->SBX: git clone（经凭据代理，token 不落沙箱）`。
+	 */
+	repoUrl?: string;
 	/** 断线续接的事件缓存条数 */
 	backlogSize?: number;
 	/** target 非空时只投递给该传输（resume 的重放不该洪泛给其他标签页） */
@@ -90,6 +96,7 @@ export class Session {
 	#queuedWhileDisarmed: ClientCommand[] = [];
 
 	#toolNames = new Map<string, string>();
+	#sandboxHome: string | undefined;
 
 	constructor(opts: SessionOptions) {
 		this.#opts = opts;
@@ -98,6 +105,7 @@ export class Session {
 		// 接线：沙箱只拿到指向两个代理的配置，真凭据留在代理进程里
 		const wired =
 			opts.wiring && opts.sandboxHome ? writeSandboxConfig(opts.sandboxHome, opts.wiring) : null;
+		this.#sandboxHome = wired?.home;
 
 		this.#pi = new PiSession({
 			cwd: opts.workspace,
@@ -149,6 +157,7 @@ export class Session {
 	 */
 	async start(): Promise<void> {
 		this.#audit({ kind: "session.start", summary: `会话开始 workspace=${this.#opts.workspace}` });
+		if (this.#opts.repoUrl && !(await this.#cloneRepo(this.#opts.repoUrl))) return;
 		try {
 			const res = await this.#pi.request({ type: "get_state" });
 			for (const ev of toClientEventFromResponse(res)) {
@@ -202,6 +211,40 @@ export class Session {
 		}
 		const piCmd = toPiCommand(cmd);
 		if (piCmd) this.#pi.send(piCmd);
+	}
+
+	/**
+	 * 由**网关**执行 clone，而不是让 agent 自己 clone。
+	 * 两个原因：工作区在 agent 拿到控制权之前就该是就绪状态；
+	 * 而且 clone 用的是网关生成的 HOME 配置，凭据仍然只在代理那一侧。
+	 */
+	async #cloneRepo(repoUrl: string): Promise<boolean> {
+		const home = this.#sandboxHome;
+		const started = Date.now();
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const proc = spawn("git", ["clone", "-q", repoUrl, "."], {
+					cwd: this.#opts.workspace,
+					env: { PATH: process.env.PATH ?? "", HOME: home ?? this.#opts.workspace, GIT_TERMINAL_PROMPT: "0" },
+					stdio: ["ignore", "ignore", "pipe"],
+				});
+				let stderr = "";
+				proc.stderr.on("data", (c: Buffer) => {
+					stderr += c.toString();
+				});
+				proc.on("error", reject);
+				proc.on("close", (code) => (code === 0 ? resolve() : reject(new Error(stderr.trim() || `git clone exit ${code}`))));
+			});
+		} catch (err) {
+			// clone 失败就别让会话跑起来：agent 会在一个空目录里瞎猜
+			this.#alive = false;
+			this.#audit({ kind: "error", summary: `clone 失败：${String(err).slice(0, 200)}` });
+			this.#emit({ type: "error", code: "agent_error", message: `仓库 clone 失败：${String(err).slice(0, 300)}` });
+			return false;
+		}
+		// 冷启动打点：Week 3 的目标是含 clone < 5s
+		this.#audit({ kind: "session.start", summary: `clone 完成（${Date.now() - started}ms）`, durationMs: Date.now() - started });
+		return true;
 	}
 
 	async stop(): Promise<void> {

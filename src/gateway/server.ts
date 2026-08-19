@@ -38,6 +38,8 @@ export interface GatewayConfig {
 	 * proxyToken 必须与本网关的 token 不同 —— 构造时断言，理由见 SandboxWiring。
 	 */
 	wiring?: SandboxWiring;
+	/** 每个会话启动时 clone 的仓库（上游真实地址，经 insteadOf 重写到凭据代理） */
+	repoUrl?: string;
 }
 
 const MIME: Record<string, string> = {
@@ -194,6 +196,7 @@ export class Gateway {
 			// HOME 放在 workspace 之外：放在里面的话，agent 一句
 			// git add -A && git commit 就把含 token 的 .gitconfig 提交进仓库
 			sandboxHome: join(this.#cfg.workspaceRoot, ".homes", sessionId),
+			repoUrl: this.#cfg.repoUrl,
 			send: (ev, seq, target) => broadcast(session, ev, seq, target),
 		});
 		this.#sessions.set(sessionId, session);

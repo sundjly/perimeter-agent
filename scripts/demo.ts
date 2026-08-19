@@ -1,9 +1,10 @@
-import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog } from "../src/audit/log.ts";
 import { Gateway } from "../src/gateway/server.ts";
+import { GitCredentialProxy } from "../src/gitproxy/server.ts";
 import { ModelGateway } from "../src/modelgw/server.ts";
 
 /**
@@ -44,7 +45,7 @@ const real = process.env.PERIMETER_DEMO_REAL === "1";
 const script = [
 	{ tool: "write", args: { path: "src/session.ts", content: "// 超时从 5s 调整为 30s\nexport const TIMEOUT_MS = 30_000;\n" } },
 	{ tool: "write", args: { path: ".github/workflows/deploy.yml", content: "on: push" } },
-	{ tool: "bash", args: { command: "git push origin fix/login-timeout" } },
+	{ tool: "bash", args: { command: "git add -A && git commit -qm '修复登录超时' && git push origin main" } },
 	{ text: "已把登录超时从 5 秒调整为 30 秒。CI 配置的改动被策略拒绝，推送在等你批准。" },
 ];
 
@@ -55,7 +56,11 @@ const piEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH, LANG: process.env.LAN
 // 真实模型模式下不接线，pi 需要操作员的 HOME 才能读到常规 provider 配置
 if (real) piEnv.HOME = process.env.HOME;
 
-let wiring: { proxyToken: string; modelGatewayUrl: string; model: string } | undefined;
+let wiring:
+	| { proxyToken: string; modelGatewayUrl: string; model: string; gitProxyUrl: string; scmHosts: string[] }
+	| undefined;
+let repoUrl: string | undefined;
+let upstreamRepo: string | undefined;
 let piArgs = process.env.PERIMETER_PI_ARGS?.split(" ").filter(Boolean) ?? [];
 
 if (!real) {
@@ -86,8 +91,58 @@ if (!real) {
 	const modelPort = await modelGw.listen();
 	process.on("exit", () => void modelGw.close());
 
-	// ③ 接线：沙箱只看到模型网关的地址 + 会话 token
-	wiring = { proxyToken: PROXY_TOKEN, modelGatewayUrl: `http://127.0.0.1:${modelPort}/v1`, model: "mock-model" };
+	// ③ 一个真实的上游 git 仓库（扮演 GitLab 的位置）
+	const scmRoot = mkdtempSync(join(tmpdir(), "perimeter-scm-"));
+	upstreamRepo = join(scmRoot, "app.git");
+	const seed = mkdtempSync(join(tmpdir(), "perimeter-seed-"));
+	const g = (args: string[], cwd: string) =>
+		execFileSync("git", args, {
+			cwd,
+			env: { PATH: process.env.PATH ?? "", HOME: cwd, GIT_AUTHOR_NAME: "seed", GIT_AUTHOR_EMAIL: "s@s", GIT_COMMITTER_NAME: "seed", GIT_COMMITTER_EMAIL: "s@s" },
+		});
+	g(["init", "-q", "-b", "main"], seed);
+	writeFileSync(join(seed, "src.txt"), "登录超时目前写死 5 秒\n");
+	g(["add", "."], seed);
+	g(["commit", "-qm", "初始提交"], seed);
+	g(["init", "-q", "--bare", upstreamRepo], scmRoot);
+	g(["remote", "add", "origin", upstreamRepo], seed);
+	g(["push", "-q", "origin", "main"], seed);
+
+	const scmAuth = `Basic ${Buffer.from("x-access-token:UPSTREAM-GIT-TOKEN-never-leaves-proxy").toString("base64")}`;
+	const scm = spawn(process.execPath, [join(root, "tests/fixtures/git-http-server.mjs"), scmRoot, scmAuth], {
+		stdio: ["ignore", "pipe", "inherit"],
+	});
+	const scmPort: number = await new Promise((r) => scm.stdout.once("data", (d) => r(JSON.parse(d.toString()).port)));
+	process.on("exit", () => scm.kill());
+
+	// ④ git 凭据代理 —— 唯一持有 git token 的进程
+	const gitAudit = AuditLog.open(join(root, "audit-data/gitproxy.jsonl"));
+	const gitProxy = new GitCredentialProxy({
+		port: 0,
+		host: "127.0.0.1",
+		token: PROXY_TOKEN,
+		audit: gitAudit,
+		repos: [
+			{
+				name: "git.internal/app.git",
+				upstream: `http://127.0.0.1:${scmPort}/app.git`,
+				username: "x-access-token",
+				token: "UPSTREAM-GIT-TOKEN-never-leaves-proxy",
+			},
+		],
+	});
+	const gitProxyPort = await gitProxy.listen();
+	process.on("exit", () => void gitProxy.close());
+
+	// ⑤ 接线：沙箱只看到两个代理的地址 + 代理 token
+	wiring = {
+		proxyToken: PROXY_TOKEN,
+		modelGatewayUrl: `http://127.0.0.1:${modelPort}/v1`,
+		model: "mock-model",
+		gitProxyUrl: `http://127.0.0.1:${gitProxyPort}`,
+		scmHosts: ["git.internal"],
+	};
+	repoUrl = "https://git.internal/app.git";
 	piArgs = ["--no-session"];
 }
 
@@ -102,6 +157,7 @@ const gw = new Gateway({
 	piArgs,
 	piEnv,
 	wiring,
+	repoUrl,
 	approvalTimeoutMs: 120_000,
 	resolveScope: () => ({ repo: "demo-app", team: "platform" }),
 });
@@ -115,10 +171,17 @@ console.log(`
   审计日志：${auditFile}
 ${real ? "" : `
 链路：浏览器 → 网关 → pi（沙箱）→ 模型网关 → mock 模型
-上游凭据只在模型网关进程里。沙箱侧的 models.json 写的是代理 token
-（${PROXY_TOKEN}），与浏览器用的网关 token（${TOKEN}）是**不同的两个值** ——
-演示时当场打开给客户看，这是「凭据域分离」最直观的证据。
+                              └→ git 凭据代理 → 上游仓库
+
+会话启动时网关已经经凭据代理 clone 了仓库。三种凭据分处三地：
+  · 网关 token（${TOKEN}）      —— 浏览器用，沙箱看不到
+  · 代理 token（${PROXY_TOKEN}）—— 沙箱用，只能访问两个代理
+  · 上游 API key 与 git token   —— 只在两个代理进程里，沙箱与浏览器都看不到
+沙箱侧的 models.json 与 .gitconfig 里写的是代理 token，演示时当场打开给客户看。
 HOME 在 workspace 之外，agent 的 git commit 带不走它。
+
+审批通过后推送会真的到达上游仓库，可以当场验证：
+  git -C ${upstreamRepo ?? ""} log --oneline -2 main
 `}
 试着发一句「修复登录超时的 bug」，会看到：
   1. 改源码 → 放行，审计里出现 policy.verdict allow
