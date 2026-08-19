@@ -38,7 +38,7 @@ npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 | 代码永不离开 Data Plane | 审计只记 hash 不记源码（`src/audit/log.ts`） | ⚠️ 有一处有意例外：`command` 存原文（heredoc 写文件、带凭据的 curl 同样会落库），导出 SIEM 前须视为敏感字段 |
 | 凭据永不进沙箱 | git 凭据代理（`src/gitproxy/`）、模型网关（`src/modelgw/`）、pi 子进程 env 白名单 | ✅ 端到端验证：三种凭据分处三地，两组测试各自遍历沙箱全树：wiring 那组断言无模型 key 与网关 token，git-e2e 那组断言无上游 git token、且代理 token 不在 workspace 内（落进去就会被 agent 一句 git add -A 推到上游） |
 | egress 双出口 + 默认拒绝 | `config/policy.yaml` 的 `egress.deny_all_except` → 生成 `deploy/networkpolicy.yaml` | ❌ **设计承诺，不是运行中的事实**。清单只做了生成与静态校验，没有任何代码去 apply 它 |
-| 每次工具调用过策略且留痕 | pi 扩展注入 `tool_call` 钩子（`src/gateway/policy-extension.ts`） | ✅ 钩子级粒度，见下。但**路径规则对 bash 不生效**，见「边界」 |
+| 每次工具调用过策略且留痕 | pi 扩展注入 `tool_call` 钩子（`src/gateway/policy-extension.ts`） | ✅ 钩子级粒度，容器里同样生效。但**路径规则对 bash 不生效**，见「边界」 |
 
 ## 一个被验证的关键判断
 
@@ -59,7 +59,7 @@ src/protocol/     自有事件协议 —— 前端永不见 pi 的格式（Phase
 src/rpc/          JSONL 成帧 + pi 子进程生命周期
 src/policy/       策略引擎：deny / require_approval / allow
 src/audit/        append-only 审计日志（哈希链）
-src/gateway/      会话网关、审批门、策略扩展
+src/gateway/      会话网关、审批门、策略扩展、执行后端（local/docker/kubectl）
 src/modelgw/      模型网关：出口 allowlist、凭据隔离、计量配额
 src/gitproxy/     git 凭据代理
 src/deploy/       从策略文件生成 NetworkPolicy
@@ -74,11 +74,25 @@ deploy/           K8s 清单
 
 这一节是给自己和客户安全团队看的，**销售材料里不要越过它**。
 
-**Phase 1 的运行形态没有沙箱 —— 这是最重要的一条：**
+**沙箱：容器后端已实现并验证，K8s 后端未验证：**
 
-网关直接在宿主机上、以自己的 OS 用户 spawn 一个 pi 子进程，只设了 `cwd`，**没有 FS 挂载限制、没有网络限制**。`deploy/sandbox.yaml`（gVisor + 只读根 + 无 SA token + 每会话独占 Pod）与 `deploy/networkpolicy.yaml` 只做了生成与静态校验，**没有在真实集群上跑过，也没有任何代码去创建它们**。
+`src/gateway/execution-backend.ts` 把「pi 进程在哪儿跑」抽象成三种后端：
 
-因此「每会话独占沙箱」与「egress 默认 deny」这两条边界目前是**设计承诺，不是运行中的事实**：演示环境里 agent 的 bash 能访问网关宿主机的文件系统与公网。四条铁律里今天在代码中真正成立的只有「凭据不进沙箱」与「工具调用过策略且留痕」。
+| 后端 | 隔离 | 状态 |
+|---|---|---|
+| `local` | **无** —— agent 与网关同一个 OS 用户 | 默认，开发与 demo 用，**不是生产形态** |
+| `docker` | 只读根、非 root、drop ALL caps、no-new-privileges、只挂工作区与 HOME | ✅ 本机实测（见下） |
+| `kubectl` | 由 `deploy/sandbox.yaml` 的 Pod 定义决定 | ❌ 只验证了生成的命令行形状，**未在真实集群跑过** |
+
+docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时整组跳过并说明原因）：
+
+- 容器里看不到宿主机文件系统（`/Users` 不存在），工作区正常挂入，uid 10001 非 root
+- 根文件系统只读，只有 `/tmp` 与工作区可写
+- 挂进去的策略扩展与策略文件是**只读**的 —— agent 改不了自己的策略
+- `--network none` 下确实无法出网，证明 egress 阻断机制有效
+- **端到端：整个会话跑在容器里，策略钩子照常拦下写 CI 配置的操作**
+
+仍未做的是 **Pod 的创建与回收**（gVisor runtimeClass、NetworkPolicy 绑定）：`deploy/` 下的清单只做了生成与静态校验，没有代码去创建它们。因此「每会话独占沙箱」在 docker 后端下成立，在 K8s 形态下仍是设计承诺。
 
 **接线：模型网关已接，git 代理未接到 demo：**
 
@@ -100,7 +114,7 @@ deploy/           K8s 清单
 
 - **路径 deny 规则只对带 `path` 参数的工具（write/edit 等）生效。** bash 按命令模式匹配，`echo x > .github/workflows/ci.yml` 在本引擎眼里没有路径。也就是说 `config/policy.yaml` 里那份 deny_paths 清单（CI、IaC、`.pi/**`、`AGENTS.md`、`.git/config`）**对 bash 写文件不成立**，只能靠命令黑名单兜 —— 而黑名单如下一条所述不是安全边界。要让路径规则真正统一，需要 Phase 2 在 FS 层（RemoteExecutionEnv）收口。`tests/redteam.test.ts` 里有一条测试专门断言这个局限。
 - **只读工具豁免路径规则**，因此 `read .env` / `read ~/.aws/credentials` 是放行的，内容会进模型上下文。这是为避免审批疲劳的有意取舍（每次读 `package.json` 都要人批，几轮后操作员就会无脑点同意），缓解手段是模型网关的凭据检测，它现已在链路上，但只告警不阻断。
-- **命令黑名单是启发式，不是安全边界。** shell 的求值方式（变量展开、base64、别名、间接调用）注定它可被绕过。设计上的真边界是 egress 默认 deny + 凭据不进沙箱 + 每会话独占沙箱，而其中两条目前尚未运行（见上）。`tests/redteam.test.ts` 里有一条测试**刻意断言黑名单拦不住**。
+- **命令黑名单是启发式，不是安全边界。** shell 的求值方式（变量展开、base64、别名、间接调用）注定它可被绕过。真边界是 egress 默认 deny + 凭据不进沙箱 + 每会话独占沙箱 —— 后两条在 docker 后端下已成立，egress 那条仍取决于部署（见上）。`tests/redteam.test.ts` 里有一条测试**刻意断言黑名单拦不住**。
 - **egress allowlist 即便部署了，也只杀掉「直连任意外部主机」这一类外泄。** 生成的策略必须放通 DNS（否则内部主机名都解析不了），DNS 隧道仍然可行；经模型网关的请求体本身也是一条合法外泄通道（凭据检测是 audit-only，不阻断不改写）。
 - **哈希链防的是意外损坏与粗糙篡改，不防有文件写权限的攻击者** —— 那种攻击者能从头重算整条链，也能截断尾部。要升级为防恶意篡改需要外部锚点（链头是纯元数据，可以出 Data Plane），`AuditLog.verify(path, expectedHead)` 已留入口，上报由部署侧接。安全白皮书里必须同口径表述，不要写成「防篡改」。
 - **PII/secret 检测只做 audit-only**（检测 + 告警，不改写流）。对代码流做正则/熵改写误伤率高，会直接破坏生成质量；阻断模式要等有真实误报数据再上。
@@ -121,3 +135,27 @@ deploy/           K8s 清单
 | `src/gateway/session.ts` | **仍直接消费三个 pi 事件类型名**：`extension_ui_request`（审批通道）、`tool_execution_start` / `tool_execution_end`（兜底审计）。这三处是纪律上的例外，Phase 2 要一并处理 |
 
 session.ts 那三处是有意识的取舍而非疏漏：审批通道与兜底审计都需要在 translate 之外做副作用（写审计、发审批），硬塞进纯转换函数会让 translate.ts 变成一个有状态的上帝对象。但它们确实构成迁移成本，不该在文档里被说成零。
+
+## 用容器后端跑
+
+```bash
+docker build -t perimeter-sandbox:test -f deploy/sandbox.Dockerfile .
+npm test   # 容器组会自动跑；没有 docker 时整组跳过并说明原因
+```
+
+网关侧接上后端：
+
+```ts
+new Gateway({
+  …,
+  backend: new DockerBackend({
+    image: "perimeter-sandbox:test",
+    repoRoot: process.cwd(),
+    // 生产上应当用 internal 网络并把两个代理也放进去 ——
+    // internal 网络禁止出公网，这才是 egress 默认 deny 的落地形态
+    network: "perimeter-internal",
+  }),
+});
+```
+
+策略扩展跑在 pi 进程内，因此容器必须能看到它：后端会把 `src/`、`config/`、`node_modules/` 三个子树**只读**挂进 `/opt/perimeter`。刻意不整仓挂载——`audit-data/` 与 `workspaces/` 都在仓库里，挂进去等于让 agent 读到审计日志和别的会话的工作区。

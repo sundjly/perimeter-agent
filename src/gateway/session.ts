@@ -16,6 +16,7 @@ import {
 	toPiCommand,
 } from "../protocol/translate.ts";
 import { PiSession } from "../rpc/pi-session.ts";
+import { type ExecutionBackend, LocalBackend } from "./execution-backend.ts";
 import { type SandboxWiring, writeSandboxConfig } from "./sandbox-config.ts";
 import { APPROVE, AUDIT_PREFIX, REJECT } from "./policy-extension.ts";
 
@@ -29,6 +30,8 @@ export interface SessionOptions {
 	audit: AuditLog;
 	piBin?: string;
 	piArgs?: string[];
+	/** pi 进程在哪儿跑。不给则直接在宿主机 spawn（无隔离） */
+	backend?: ExecutionBackend;
 	piEnv?: NodeJS.ProcessEnv;
 	approvalTimeoutMs?: number;
 	/**
@@ -118,22 +121,38 @@ export class Session {
 		// 不需要 clone 的会话，工作区从一开始就是就绪的
 		this.#workspaceReady = !opts.repoUrl;
 
+		// 执行后端决定 pi 跑在哪儿（宿主机 / 容器 / Pod）。
+		// 上层的策略、审批、审计、协议都不感知这个差别。
+		const sandboxEnv: NodeJS.ProcessEnv = {
+			PERIMETER_REPO: opts.repo,
+			PERIMETER_TEAM: opts.team,
+			PERIMETER_APPROVAL_TIMEOUT_MS: String(opts.approvalTimeoutMs ?? 120_000),
+		};
+		const backend = opts.backend ?? new LocalBackend(opts.piEnv ?? {});
+		const launch = backend.launch({
+			sessionId: opts.sessionId,
+			workspace: opts.workspace,
+			home: wired?.home,
+			extensionPath: extensionPath(),
+			policyFile: opts.policyFile,
+			// 刻意不在这里传 PERIMETER_POLICY_FILE：它的值取决于 pi 进程
+			// 看到的文件系统，只有后端知道（容器里是挂载点）
+			env: sandboxEnv,
+		});
+		// 扩展路径与策略路径都必须是 pi 进程视角的路径：
+		// 容器里是挂载点，本机是仓库路径。两者都由后端给出。
+		const launchEnv = launch.env;
+
 		this.#pi = new PiSession({
 			cwd: opts.workspace,
-			bin: opts.piBin,
-			args: [...(opts.piArgs ?? []), ...(wired?.piArgs ?? []), "-e", extensionPath()],
+			bin: launch.bin,
+			args: [...launch.argsPrefix, ...(opts.piArgs ?? []), ...(wired?.piArgs ?? []), "-e", launch.extensionPath],
 			// 只传显式给定的环境变量。继承 process.env 会把网关的共享 token
 			// 与模型 key 一起交给 pi，而 pi 会执行 agent 的 bash 工具 ——
 			// agent 跑一句 env 就拿到了，与「凭据不进沙箱」正面冲突。
-			env: {
-				...(opts.piEnv ?? {}),
-				// 接线生成的 HOME 覆盖调用方给的：pi 从这里读 models.json 与 .gitconfig
-				...(wired ? { HOME: wired.home } : {}),
-				PERIMETER_POLICY_FILE: opts.policyFile,
-				PERIMETER_REPO: opts.repo,
-				PERIMETER_TEAM: opts.team,
-				PERIMETER_APPROVAL_TIMEOUT_MS: String(opts.approvalTimeoutMs ?? 120_000),
-			},
+			// 容器后端下环境变量已由后端经 -e 注入容器，这里只剩 docker
+			// 客户端自己需要的 PATH；local 后端则拿到完整的一份。
+			env: { PATH: process.env.PATH, ...launchEnv },
 			onEvent: (e) => this.#onPiEvent(e),
 			onResponse: (r) => this.#onPiResponse(r),
 			onExit: (info) => this.#onExit(info),
@@ -318,6 +337,10 @@ export class Session {
 	async stop(): Promise<void> {
 		if (this.#alive) this.#audit({ kind: "session.end", summary: "会话结束" });
 		this.#alive = false;
+		// **先杀容器再收客户端**。顺序反过来会挂住：SIGTERM 发给的是宿主机上的
+		// docker 客户端进程，容器内的 pi 收不到，容器继续跑、stdio 管道不关，
+		// pi.stop() 就一直等下去 —— 实测表现为测试进程挂死且容器泄漏。
+		await this.#opts.backend?.cleanup?.(this.#opts.sessionId);
 		await this.#pi.stop();
 	}
 
