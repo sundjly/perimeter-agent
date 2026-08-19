@@ -24,6 +24,7 @@ export type AuditKind =
 	| "approval.request"
 	| "approval.decision"
 	| "usage"
+	| "repo.clone"
 	| "git.push"
 	| "error";
 

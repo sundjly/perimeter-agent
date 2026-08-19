@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { AuditInput, AuditLog } from "../audit/log.ts";
 import { contentHash } from "../audit/log.ts";
@@ -95,10 +95,17 @@ export class Session {
 
 	/** 钩子存活握手 */
 	#hookArmed = false;
+	/**
+	 * 工作区就绪。pi 子进程在构造函数里就 spawn 了，而 clone 在 start() 里 ——
+	 * 只用 #hookArmed 当门的话，用户一连上就发 prompt 会让 agent 在
+	 * clone 还没完成的目录里开工。本机 clone ~120ms 看不出来，中型仓库必现。
+	 */
+	#workspaceReady = false;
 	#queuedWhileDisarmed: ClientCommand[] = [];
 
 	#toolNames = new Map<string, string>();
 	#sandboxHome: string | undefined;
+	#startedAt = Date.now();
 
 	constructor(opts: SessionOptions) {
 		this.#opts = opts;
@@ -108,6 +115,8 @@ export class Session {
 		const wired =
 			opts.wiring && opts.sandboxHome ? writeSandboxConfig(opts.sandboxHome, opts.wiring) : null;
 		this.#sandboxHome = wired?.home;
+		// 不需要 clone 的会话，工作区从一开始就是就绪的
+		this.#workspaceReady = !opts.repoUrl;
 
 		this.#pi = new PiSession({
 			cwd: opts.workspace,
@@ -178,6 +187,19 @@ export class Session {
 			workspace: this.#opts.workspace,
 			model: this.#model,
 		});
+		// 这才是验收项里的「会话冷启动（含 clone）< 5s」：
+		// 含 clone、spawn pi、get_state 与 ready 的全过程
+		this.#audit({
+			kind: "session.start",
+			summary: `会话就绪（冷启动 ${Date.now() - this.#startedAt}ms，含 clone）`,
+			durationMs: Date.now() - this.#startedAt,
+		});
+	}
+
+	/** 两道门都开了才放行排队的 prompt */
+	#flushQueued(): void {
+		if (!(this.#hookArmed && this.#workspaceReady)) return;
+		for (const cmd of this.#queuedWhileDisarmed.splice(0)) this.handle(cmd);
 	}
 
 	/** actor 是发出这条命令的连接身份；from 用于把 resume 的重放只回给发起方 */
@@ -203,8 +225,8 @@ export class Session {
 			this.#resolveApproval(cmd.approvalId, cmd.decision, actor);
 			return;
 		}
-		// 钩子未确认挂上之前，prompt 先排队：此时执行工具等于无策略保护
-		if (!this.#hookArmed && (cmd.type === "prompt" || cmd.type === "steer")) {
+		// 两道门都过了才放行 prompt：钩子未挂 = 无策略保护，工作区未就绪 = 在空目录里瞎改
+		if (!(this.#hookArmed && this.#workspaceReady) && (cmd.type === "prompt" || cmd.type === "steer")) {
 			this.#queuedWhileDisarmed.push(cmd);
 			return;
 		}
@@ -228,7 +250,16 @@ export class Session {
 			return true;
 		}
 
+		// 没有 wiring 就没有 insteadOf 规则，clone 会直接打到上游而绕过凭据代理。
+		// 退化到「HOME 指向 workspace」既违反 sandbox-config 里写明的纪律，
+		// 也让这次 clone 失去意义 —— 直接拒绝。
 		const home = this.#sandboxHome;
+		if (!home) {
+			this.#audit({ kind: "error", summary: "配置了 repoUrl 但没有 wiring：clone 会绕过凭据代理" });
+			this.#emit({ type: "error", code: "agent_error", message: "配置了 repoUrl 但没有 wiring，拒绝在无凭据代理的情况下 clone" });
+			await this.stop();
+			return false;
+		}
 		const started = Date.now();
 		try {
 			await new Promise<void>((resolve, reject) => {
@@ -236,14 +267,14 @@ export class Session {
 				// git 当成选项（如 --upload-pack=<cmd>），这是一条命令注入路径
 				const proc = spawn("git", ["clone", "-q", "--", repoUrl, "."], {
 					cwd: this.#opts.workspace,
-					env: { PATH: process.env.PATH ?? "", HOME: home ?? this.#opts.workspace, GIT_TERMINAL_PROMPT: "0" },
+					env: { PATH: process.env.PATH ?? "", HOME: home, GIT_TERMINAL_PROMPT: "0" },
 					stdio: ["ignore", "ignore", "pipe"],
 				});
 				// 卡住的 clone（上游无响应）会让会话永远停在启动中，前端只看到一片空白
 				const timer = setTimeout(() => {
 					proc.kill("SIGKILL");
-					reject(new Error(`clone 超时（${this.#opts.cloneTimeoutMs ?? 120_000}ms）`));
-				}, this.#opts.cloneTimeoutMs ?? 120_000);
+					reject(new Error(`clone 超时（${this.#opts.cloneTimeoutMs ?? 30_000}ms）`));
+				}, this.#opts.cloneTimeoutMs ?? 30_000);
 				let stderr = "";
 				proc.stderr.on("data", (c: Buffer) => {
 					stderr += c.toString();
@@ -259,13 +290,28 @@ export class Session {
 			});
 		} catch (err) {
 			// clone 失败就别让会话跑起来：agent 会在一个空目录里瞎猜
-			this.#alive = false;
 			this.#audit({ kind: "error", summary: `clone 失败：${String(err).slice(0, 200)}` });
 			this.#emit({ type: "error", code: "agent_error", message: `仓库 clone 失败：${String(err).slice(0, 300)}` });
+			// 超时是 SIGKILL 打断的，git 来不及自清理，会留下半个 .git；
+			// 不清掉的话下次会话会误判「工作区已存在」而跳过 clone，
+			// 把一个残缺仓库交给 agent
+			try {
+				rmSync(join(this.#opts.workspace, ".git"), { recursive: true, force: true });
+			} catch {
+				// 清理失败不改变结论：会话本来就要终止
+			}
+			// 直接收掉 pi 并补上 session.end —— 只置 #alive=false 的话，
+			// 进程要等 30s 的 reaper 才被收，而那时 stop() 里的 if (#alive)
+			// 已不成立，这个会话永远不会有结束记录。审计里「有 start 无 end」
+			// 对一个以审计完整性为卖点的运行时是个洞。
+			await this.stop();
 			return false;
 		}
-		// 冷启动打点：Week 3 的目标是含 clone < 5s
-		this.#audit({ kind: "session.start", summary: `clone 完成（${Date.now() - started}ms）`, durationMs: Date.now() - started });
+		// clone 打点。注意它测的**不是**验收项里的「会话冷启动（含 clone）」——
+		// 那一项还包含 spawn pi、get_state 与 ready，见 start() 末尾的打点。
+		this.#audit({ kind: "repo.clone", summary: `clone 完成（${Date.now() - started}ms）`, durationMs: Date.now() - started });
+		this.#workspaceReady = true;
+		this.#flushQueued();
 		return true;
 	}
 
@@ -390,7 +436,7 @@ export class Session {
 		if (kind === "hook-armed") {
 			this.#hookArmed = true;
 			this.#audit({ kind: "session.start", summary: `策略钩子已挂载（${String(v.rules)} 条规则）` });
-			for (const cmd of this.#queuedWhileDisarmed.splice(0)) this.handle(cmd);
+			this.#flushQueued();
 			return;
 		}
 

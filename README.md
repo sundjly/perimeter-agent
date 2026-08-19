@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 177 个测试
+npm test          # 180 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -36,7 +36,7 @@ npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 | 铁律 | 落地位置 | 现状 |
 |---|---|---|
 | 代码永不离开 Data Plane | 审计只记 hash 不记源码（`src/audit/log.ts`） | ⚠️ 有一处有意例外：`command` 存原文（heredoc 写文件、带凭据的 curl 同样会落库），导出 SIEM 前须视为敏感字段 |
-| 凭据永不进沙箱 | git 凭据代理（`src/gitproxy/`）、模型网关（`src/modelgw/`）、pi 子进程 env 白名单 | ✅ 端到端验证：三种凭据分处三地，测试遍历沙箱全部文件断言其中只有代理 token |
+| 凭据永不进沙箱 | git 凭据代理（`src/gitproxy/`）、模型网关（`src/modelgw/`）、pi 子进程 env 白名单 | ✅ 端到端验证：三种凭据分处三地，两组测试各自遍历沙箱全树：wiring 那组断言无模型 key 与网关 token，git-e2e 那组断言无上游 git token、且代理 token 不在 workspace 内（落进去就会被 agent 一句 git add -A 推到上游） |
 | egress 双出口 + 默认拒绝 | `config/policy.yaml` 的 `egress.deny_all_except` → 生成 `deploy/networkpolicy.yaml` | ❌ **设计承诺，不是运行中的事实**。清单只做了生成与静态校验，没有任何代码去 apply 它 |
 | 每次工具调用过策略且留痕 | pi 扩展注入 `tool_call` 钩子（`src/gateway/policy-extension.ts`） | ✅ 钩子级粒度，见下。但**路径规则对 bash 不生效**，见「边界」 |
 

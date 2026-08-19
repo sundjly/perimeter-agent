@@ -40,6 +40,8 @@ export interface GatewayConfig {
 	wiring?: SandboxWiring;
 	/** 每个会话启动时 clone 的仓库（上游真实地址，经 insteadOf 重写到凭据代理） */
 	repoUrl?: string;
+	/** clone 超时。验收目标是「冷启动（含 clone）< 5s」，默认给 30s 留足余量 */
+	cloneTimeoutMs?: number;
 }
 
 const MIME: Record<string, string> = {
@@ -197,6 +199,9 @@ export class Gateway {
 			// git add -A && git commit 就把含 token 的 .gitconfig 提交进仓库
 			sandboxHome: join(this.#cfg.workspaceRoot, ".homes", sessionId),
 			repoUrl: this.#cfg.repoUrl,
+			cloneTimeoutMs: this.#cfg.cloneTimeoutMs,
+			// 提交身份带上会话发起人，上游提交可归属到具体的人
+			...(this.#cfg.wiring ? { wiring: { ...this.#cfg.wiring, authorEmail: actor } } : {}),
 			send: (ev, seq, target) => broadcast(session, ev, seq, target),
 		});
 		this.#sessions.set(sessionId, session);

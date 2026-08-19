@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -27,6 +27,22 @@ const UPSTREAM_AUTH = `Basic ${Buffer.from(`x-access-token:${UPSTREAM_TOKEN}`).t
 const PROXY_TOKEN = "sandbox-proxy-token";
 
 const exec = promisify(execFile);
+
+/** 递归收集目录下所有文件 */
+function readAllFiles(dir: string, out: { path: string; text: string }[] = []): { path: string; text: string }[] {
+	for (const name of readdirSync(dir)) {
+		const p = join(dir, name);
+		if (statSync(p).isDirectory()) readAllFiles(p, out);
+		else {
+			try {
+				out.push({ path: p, text: readFileSync(p, "utf8") });
+			} catch {
+				// 二进制或不可读文件跳过 —— token 是文本，不会藏在这里
+			}
+		}
+	}
+	return out;
+}
 const cleanups: (() => Promise<void> | void)[] = [];
 after(async () => {
 	for (const c of cleanups) await c();
@@ -149,19 +165,47 @@ test("Week 3 验收：沙箱内 push 成功，改动真的到了上游", async (
 	assert.match(push!.summary, /推送到 git\.internal\/app\.git/);
 });
 
-test("Week 3 验收：沙箱侧看不到任何 git 凭据", async () => {
+test("Week 3 验收：沙箱侧看不到任何 git 凭据（全树遍历）", async () => {
 	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
 	const home = sandboxHome(port);
 	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
 	await git(["clone", "-q", "https://git.internal/app.git", "repo"], ws, home);
+	const repo = join(ws, "repo");
+	writeFileSync(join(repo, "fix.txt"), "改动\n");
+	await git(["add", "."], repo, home);
+	await git(["commit", "-qm", "改一下"], repo, home);
+	await git(["push", "-q", "origin", "main"], repo, home);
 
-	// agent 能看到的全部：HOME 下的配置 + 仓库里的 .git/config
-	const visible = readFileSync(join(home, ".gitconfig"), "utf8") + readFileSync(join(ws, "repo", ".git", "config"), "utf8");
-	assert.ok(!visible.includes(UPSTREAM_TOKEN), "上游 git 凭据绝不能出现在沙箱侧");
-	assert.ok(visible.includes(PROXY_TOKEN), "沙箱手里只有代理 token —— 拿到别处无用");
+	// 遍历 workspace 全树（含 .git/logs、packed-refs、objects），不是只看两个文件
+	const wsFiles = readAllFiles(ws);
+	assert.ok(wsFiles.length > 5, "应当扫到成组文件，否则这条断言是空转");
+	for (const f of wsFiles) {
+		assert.ok(!f.text.includes(UPSTREAM_TOKEN), `上游 git 凭据泄漏到 ${f.path}`);
+		// 这一条才是真会失效的：代理 token 一旦落进 workspace，
+		// agent 一句 git add -A 就把它推到上游去了
+		assert.ok(!f.text.includes(PROXY_TOKEN), `代理 token 落进了 workspace：${f.path} —— 会被 commit 推走`);
+	}
 
-	// .git/config 里存的是原始上游地址，凭据在 insteadOf 那一侧
-	assert.match(readFileSync(join(ws, "repo", ".git", "config"), "utf8"), /https:\/\/git\.internal\/app\.git/);
+	// 代理 token 只在 workspace 之外的 HOME 里
+	assert.ok(readAllFiles(home).some((f) => f.text.includes(PROXY_TOKEN)), "沙箱要用代理 token 访问代理");
+	// .git/config 里存的是原始上游地址，重写只发生在传输层
+	assert.match(readFileSync(join(repo, ".git", "config"), "utf8"), /https:\/\/git\.internal\/app\.git/);
+});
+
+test("沙箱 gitconfig 带提交身份 —— 容器里 hostname 无域时 git 会拒绝提交", async () => {
+	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
+	const home = sandboxHome(port);
+	const cfg = readFileSync(join(home, ".gitconfig"), "utf8");
+	assert.match(cfg, /\[user\]/);
+	assert.match(cfg, /email = /);
+
+	// 不给 GIT_AUTHOR_* 也能提交（模拟容器里的真实环境）
+	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
+	await git(["clone", "-q", "https://git.internal/app.git", "repo"], ws, home);
+	const repo = join(ws, "repo");
+	writeFileSync(join(repo, "a.txt"), "x\n");
+	await exec("git", ["add", "."], { cwd: repo, env: { PATH: process.env.PATH ?? "", HOME: home } });
+	await exec("git", ["commit", "-qm", "无环境身份也能提交"], { cwd: repo, env: { PATH: process.env.PATH ?? "", HOME: home } });
 });
 
 test("只读仓库：clone 允许，push 被代理拒绝且不到达上游", async () => {

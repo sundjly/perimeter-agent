@@ -21,6 +21,24 @@ import { ModelGateway } from "../src/modelgw/server.ts";
 
 const root = join(import.meta.dirname, "..");
 
+/**
+ * 等子进程报告端口。必须有兜底：子进程启动失败时 stdout 永远不会来数据，
+ * 没有超时的话 demo 会静默挂死，连 banner 都不打印 —— 最难排查的失败形态。
+ */
+function waitForPort(proc: { stdout: NodeJS.ReadableStream | null }, what: string): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`${what} 启动超时`)), 10_000);
+		proc.stdout?.once("data", (d: Buffer) => {
+			clearTimeout(timer);
+			try {
+				resolve(JSON.parse(d.toString()).port);
+			} catch (e) {
+				reject(new Error(`${what} 未报告端口：${String(e)}`));
+			}
+		});
+	});
+}
+
 // pi 不是 npm 依赖（本仓库只用它的 RPC 模式，不锁版本）。不预检的话，
 // 失败形态是最难排查的那种：banner 与地址照常打印，客户点开链接才收到
 // 「spawn pi ENOENT」—— 演示时看起来一切正常，一开口就死。
@@ -68,7 +86,7 @@ if (!real) {
 	const mock = spawn(process.execPath, [join(root, "tests/fixtures/mock-model.mjs"), "0", JSON.stringify(script)], {
 		stdio: ["ignore", "pipe", "inherit"],
 	});
-	const mockPort: number = await new Promise((r) => mock.stdout.once("data", (d) => r(JSON.parse(d.toString()).port)));
+	const mockPort = await waitForPort(mock, "mock 模型");
 	process.on("exit", () => mock.kill());
 
 	// ② 模型网关 —— 唯一持有上游凭据的进程
@@ -112,7 +130,7 @@ if (!real) {
 	const scm = spawn(process.execPath, [join(root, "tests/fixtures/git-http-server.mjs"), scmRoot, scmAuth], {
 		stdio: ["ignore", "pipe", "inherit"],
 	});
-	const scmPort: number = await new Promise((r) => scm.stdout.once("data", (d) => r(JSON.parse(d.toString()).port)));
+	const scmPort = await waitForPort(scm, "git 上游服务");
 	process.on("exit", () => scm.kill());
 
 	// ④ git 凭据代理 —— 唯一持有 git token 的进程

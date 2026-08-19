@@ -21,6 +21,15 @@ export interface SandboxWiring {
 	modelGatewayUrl?: string;
 	/** 模型名。沙箱只知道名字，不知道它背后是哪个 provider、用的哪把 key */
 	model?: string;
+	/**
+	 * 提交身份。**容器里必须给** —— 沙箱 HOME 是全新空目录、hostname 通常无域，
+	 * git 会以 `unable to auto-detect email address (got 'x@y.(none)')` 拒绝提交。
+	 * 本机 macOS 能自动推断所以看不出来，而 K8s 沙箱正是产品的目标运行环境：
+	 * commit 一挂，`git add && git commit && git push` 整条就静默不发生。
+	 * 顺带让上游提交可归属到发起会话的人。
+	 */
+	authorName?: string;
+	authorEmail?: string;
 	/** git 代理地址，如 http://git-proxy.internal:8080 */
 	gitProxyUrl?: string;
 	/**
@@ -108,7 +117,8 @@ export function writeSandboxConfig(home: string, w: SandboxWiring): SandboxConfi
 			.join("");
 		// 关掉凭据 helper：沙箱里不该有任何本地凭据存储，
 		// 也不该在代理返回 401 时去别处找凭据
-		writeFileSync(join(home, ".gitconfig"), `${sections}[credential]\n\thelper =\n`);
+		const user = `[user]\n\tname = ${w.authorName ?? "perimeter-agent"}\n\temail = ${w.authorEmail ?? "agent@perimeter.local"}\n`;
+		writeFileSync(join(home, ".gitconfig"), `${sections}${user}[credential]\n\thelper =\n`);
 	}
 
 	return { home, piArgs };
