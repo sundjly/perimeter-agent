@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AuditInput, AuditLog } from "../audit/log.ts";
 import { contentHash } from "../audit/log.ts";
@@ -43,6 +43,8 @@ export interface SessionOptions {
 	 * 这是策略文档 §4.3 时序里的 `GW->SBX: git clone（经凭据代理，token 不落沙箱）`。
 	 */
 	repoUrl?: string;
+	/** clone 超时。卡住的 clone 会让会话永远停在启动中 */
+	cloneTimeoutMs?: number;
 	/** 断线续接的事件缓存条数 */
 	backlogSize?: number;
 	/** target 非空时只投递给该传输（resume 的重放不该洪泛给其他标签页） */
@@ -219,21 +221,41 @@ export class Session {
 	 * 而且 clone 用的是网关生成的 HOME 配置，凭据仍然只在代理那一侧。
 	 */
 	async #cloneRepo(repoUrl: string): Promise<boolean> {
+		// 网关重启后同一 sessionId 重连时，workspace 里已经有上次 clone 的内容。
+		// 不跳过的话 git 会以「目标目录非空」失败，会话再也起不来。
+		if (existsSync(join(this.#opts.workspace, ".git"))) {
+			this.#audit({ kind: "session.start", summary: "工作区已存在，跳过 clone" });
+			return true;
+		}
+
 		const home = this.#sandboxHome;
 		const started = Date.now();
 		try {
 			await new Promise<void>((resolve, reject) => {
-				const proc = spawn("git", ["clone", "-q", repoUrl, "."], {
+				// `--` 分隔：repoUrl 来自配置而非客户端，但以 `-` 开头的值会被
+				// git 当成选项（如 --upload-pack=<cmd>），这是一条命令注入路径
+				const proc = spawn("git", ["clone", "-q", "--", repoUrl, "."], {
 					cwd: this.#opts.workspace,
 					env: { PATH: process.env.PATH ?? "", HOME: home ?? this.#opts.workspace, GIT_TERMINAL_PROMPT: "0" },
 					stdio: ["ignore", "ignore", "pipe"],
 				});
+				// 卡住的 clone（上游无响应）会让会话永远停在启动中，前端只看到一片空白
+				const timer = setTimeout(() => {
+					proc.kill("SIGKILL");
+					reject(new Error(`clone 超时（${this.#opts.cloneTimeoutMs ?? 120_000}ms）`));
+				}, this.#opts.cloneTimeoutMs ?? 120_000);
 				let stderr = "";
 				proc.stderr.on("data", (c: Buffer) => {
 					stderr += c.toString();
 				});
-				proc.on("error", reject);
-				proc.on("close", (code) => (code === 0 ? resolve() : reject(new Error(stderr.trim() || `git clone exit ${code}`))));
+				proc.on("error", (e) => {
+					clearTimeout(timer);
+					reject(e);
+				});
+				proc.on("close", (code) => {
+					clearTimeout(timer);
+					code === 0 ? resolve() : reject(new Error(stderr.trim() || `git clone exit ${code}`));
+				});
 			});
 		} catch (err) {
 			// clone 失败就别让会话跑起来：agent 会在一个空目录里瞎猜

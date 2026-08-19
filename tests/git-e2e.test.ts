@@ -193,3 +193,26 @@ test("allowlist 之外的仓库：clone 直接失败", async () => {
 	await assert.rejects(git(["clone", "-q", "https://git.internal/other-team.git", "x"], ws, home), /403|forbidden|not in|allowlist/i);
 	assert.equal(existsSync(join(ws, "x", ".git")), false);
 });
+
+test("工作区已有仓库时跳过 clone —— 否则网关重启后同名会话再也起不来", async () => {
+	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
+	const home = sandboxHome(port);
+	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
+
+	// 第一次：正常 clone 到工作区根
+	await git(["clone", "-q", "--", "https://git.internal/app.git", "."], ws, home);
+	assert.ok(existsSync(join(ws, ".git")));
+
+	// 第二次直接 clone 会失败（目标目录非空），这正是 #cloneRepo 要跳过的场景
+	await assert.rejects(
+		git(["clone", "-q", "--", "https://git.internal/app.git", "."], ws, home),
+		/already exists|not an empty directory/i,
+	);
+});
+
+test("repoUrl 以 - 开头会被 git 当成选项 —— `--` 分隔是必需的", async () => {
+	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
+	// 不带 `--` 时，git 把它解析成选项而不是地址
+	await assert.rejects(git(["clone", "-q", "--upload-pack=touch /tmp/pwned", "x"], ws), /./);
+	assert.equal(existsSync("/tmp/pwned"), false);
+});
