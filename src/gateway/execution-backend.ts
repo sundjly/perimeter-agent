@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { hostname } from "node:os";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -52,6 +53,8 @@ export interface ExecutionBackend {
 	launch(ctx: LaunchContext): Launch;
 	/** 会话结束后的清理。local 无需清理；docker 要收容器 */
 	cleanup?(sessionId: string): Promise<void>;
+	/** 启动时回收上次遗留的容器，返回被回收的 id。local/kubectl 无需实现 */
+	reapOrphans?(): Promise<string[]>;
 }
 
 /** 直接在网关宿主机上跑。**没有隔离** —— agent 与网关同一个 OS 用户。 */
@@ -145,7 +148,7 @@ export interface DockerBackendOptions {
  * 容器执行后端。
  *
  * 与 deploy/sandbox.yaml 对应的是**下列五项**，改动要同步：
- * 只读根、非 root(10001)、丢弃全部 capability、禁止提权、独占工作区。
+ * 只读根、非 root、丢弃全部 capability、禁止提权、独占工作区。
  * 两侧刻意不同的部分：gVisor runtimeClass（K8s 有、docker 没有）、
  * 资源上限的表达方式、会话生命周期上限、以及挂载面 ——
  * K8s 只挂一个 policy configMap，docker 这边为了让扩展跑起来挂了三个子树。
@@ -157,20 +160,25 @@ export interface DockerBackendOptions {
  * ⚠️ **bind mount 的属主语义在 Linux 与 macOS 上不同**：Linux 保留宿主机
  * 属主，而网关是以自己的 uid 建的工作区与 HOME，容器里的 10001 会写不进去；
  * macOS 的 Docker Desktop / OrbStack 做属主重映射所以本机看不出来。
- * 因此工作区与 HOME 在创建后要 chown 到容器 uid（见 CONTAINER_UID）。
+ * 因此容器身份默认取网关自己的 uid/gid，见 DockerBackendOptions.user。
  */
 export class DockerBackend implements ExecutionBackend {
 	readonly kind = "docker" as const;
 	#opts: DockerBackendOptions;
 
+	#gatewayId: string;
+
 	constructor(opts: DockerBackendOptions) {
 		this.#opts = opts;
+		// 必须可区分到实例。恒为 "default" 的话，reapOrphans 会按 label
+		// 扫掉另一个网关**正在跑**的容器 —— 正是 gatewayId 要防的那件事。
+		this.#gatewayId = opts.gatewayId ?? `${hostname()}-${process.pid}`;
 	}
 
 	launch(ctx: LaunchContext): Launch {
 		const workdir = this.#opts.workdir ?? "/workspace";
 		const home = "/home/agent";
-		const name = containerName(ctx.sessionId, this.#opts.gatewayId);
+		const name = containerName(ctx.sessionId, this.#gatewayId);
 
 		const mountRoot = "/opt/perimeter";
 		const args = [
@@ -192,7 +200,7 @@ export class DockerBackend implements ExecutionBackend {
 			"no-new-privileges",
 			// 孤儿回收的抓手：网关被 SIGKILL 后容器会残留，下次启动按它扫净
 			"--label",
-			`perimeter.gateway=${this.#opts.gatewayId ?? "default"}`,
+			`perimeter.gateway=${this.#gatewayId}`,
 			// 只挂工作区与 HOME；宿主机其余部分在容器里不存在
 			"-v",
 			`${ctx.workspace}:${workdir}`,
@@ -226,6 +234,10 @@ export class DockerBackend implements ExecutionBackend {
 			...ctx.env,
 			PERIMETER_POLICY_FILE: `${mountRoot}/config/policy.yaml`,
 		};
+		// docker CLI 自己那几个变量不允许被当作容器 env 下发：调用方若传了
+		// HOME/DOCKER_HOST，既会顶掉容器里显式设定的 HOME，也会让客户端
+		// 去连错的 daemon。两组 key 今天恰好不相交，但那是巧合不是约束。
+		for (const k of DOCKER_CLIENT_KEYS) delete containerEnv[k];
 		// 用 `-e KEY`（不带值）而不是 `-e KEY=VALUE`：后者把值写进 argv，
 		// 同机其他用户 `ps aux` 就能看到。当前这五个变量都不敏感，但
 		// K8s 那侧的等价配置里是有会话 token 的（secretKeyRef），
@@ -247,8 +259,13 @@ export class DockerBackend implements ExecutionBackend {
 		return {
 			bin: "docker",
 			argsPrefix: args,
-			// `-e KEY` 从 docker 客户端自己的环境取值，所以这里必须把它们给出来
-			env: containerEnv,
+			// 两部分：① `-e KEY` 要从 docker 客户端自己的环境取值，所以
+			// containerEnv 必须给出来；② docker CLI 本身需要的宿主机变量。
+			// 后者容易漏 —— PiSession 的 spawn **不继承** process.env，
+			// 而 docker CLI 靠 HOME 定位 ~/.docker/config.json（registry 认证、
+			// 自定义 context、代理配置都在那儿）。漏了它在默认 socket 的机器上
+			// 看不出问题，换成私有 registry 或自定义 context 就连不上 daemon。
+			env: { ...dockerClientEnv(), ...containerEnv },
 			cwd: ctx.workspace,
 			homeInContainer: home,
 			extensionPath: `${mountRoot}/src/gateway/policy-extension.ts`,
@@ -264,13 +281,15 @@ export class DockerBackend implements ExecutionBackend {
 	async cleanup(sessionId: string): Promise<void> {
 		try {
 			// 必须带超时：daemon 卡住时没有超时会让 Gateway.close() 永久挂起
-			await exec("docker", ["rm", "-f", containerName(sessionId, this.#opts.gatewayId)], { timeout: 10_000 });
+			await exec("docker", ["rm", "-f", containerName(sessionId, this.#gatewayId)], { timeout: 10_000 });
 		} catch (err) {
 			// 「容器已不存在」是正常路径（正常退出时 --rm 已经收掉了）；
 			// 其余情况意味着容器可能泄漏了，不能和前者一样静默吞掉
 			const msg = err instanceof Error ? err.message : String(err);
 			if (!/No such container/i.test(msg)) {
-				this.#opts.onCleanupError?.(sessionId, err);
+				// 没有回调时也要出声：静默等于容器泄漏没人知道
+				const report = this.#opts.onCleanupError ?? ((id, e) => console.error(`容器清理失败 ${id}:`, e));
+				report(sessionId, err);
 			}
 		}
 	}
@@ -280,14 +299,15 @@ export class DockerBackend implements ExecutionBackend {
 	 * 网关被 SIGKILL 时来不及走 cleanup，容器会一直跑下去。
 	 */
 	async reapOrphans(): Promise<string[]> {
-		const label = `perimeter.gateway=${this.#opts.gatewayId ?? "default"}`;
+		const label = `perimeter.gateway=${this.#gatewayId}`;
 		try {
 			const { stdout } = await exec("docker", ["ps", "-aq", "--filter", `label=${label}`], { timeout: 10_000 });
 			const ids = stdout.split("\n").map((x) => x.trim()).filter(Boolean);
 			if (ids.length > 0) await exec("docker", ["rm", "-f", ...ids], { timeout: 30_000 });
 			return ids;
 		} catch (err) {
-			this.#opts.onCleanupError?.("<orphan-scan>", err);
+			const report = this.#opts.onCleanupError ?? ((id, e) => console.error(`孤儿容器扫描失败 ${id}:`, e));
+			report("<orphan-scan>", err);
 			return [];
 		}
 	}
@@ -325,7 +345,10 @@ export class KubectlBackend implements ExecutionBackend {
 		return {
 			bin: "kubectl",
 			argsPrefix: args,
-			env: {},
+			// 与 docker 同理：spawn 不继承 process.env，而 kubectl 靠 HOME
+			// 找 ~/.kube/config。缺了它每次 exec 都是
+			// "no configuration has been provided"。
+			env: kubectlClientEnv(),
 			cwd: ctx.workspace,
 			homeInContainer: "/home/agent",
 			// Pod 里这两个由 deploy/sandbox.yaml 的 configMap 与镜像提供
@@ -336,15 +359,47 @@ export class KubectlBackend implements ExecutionBackend {
 }
 
 /**
+ * docker CLI 自己需要的宿主机环境。
+ * 这些**不会**进容器 —— 进容器的只有 argsPrefix 里 `-e` 列出的那些。
+ */
+const DOCKER_CLIENT_KEYS = ["HOME", "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY"];
+
+/** kubectl 同理：靠 HOME 找 ~/.kube/config，缺了每次 exec 都会失败 */
+function kubectlClientEnv(): NodeJS.ProcessEnv {
+	const out: NodeJS.ProcessEnv = {};
+	for (const k of ["HOME", "KUBECONFIG", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"]) {
+		if (process.env[k] !== undefined) out[k] = process.env[k];
+	}
+	return out;
+}
+
+function dockerClientEnv(): NodeJS.ProcessEnv {
+	const out: NodeJS.ProcessEnv = {};
+	for (const k of DOCKER_CLIENT_KEYS) {
+		if (process.env[k] !== undefined) out[k] = process.env[k];
+	}
+	return out;
+}
+
+/**
  * 容器内的默认运行身份：网关自己的 uid/gid。
  * 见 DockerBackendOptions.user 里关于 bind mount 属主的说明。
  */
 export function defaultContainerUser(): string {
 	const uid = process.getuid?.();
 	const gid = process.getgid?.();
-	// root 或拿不到 uid（Windows）时退回镜像里的固定非 root 用户
-	if (uid === undefined || uid === 0) return "10001:10001";
-	return `${uid}:${gid ?? uid}`;
+	// 拿不到 uid（Windows）时退回镜像里的固定非 root 用户
+	if (uid === undefined || gid === undefined) return "10001:10001";
+	// 网关以 root 跑时不能把 0:0 传下去（那等于放弃非 root），但退回 10001
+	// 也写不进 root 建的工作区 —— 这种部署必须显式指定 user 或修属主，
+	// 与其给一个第一次写文件才炸的默认值，不如现在就说清楚。
+	if (uid === 0) {
+		throw new Error(
+			"网关以 root 运行时必须显式指定 DockerBackendOptions.user，并保证工作区属主与之匹配；" +
+				"否则容器要么以 root 跑（放弃非 root），要么写不进 bind mount",
+		);
+	}
+	return `${uid}:${gid}`;
 }
 
 /**

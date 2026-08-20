@@ -110,6 +110,18 @@ export class Gateway {
 	}
 
 	async listen(): Promise<number> {
+		// 回收上次运行遗留的容器：网关被 SIGKILL 时来不及走 cleanup，
+		// --rm 只保证容器退出后删记录、不保证容器退出。按 label 扫，
+		// 只动本网关自己的（gatewayId 默认带 hostname+pid）。
+		const reaped = await this.#cfg.backend?.reapOrphans?.();
+		if (reaped?.length) {
+			this.#audit.append({
+				kind: "session.end",
+				sessionId: "-",
+				actor: "system",
+				summary: `启动时回收了 ${reaped.length} 个遗留容器`,
+			});
+		}
 		await new Promise<void>((r) => this.#http.listen(this.#cfg.port, this.#cfg.host, r));
 		const addr = this.#http.address();
 		return typeof addr === "object" && addr ? addr.port : this.#cfg.port;

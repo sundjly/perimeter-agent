@@ -79,6 +79,7 @@ test("docker 后端的五项收紧与 deploy/sandbox.yaml 对应", () => {
 	// 默认取网关自己的 uid —— Linux 上 bind mount 保留宿主机属主，
 	// 固定 10001 会让容器写不进工作区（macOS 会重映射所以本机测不出来）
 	assert.match(a, new RegExp(`--user ${defaultContainerUser()}`));
+	assert.ok(!/--user 0:/.test(a), "绝不能以 root 跑");
 	// 上限必须有默认值：没有的话一句 dd 就能吃掉宿主机内存
 	assert.match(a, /--memory 4g/);
 	assert.match(a, /--pids-limit 512/);
@@ -155,7 +156,9 @@ describe("容器隔离（需要 docker 与 perimeter-sandbox:test 镜像）", { 
 		const { stdout } = await exec("docker", args);
 		assert.match(stdout, /in-workspace\.txt/, "工作区应当挂进去");
 		assert.match(stdout, /No such file|not found/, "宿主机的 /Users 在容器里不该存在");
-		assert.match(stdout, /10001/, "必须非 root 运行");
+		// --user 传什么，id -u 就是什么；默认取网关自己的 uid
+		assert.match(stdout, new RegExp(defaultContainerUser().split(":")[0]!));
+		assert.ok(!/^0$/m.test(stdout), "必须非 root 运行");
 	});
 
 	test("根文件系统只读，只有 /tmp 与工作区可写", async () => {
@@ -289,4 +292,45 @@ describe("容器隔离（需要 docker 与 perimeter-sandbox:test 镜像）", { 
 		const { stdout } = await exec("docker", ["ps", "-aq", "--filter", `name=${containerName(sessionId)}`]);
 		assert.equal(stdout.trim(), "", "会话结束后容器必须被收掉");
 	});
+});
+
+test("docker 客户端拿得到自己需要的宿主机环境，但那些不进容器", () => {
+	const l = new DockerBackend({ image: IMAGE, repoRoot: "/repo" }).launch(ctx);
+	// PiSession 的 spawn 不继承 process.env；docker CLI 靠 HOME 定位
+	// ~/.docker/config.json（registry 认证、自定义 context、代理配置）。
+	// 漏了它在默认 socket 的机器上看不出来，换私有 registry 就连不上。
+	assert.ok(process.env.HOME, "前提：本机有 HOME，否则下面这条断言是空转");
+	assert.equal(l.env.HOME, process.env.HOME);
+	// 而容器里的 HOME 是另一回事，由 argv 显式给定
+	assert.ok(l.argsPrefix.includes("HOME=/home/agent"));
+	// docker 客户端的宿主机变量不得出现在 -e 列表里
+	const envArgs = l.argsPrefix.filter((_, i) => l.argsPrefix[i - 1] === "-e");
+	assert.ok(!envArgs.includes("DOCKER_HOST"));
+	assert.ok(!envArgs.some((e) => e === "HOME"), "容器的 HOME 走 KEY=VALUE，不该再有裸 HOME");
+});
+
+test("launch 的 env 原样送到 PiSession —— -e KEY 全靠这条链路", () => {
+	// 这次改动真正的风险点：值不在 argv 里了，全靠 docker 客户端进程环境。
+	// 中途任何一处丢失，容器里的变量就是空的，而症状离原因很远。
+	const l = new DockerBackend({ image: IMAGE, repoRoot: "/repo" }).launch(ctx);
+	// session.ts 的组合方式
+	const spawnEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH, ...l.env };
+	for (const k of l.argsPrefix.filter((_, i) => l.argsPrefix[i - 1] === "-e")) {
+		if (k.includes("=")) continue; // KEY=VALUE 形式自带值
+		assert.ok(spawnEnv[k] !== undefined, `${k} 必须能从 docker 客户端环境取到`);
+	}
+	assert.ok(spawnEnv.PATH, "PATH 不能丢：spawn 用子进程 env 做 execvp 查找");
+});
+
+test("调用方传的 docker 客户端变量不会污染容器 env", () => {
+	const l = new DockerBackend({
+		image: IMAGE,
+		repoRoot: "/repo",
+		env: { HOME: "/evil", DOCKER_HOST: "tcp://evil:2375" },
+	}).launch(ctx);
+	const envArgs = l.argsPrefix.filter((_, i) => l.argsPrefix[i - 1] === "-e");
+	assert.ok(!envArgs.includes("HOME"), "容器 HOME 由 argv 显式给定，不接受覆盖");
+	assert.ok(!envArgs.includes("DOCKER_HOST"));
+	// 客户端仍用宿主机自己的值，而不是调用方塞的
+	assert.equal(l.env.DOCKER_HOST, process.env.DOCKER_HOST);
 });

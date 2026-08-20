@@ -15,6 +15,18 @@ RUN apk add --no-cache git
 ARG PI_VERSION=0.84.2
 RUN npm i -g @earendil-works/pi-coding-agent@${PI_VERSION}
 
+# 策略扩展及其依赖装进镜像，而不是从宿主机挂。两个理由：
+# ① node_modules 是平台相关的，从 macOS 宿主机挂进 Linux 容器会在 native
+#    模块上出 ABI 问题（当前只有纯 JS 依赖所以没炸，加一个就炸）；
+# ② K8s 侧没有 bind mount，而 ConfigMap 有 1MiB 上限 —— node_modules 27MB，
+#    差 27 倍，configMap 方案根本不可行。装进镜像是唯一对两种形态都成立的做法。
+# 同时让「策略代码不可变」成为镜像属性，而不是一个挂载选项。
+WORKDIR /opt/perimeter
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY src/ ./src/
+COPY config/ ./config/
+
 # 非 root。与 deploy/sandbox.yaml 的 runAsUser 保持一致。
 RUN adduser -D -u 10001 -h /home/agent agent
 USER 10001

@@ -39,11 +39,13 @@ spec:
       command: ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
       workingDir: /workspace
       env:
-        # 只有策略文件路径走 env。模型网关地址、git 代理地址与代理 token
-        # **不在这里** —— 它们由网关的 sandbox-config.ts 生成成
-        # $HOME/.pi/agent/models.json 与 $HOME/.gitconfig，经 sandbox-home
-        # 卷送进来。走文件而不是 env 是有意的：env 会出现在 `kubectl describe`
-        # 与容器的 /proc/1/environ 里。
+        # ⚠️ **会话级配置的注入方式在 K8s 形态下尚未实现。**
+        # docker 后端是把网关生成的 $HOME（models.json + .gitconfig）bind mount
+        # 进去；K8s 这边 sandbox-home 是 emptyDir，网关无法从外部写入它。
+        # 可选方案：Pod 就绪后由网关 `kubectl cp` 写入，或每会话建一个 Secret
+        # 卷（后者与本文件开头「不挂任何 secret」的说法冲突，要先定夺）。
+        # 在做出选择并实现之前，kubectl 后端跑不了真实会话 —— 不要按
+        # 「只差一个集群」来理解。
         - name: PERIMETER_POLICY_FILE
           value: /etc/perimeter/policy.yaml
         - name: PERIMETER_REPO
@@ -72,14 +74,10 @@ spec:
         - name: policy
           mountPath: /etc/perimeter
           readOnly: true
-        # 策略扩展跑在 pi 进程内。没有这一份，K8s 形态下就没有 tool_call
-        # 钩子 —— 钩子级拦截是产品的核心卖点，缺了它审计与审批门全部落空。
-        # 内容与 docker 后端只读挂载的三个子树等价，随镜像一起构建更稳妥
-        # （node_modules 有平台相关性，不要从宿主机挂）。
-        - name: perimeter-runtime
-          mountPath: /opt/perimeter
-          readOnly: true
-        # 沙箱 HOME：models.json 与 .gitconfig 由网关写入后挂进来
+        # 沙箱 HOME。必须可写：readOnlyRootFilesystem 下 pi 要写自身状态。
+        # ⚠️ 策略扩展所在的 /opt/perimeter **由镜像提供**（见
+        # deploy/sandbox.Dockerfile），不在这里挂 —— ConfigMap 有 1MiB 上限，
+        # 而扩展的依赖有 27MB，用 configMap 会让 Pod 卡在 ContainerCreating。
         - name: sandbox-home
           mountPath: /home/agent
   volumes:
@@ -93,11 +91,6 @@ spec:
     - name: policy
       configMap:
         name: perimeter-policy
-    # 与 docker 后端的三个只读挂载等价。用 image 里自带的一份更稳妥：
-    # node_modules 是平台相关的，从宿主机挂会在 ABI 上出问题。
-    - name: perimeter-runtime
-      configMap:
-        name: perimeter-runtime
     - name: sandbox-home
       emptyDir:
         sizeLimit: 64Mi
