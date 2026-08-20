@@ -146,6 +146,9 @@ if (!real) {
 				upstream: `http://127.0.0.1:${scmPort}/app.git`,
 				username: "x-access-token",
 				token: "UPSTREAM-GIT-TOKEN-never-leaves-proxy",
+				// 代理默认只读，推送必须显式授权 —— demo 第三段正要演示
+				// 「审批通过后推送真的到达上游」
+				allowPush: true,
 			},
 		],
 	});

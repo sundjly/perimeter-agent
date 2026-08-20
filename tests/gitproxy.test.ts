@@ -138,7 +138,8 @@ test("POST 请求体完整转发，且带上注入的凭据", async () => {
 
 test("推送走 git-receive-pack，被单独识别并留痕", async () => {
 	const up = await startRecordingUpstream();
-	const { base, auditFile } = await startProxy(up.port);
+	// 推送必须显式授权 —— 默认是只读的
+	const { base, auditFile } = await startProxy(up.port, true);
 
 	await post(base, "/app.git/git-receive-pack", "0000", { "content-type": "application/x-git-receive-pack-request" });
 
@@ -157,7 +158,14 @@ test("审计里不得出现上游凭据，连上游地址里内嵌的也要剥�
 		host: "127.0.0.1",
 		token: SESSION_TOKEN,
 		audit,
-		repos: [{ name: "app.git", upstream: `http://user:embedded-secret@127.0.0.1:${up.port}/app.git`, token: UPSTREAM_TOKEN }],
+		repos: [
+			{
+				name: "app.git",
+				upstream: `http://user:embedded-secret@127.0.0.1:${up.port}/app.git`,
+				token: UPSTREAM_TOKEN,
+				allowPush: true,
+			},
+		],
 	});
 	cleanups.push(() => proxy.close());
 	const base = `http://127.0.0.1:${await proxy.listen()}`;
@@ -175,7 +183,7 @@ test("只读仓库拒绝推送，拒绝也留痕", async () => {
 	const res = await post(base, "/app.git/git-receive-pack", "0000");
 	assert.equal(res.status, 403);
 	assert.equal(up.seen.length, 0, "被拒的推送不该到达上游");
-	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("只读")));
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("未显式授权推送")));
 });
 
 test("info/refs 上的推送探测同样受 allowPush 约束", async () => {
@@ -225,4 +233,84 @@ test("上游不可达时返回 502 而不是挂死", async () => {
 	const base = `http://127.0.0.1:${await proxy.listen()}`;
 	const res = await post(base, "/app.git/git-upload-pack", "0000");
 	assert.equal(res.status, 502);
+});
+
+test("默认只读：不传 allowPush 时推送被拒", async () => {
+	const up = await startRecordingUpstream();
+	const { base, auditFile } = await startProxy(up.port); // 刻意不传
+
+	const res = await post(base, "/app.git/git-receive-pack", "0000");
+	assert.equal(res.status, 403, "未显式授权就该拒绝");
+	assert.equal(up.seen.length, 0, "被拒的推送不该到达上游");
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny"));
+});
+
+test("默认只读不影响 clone —— 只读仓库照样能拉", async () => {
+	const up = await startRecordingUpstream();
+	const { base } = await startProxy(up.port);
+	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, {
+		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+	});
+	assert.equal(res.status, 200);
+	assert.equal(up.seen.length, 1);
+});
+
+test("只有 service 参数被透传给上游 —— 沙箱不能往上游塞任意查询串", async () => {
+	// 全量透传会让沙箱覆盖 upstream URL 里已有的同名参数
+	// （GitLab 支持 ?private_token=），也给上游多开一个无谓的输入面
+	const up = await startRecordingUpstream();
+	const { base } = await startProxy(up.port);
+	await fetch(`${base}/app.git/info/refs?service=git-upload-pack&private_token=attacker&x=1`, {
+		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+	});
+	const seen = up.seen.at(-1)!;
+	assert.match(seen.url, /service=git-upload-pack/);
+	assert.ok(!seen.url.includes("private_token"), "沙箱传的额外参数不得到达上游");
+	assert.ok(!seen.url.includes("x=1"));
+});
+
+test("重复 service 参数：代理判定与转发给上游的必须一致", async () => {
+	// 这是全量透传与白名单唯一发生安全性分歧的输入。旧写法下：
+	// isPush 读第一个值（upload-pack → 判定非推送、放行），而循环 set 用
+	// 最后一个值覆盖 → 上游收到 receive-pack。
+	// 「代理认为不是推送」与「上游按推送处理」同时成立，
+	// 正是只读仓库最不该出现的状态。
+	const up = await startRecordingUpstream();
+	const { base } = await startProxy(up.port); // 默认只读
+	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack&service=git-receive-pack`, {
+		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+	});
+
+	if (res.status === 200) {
+		// 放行了就必须是按 upload-pack 放行的，上游不能收到 receive-pack
+		assert.ok(!up.seen.at(-1)!.url.includes("git-receive-pack"), "代理判定非推送，却把 receive-pack 递给了上游");
+	} else {
+		// 或者干脆按推送拒绝，同样是自洽的
+		assert.equal(res.status, 403);
+		assert.equal(up.seen.length, 0);
+	}
+});
+
+test("端点与方法的对应被强制 —— 不替沙箱把 PUT/DELETE 递给上游", async () => {
+	const up = await startRecordingUpstream();
+	const { base } = await startProxy(up.port);
+	for (const method of ["PUT", "DELETE", "PATCH"]) {
+		const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, {
+			method,
+			headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+		});
+		assert.equal(res.status, 405, `${method} 应当被拒`);
+	}
+	assert.equal(up.seen.length, 0, "被拒的请求不该带着注入的凭据到达上游");
+});
+
+test("service 值的大小写变体不透传 —— 判定与转发不能各看各的字符串", async () => {
+	const up = await startRecordingUpstream();
+	const { base } = await startProxy(up.port);
+	await fetch(`${base}/app.git/info/refs?service=GIT-RECEIVE-PACK`, {
+		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+	});
+	if (up.seen.length > 0) {
+		assert.ok(!/service=/i.test(up.seen.at(-1)!.url), "不认识的 service 值不该原样递给上游");
+	}
 });

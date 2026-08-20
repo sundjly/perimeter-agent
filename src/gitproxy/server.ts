@@ -10,7 +10,15 @@ export interface RepoMapping {
 	/** 上游凭据。**只存在于代理，永不进沙箱** */
 	username?: string;
 	token?: string;
-	/** 是否允许推送。只读仓库设为 false */
+	/**
+	 * 是否允许推送。**默认否** —— 必须显式写 true。
+	 *
+	 * 方向是有意的：代理持有组织级凭据，push 又是不可逆操作。
+	 * 默认可写意味着部署者漏配一个仓库，agent 就能往它推东西；
+	 * 默认只读的代价只是多写一行配置，而且写的时候人会意识到自己在授权。
+	 * 项目其余各处也是这个方向（策略求值失败→deny、钩子未挂→不跑 prompt、
+	 * 未知工具→受路径约束）。
+	 */
 	allowPush?: boolean;
 }
 
@@ -103,15 +111,35 @@ export class GitCredentialProxy {
 			return;
 		}
 
+		// 端点与方法的对应是固定的：info/refs 只收 GET，两个 pack 端点只收 POST。
+		// 不限制的话 PUT/DELETE/MOVE 都会带着注入的组织级凭据转发到上游 ——
+		// 正规 git 服务端不实现这些方法，但没有理由替沙箱把它们递过去
+		const wantMethod = parsed.endpoint === INFO_REFS ? "GET" : "POST";
+		if ((req.method ?? "GET") !== wantMethod) {
+			res.writeHead(405, { allow: wantMethod }).end("方法不允许");
+			return;
+		}
+
 		const isPush = parsed.endpoint === RECEIVE_PACK || url.searchParams.get("service") === "git-receive-pack";
-		if (isPush && repo.allowPush === false) {
-			this.#audit(req, repo.name, `拒绝推送：${repo.name} 为只读`, "deny");
+		if (isPush && repo.allowPush !== true) {
+			this.#audit(req, repo.name, `拒绝推送：${repo.name} 未显式授权推送`, "deny");
 			res.writeHead(403).end("该仓库为只读");
 			return;
 		}
 
 		const target = new URL(repo.upstream.replace(/\/$/, "") + parsed.endpoint);
-		for (const [k, v] of url.searchParams) target.searchParams.set(k, v);
+		// 只透传 git 协议真正需要的那个参数。全量透传的真实危害是**重复参数**：
+		// `?service=git-upload-pack&service=git-receive-pack` 下，isPush 读的是
+		// 第一个值（判定为非 push、放行），而循环 set 会用最后一个值覆盖 ——
+		// 上游于是收到 receive-pack。「代理认为不是推送」与「上游按推送处理」
+		// 同时成立，正是只读仓库最不该出现的状态。
+		// 只在值恰好等于两个已知常量之一时才透传：否则「代理判定不是 push」
+		// 与「上游收到一个 receive-pack 形状的字符串」会不一致，
+		// 而那个不一致只会出现在审计盲区里
+		const service = url.searchParams.get("service");
+		if (service === "git-upload-pack" || service === "git-receive-pack") {
+			target.searchParams.set("service", service);
+		}
 
 		const headers: Record<string, string> = {};
 		// git 客户端的这几个头必须原样带上，否则协议协商会失败

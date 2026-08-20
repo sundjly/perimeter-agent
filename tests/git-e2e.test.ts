@@ -88,6 +88,8 @@ async function startUpstreamServer(root: string): Promise<number> {
 	return new Promise((r) => proc.stdout?.once("data", (d) => r(JSON.parse(d.toString()).port)));
 }
 
+/** 默认放行推送：多数用例要验的是「push 能到上游」。代理本身默认只读，
+ *  所以这里必须显式给 —— 那正是新默认要求的。 */
 async function startProxy(upstreamPort: number, opts: { allowPush?: boolean } = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "gp-"));
 	const auditFile = join(dir, "audit.jsonl");
@@ -105,7 +107,7 @@ async function startProxy(upstreamPort: number, opts: { allowPush?: boolean } = 
 				upstream: `http://127.0.0.1:${upstreamPort}/app.git`,
 				username: "x-access-token",
 				token: UPSTREAM_TOKEN,
-				allowPush: opts.allowPush,
+				allowPush: opts.allowPush ?? true,
 			},
 		],
 	});
@@ -220,12 +222,12 @@ test("只读仓库：clone 允许，push 被代理拒绝且不到达上游", asy
 	await git(["add", "."], repo, home);
 	await git(["commit", "-qm", "不该推上去"], repo, home);
 
-	await assert.rejects(git(["push", "-q", "origin", "main"], repo, home), /403|forbidden|只读/i);
+	await assert.rejects(git(["push", "-q", "origin", "main"], repo, home), /403|forbidden|只读|未显式授权/i);
 
 	// 上游没有这次提交
 	const { stdout } = await git(["log", "--oneline", "-1", "main"], join(upstreamRoot, "app.git"));
 	assert.ok(!stdout.includes("不该推上去"));
-	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("只读")));
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("未显式授权推送")));
 });
 
 test("allowlist 之外的仓库：clone 直接失败", async () => {
