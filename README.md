@@ -70,6 +70,12 @@ deploy/           K8s 清单
 
 技术栈刻意保持最小：TypeScript 直接由 Node 运行（类型剥离，无构建步骤），运行时依赖只有 `ws` 与 `yaml`，测试用 `node:test`。
 
+## Review 记录
+
+每个功能的流程是「实现 → subagent review → 修复 → commit」。覆盖情况、
+一处流程偏差（F13 未 review 即提交）、以及 review 反复抓到的三种问题模式，
+都记在 [docs/review-log.md](docs/review-log.md)。
+
 ## 边界与已知缺口
 
 这一节是给自己和客户安全团队看的，**销售材料里不要越过它**。
