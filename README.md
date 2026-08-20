@@ -26,9 +26,9 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 315 个测试
+npm test          # 324 个测试
 npm run typecheck
-npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
+npm run gen:deploy  # 从 config/policy.yaml 重新生成 NetworkPolicy 与策略 ConfigMap
 ```
 
 ## 四条铁律与它们各自落在哪
@@ -106,7 +106,7 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 **Pod 的创建与回收现在有代码了**（`src/deploy/pod-template.ts` + `KubectlBackend.provision/cleanup/reapOrphans`）：从 `deploy/sandbox.yaml` 渲染每会话 Pod、create、等 Ready、cp 配置进去，会话结束删 Pod，网关重启时按 label 回收孤儿。
 
 **整条 kubectl 路径未在真实集群跑过。** 离线能证的已经证了：渲染产物通过 Kubernetes v1.31.0 官方 JSON schema 校验（字段名与类型层面）、Pod 与 NetworkPolicy 的 label/namespace 一致、sessionId 规范化后满足 DNS-1123 与 label 的长度约束。
-但 schema 有明确盲区——枚举值写错、名字非法、`containers: []` 它都放行；准入控制器、配额、runtimeClass 是否存在、镜像能否拉取更在覆盖之外。另外 `deploy/sandbox.yaml` 引用的 `perimeter-policy` ConfigMap **仓库里没有提供**，需由部署侧用 `kubectl create configmap perimeter-policy --from-file=config/policy.yaml` 创建。所以「每会话独占沙箱」在 docker 后端下是运行中的事实，在 K8s 形态下仍然只是「代码写了、没验过」。另外镜像必须含 `tar`（`kubectl cp` 走 exec+tar），客户自带的 distroless 镜像会让整条路径断掉。
+但 schema 有明确盲区——枚举值写错、名字非法、`containers: []` 它都放行；准入控制器、配额、runtimeClass 是否存在、镜像能否拉取更在覆盖之外。部署时 `deploy/` 下的三份清单都要 apply：`policy-configmap.yaml`（策略，由 `npm run gen:policy-cm` 从 `config/policy.yaml` 生成）、`networkpolicy.yaml`（egress，由 `npm run gen:netpol` 生成）、以及每会话的 Pod（由网关在运行时渲染）。前两份是生成物，改策略后要重新生成——有测试守着漂移。所以「每会话独占沙箱」在 docker 后端下是运行中的事实，在 K8s 形态下仍然只是「代码写了、没验过」。另外镜像必须含 `tar`（`kubectl cp` 走 exec+tar），客户自带的 distroless 镜像会让整条路径断掉。
 
 **接线：模型网关已接，git 代理未接到 demo：**
 

@@ -15,7 +15,9 @@
     "modelgw": "node src/modelgw/server.ts",
     "gitproxy": "node src/gitproxy/server.ts",
     "demo": "node scripts/demo.ts",
-    "gen:netpol": "node scripts/gen-netpol.ts"
+    "gen:netpol": "node scripts/gen-netpol.ts",
+    "gen:policy-cm": "node scripts/gen-policy-cm.ts",
+    "gen:deploy": "npm run gen:netpol && npm run gen:policy-cm"
   },
   "dependencies": {
     "ws": "^8.18.0",

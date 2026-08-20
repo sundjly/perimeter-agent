@@ -33,6 +33,47 @@ export type ClientEvent =
 	| { type: "usage"; usage: Usage }
 	| { type: "error"; code: ErrorCode; message: string };
 
+/**
+ * ClientEvent 的全部 type 值，运行时可枚举。
+ *
+ * 存在的理由：`web/` 是零构建原生 JS，不在 tsconfig 的 include 里，
+ * 类型系统够不着它 —— 往 ClientEvent 加事件而忘了前端，浏览器会静默丢弃。
+ * 测试要拿这份清单去核对前端的覆盖，而 ClientEvent 是纯类型、运行时不存在。
+ *
+ * 下面的双向穷尽性检查保证这个数组与联合类型同步：漏一个或多一个都编译不过。
+ * 这比从源码正则提取可靠得多 —— 正则会漏掉不合它字符集的命名
+ * （`quota_warning`、`toolV2.start`），而那种漏检是静默的。
+ */
+export const CLIENT_EVENT_TYPES = [
+	"session.ready",
+	"session.state",
+	"agent.start",
+	"agent.end",
+	"agent.settled",
+	"agent.status",
+	"message.start",
+	"message.text",
+	"message.thinking",
+	"message.end",
+	"tool.start",
+	"tool.progress",
+	"tool.end",
+	"approval.request",
+	"approval.resolved",
+	"policy.denied",
+	"audit.entry",
+	"usage",
+	"error",
+] as const;
+
+// 双向包含：数组少了某个事件、或含有联合里没有的值，这两行之一会报错
+type _EventsCovered = ClientEvent["type"] extends (typeof CLIENT_EVENT_TYPES)[number] ? true : never;
+type _NoExtras = (typeof CLIENT_EVENT_TYPES)[number] extends ClientEvent["type"] ? true : never;
+const _eventsCovered: _EventsCovered = true;
+const _noExtras: _NoExtras = true;
+void _eventsCovered;
+void _noExtras;
+
 export type AgentPhase = "retrying" | "compacting" | "idle";
 
 export type ErrorCode = "aborted" | "agent_error" | "extension_error" | "command_failed" | "policy_error";

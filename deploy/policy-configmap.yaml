@@ -1,0 +1,150 @@
+# 本文件由 npm run gen:policy-cm 从 config/policy.yaml 生成，请勿手改。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: perimeter-policy
+  namespace: perimeter
+  labels:
+    app.kubernetes.io/name: perimeter-sandbox
+data:
+  policy.yaml: |
+    # 策略引擎 v1 的默认规则集。按 repo/team 生效：给某条规则加 repos/teams 即可限定范围。
+    #
+    # 三档决策：deny（直接拒）> require_approval（推前端等人工确认）> allow。
+    # 命令匹配前会折叠空白、给 shell 操作符补空格、剥掉 sudo/env/VAR=x 这类前导 token，
+    # 并把 `a && b` 拆成整条 + 各子命令分别匹配。
+    #
+    # 未知字段会让加载直接失败（`deny_pattern` 少个 s 曾是静默失效的经典来源）。
+    version: 1
+
+    # 只读工具不受 deny_paths / require_approval_paths 约束。
+    # 反过来说：任何不在这个名单里的工具，只要带 path 参数就按「会改文件」处理 ——
+    # pi 新增或改名一个编辑类工具时，路径防线自动覆盖它，而不是静默漏掉。
+    read_only_tools: [read, ls, grep, find, glob, tree, image]
+
+    # 沙箱 NetworkPolicy 的唯一事实来源（由 deploy/ 的清单生成器消费）。
+    # 默认 deny all，只放通两个内部出口。这是四条铁律里唯一的技术边界，
+    # 但它的作用范围要说准确：它杀掉的是「直连任意外部主机」这一类外泄，
+    # **不是全部外泄** —— 生成的策略放通了 kube-system 的 53 端口（否则连
+    # 这两个名字都解析不了），DNS 隧道仍然可行；而经模型网关的请求体本身
+    # 就是一条合法外泄通道（scanSecrets 是 audit-only，不阻断也不改写）。
+    # 另外：这份清单当前只是生成物，尚未在任何真实集群 apply。
+    egress:
+      deny_all_except:
+        - model-gateway.internal
+        - git-proxy.internal
+        # 注意：这份名单管的是**沙箱**的出口。网关自身还有两类出站：
+        # 配置好的模型上游（受 ModelGateway 的 assertAllowed 约束），
+        # 以及 Vertex 换 access token 的 oauth2.googleapis.com。后者是网关自身的
+        # 硬编码出口，配了 gcp 上游时会被构造期校验强制要求出现在本名单里
+        # （见 ModelGateway 构造函数），所以这里不是靠注释维持的约定。
+        # 网关 Pod 的网络策略同样要放通它。
+
+    rules:
+      # ── 不可越权改动的路径（对所有非只读工具生效）────────────────
+      - name: ci-iac-secrets-off-limits
+        tool: "*"
+        deny_paths:
+          # CI/CD 定义：改了它就等于拿到流水线的执行权
+          - "**/.github/workflows/**"
+          - "**/.gitlab-ci.yml"
+          - "**/Jenkinsfile"
+          - "**/.circleci/**"
+          - "**/azure-pipelines.yml"
+          - "**/.buildkite/**"
+          # 构建与基础设施
+          - "**/Dockerfile"
+          - "**/Dockerfile.*"
+          - "**/*.tf"
+          - "**/*.tfvars"
+          - "**/*.tf.json"
+          # 凭据
+          - "**/secrets/**"
+          - "**/.env"
+          - "**/.env.*"
+          - "**/.npmrc"
+          - "**/.ssh/**"
+          - "**/.aws/**"
+          # agent 自己的配置面。pi 会发现项目本地的 .pi/extensions/ 与
+          # .pi/settings.json，但**默认加载不了**：main.ts 有一道 project trust 门，
+          # RPC 模式无 UI、defaultProjectTrust 为 ask 时直接判为不信任（fail-closed）。
+          # 因此这不是一条当下可直接利用的提权路径。封掉是纵深防御，防的是四个
+          # 真实存在的窗口：客户镜像把 defaultProjectTrust 设成 always、trustStore
+          # 里已有该目录的 true、启动带了 trust override、pi 未来改这个默认。
+          # 扩展一旦加载就能注册 tool_call 钩子，也能伪造判决上报污染审计。
+          # AGENTS.md 则是 prompt injection 的标准载体（红队项就是往仓库里埋一个）。
+          - "**/.pi/**"
+          # AGENTS.override.md 在 pi 的候选列表里排第一（resource-loader.ts），
+          # 写了它就直接顶掉 AGENTS.md
+          - "**/AGENTS.override.md"
+          - "**/AGENTS.md"
+          - "**/CLAUDE.md"
+          - "**/.cursorrules"
+          - "**/.clinerules"
+          # .git 内部：写 hooks 等于任意代码执行（之后任何一条 git commit 都会触发），
+          # 写 config 能改 credential.helper 或用 insteadOf 把 git-proxy 重定向走 ——
+          # 这会直接击穿「凭据不进沙箱」这条铁律。
+          - "**/.git/hooks/**"
+          - "**/.git/config"
+          # 全局 .gitconfig 同样承载 insteadOf 与 credential.helper，而且网关
+          # 就是靠它把 SCM 重写到凭据代理的。真实收益不是「重定向到攻击者地址」
+          # （那由 egress 挡），而是审批门绕过：写一句 [alias] p = push，
+          # 之后 git p 不再匹配 git push* 模式，审批门静默失效；core.hooksPath 同理。
+          - "**/.gitconfig"
+
+      # ── 破坏性与外泄类命令 ─────────────────────────────────────
+      - name: destructive-commands
+        tool: bash
+        deny_patterns:
+          - "rm -rf /"
+          # 不写成 `rm -rf /*`：那会连 `rm -rf /workspace/node_modules` 一起拒掉，
+          # 而 deny 没有审批兜底，agent 会在极常见的动作上直接卡死。
+          - "rm -rf /bin*"
+          - "rm -rf /etc*"
+          - "rm -rf /usr*"
+          - "rm -rf /var*"
+          # 反弹 shell 与远程执行。操作符两侧空格由 collapse 补齐，
+          # 所以 `>/dev/tcp/x` 与 `> /dev/tcp/x` 都会命中。
+          - "*/dev/tcp/*"
+          - "curl * | *sh"
+          - "wget * | *sh"
+          - "npm publish*"
+          - "pnpm publish*"
+          - "chmod -R 777 *"
+          - "history -c*"
+
+      # ── 不可逆操作：拦下来问人 ──────────────────────────────────
+      - name: irreversible-operations
+        tool: bash
+        require_approval:
+          # force push 的三种拼写统一到审批档。不 deny 的理由：远端 reflog 仍可挽回，
+          # 而硬拒 --force-with-lease 会逼人退回真正危险的 -f。
+          - "git push*"
+          - "git tag*"
+          - "kubectl *"
+          - "terraform apply*"
+          - "terraform destroy*"
+          - "aws *"
+          - "gcloud *"
+          - "docker push*"
+          - "helm *"
+          # 写 PR/MR 评论同样可能不可逆：Atlantis、Terraform Cloud 这类工具
+          # 监听 issue_comment，一条评论就能触发基础设施变更。
+          - "gh pr comment*"
+          - "gh issue comment*"
+          - "gh pr review*"
+          - "glab mr note*"
+          - "glab mr approve*"
+          - "* /repos/*/issues/*/comments*"
+          - "* /projects/*/merge_requests/*/notes*"
+
+      # ── 高风险路径：允许改但要人过目 ────────────────────────────
+      - name: sensitive-paths-need-review
+        tool: "*"
+        require_approval_paths:
+          - "**/package.json"
+          - "**/pnpm-lock.yaml"
+          - "**/package-lock.json"
+          - "**/go.mod"
+          - "**/pyproject.toml"
+          - "**/requirements.txt"

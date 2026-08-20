@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { parse as parseYaml } from "yaml";
+import { generateNetworkPolicy } from "../src/deploy/netpol.ts";
 import { renderPodManifest } from "../src/deploy/pod-template.ts";
 
 /**
@@ -114,4 +115,56 @@ test("运行时依赖只能是 ws 与 yaml —— 这条硬约束此前没有守
 	// 进沙箱的攻击面。声明在 README 里，但没有任何自动化断言。
 	const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8"));
 	assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["ws", "yaml"]);
+});
+
+test("configmap schema 有判别力 —— 否则下面那条是空转", () => {
+	const validate = validator("configmap.json");
+	assert.equal(validate({ apiVersion: "v1", kind: "ConfigMap", metadata: { name: "x" }, datas: {} }), false);
+	assert.equal(validate({ apiVersion: "v1", kind: "ConfigMap", metadata: { name: "x" }, data: { a: 1 } }), false);
+});
+
+test("生成的策略 ConfigMap 通过官方 schema 校验", () => {
+	// sandbox.yaml 引用了这份 ConfigMap；缺了它 Pod 会卡在 ContainerCreating，
+	// 而症状看起来像沙箱起不来
+	const validate = validator("configmap.json");
+	const doc = parseYaml(readFileSync(join(REPO, "deploy/policy-configmap.yaml"), "utf8"));
+	assert.ok(validate(doc), describeErrors(validate.errors));
+});
+
+test("ConfigMap 的 key 必须与 Pod 里 PERIMETER_POLICY_FILE 的文件名一致", () => {
+	// 对不上的话卷挂上了、文件名却不对，扩展在容器里 readFileSync 失败
+	const cm = parseYaml(readFileSync(join(REPO, "deploy/policy-configmap.yaml"), "utf8"));
+	const pod = parseYaml(readFileSync(join(REPO, "deploy/sandbox.yaml"), "utf8"));
+	const env = pod.spec.containers[0].env.find((e: { name: string }) => e.name === "PERIMETER_POLICY_FILE");
+	const fileName = String(env.value).split("/").pop() ?? "";
+	assert.ok(Object.keys(cm.data).includes(fileName), `ConfigMap 没有 key ${fileName}`);
+
+	// 挂载点也要精确对上。前缀比较会放过 mountPath=/etc 而文件实际在
+	// /etc/policy.yaml、env 却指向 /etc/perimeter/policy.yaml 的情况
+	const mount = pod.spec.containers[0].volumeMounts.find((m: { name: string }) => m.name === "policy");
+	assert.equal(String(env.value), `${mount.mountPath}/${fileName}`);
+
+	// 卷引用的 ConfigMap 名字要和生成的一致
+	const vol = pod.spec.volumes.find((v: { name: string }) => v.name === "policy");
+	assert.equal(vol.configMap.name, cm.metadata.name);
+});
+
+test("ConfigMap 内容与 config/policy.yaml 无漂移", () => {
+	// 策略是唯一事实来源，两处各维护一份必然漂移，
+	// 而漂移的后果是沙箱按一份过期的规则跑
+	const cm = parseYaml(readFileSync(join(REPO, "deploy/policy-configmap.yaml"), "utf8"));
+	const source = readFileSync(join(REPO, "config/policy.yaml"), "utf8");
+	assert.equal(cm.data["policy.yaml"], source, "请跑 npm run gen:policy-cm");
+});
+
+test("NetworkPolicy 与 config/policy.yaml 无漂移", () => {
+	// 与 ConfigMap 同一个生成器模式，覆盖不该不对称。
+	// egress allowlist 是四条铁律里唯一真正的技术边界，
+	// 生成物滞后就意味着沙箱按一份过期的名单跑
+	const generated = generateNetworkPolicy(readFileSync(join(REPO, "config/policy.yaml"), "utf8"), {
+		namespace: "perimeter",
+		podLabel: { "app.kubernetes.io/name": "perimeter-sandbox" },
+	});
+	const committed = readFileSync(join(REPO, "deploy/networkpolicy.yaml"), "utf8");
+	assert.equal(committed, generated, "请跑 npm run gen:netpol");
 });
