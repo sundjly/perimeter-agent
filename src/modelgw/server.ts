@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AuditLog } from "../audit/log.ts";
 import { scanSecrets } from "./secrets.ts";
-import { type UpstreamAuth, authorizeUpstream } from "./upstream-auth.ts";
+import { GCP_TOKEN_HOST, type UpstreamAuth, authorizeUpstream } from "./upstream-auth.ts";
 
 export interface UpstreamConfig {
 	/** provider id，客户端用 model 前缀或 header 选择 */
@@ -18,9 +18,17 @@ export interface UpstreamConfig {
 	 */
 	auth?: UpstreamAuth;
 	/**
-	 * 上游路径，默认 `/chat/completions`（OpenAI 兼容）。
-	 * Bedrock 是 `/model/{model}/invoke-with-response-stream`，
-	 * `{model}` 会用请求体里的 model 字段替换。
+	 * 上游路径，默认 `/chat/completions`。
+	 *
+	 * 四条通道都应当指向上游的 **OpenAI 兼容端点**（Bedrock 有
+	 * `/openai/v1/chat/completions`，Vertex 有
+	 * `.../endpoints/openapi/chat/completions`）—— 网关不做协议转换。
+	 *
+	 * `{model}` 占位符会用请求体里的 model 字段替换，供少数需要把模型 id
+	 * 放进路径的部署使用。⚠️ 指向**原生**端点（如 Bedrock 的
+	 * `/model/{model}/invoke`）虽然能连通，但响应是
+	 * `application/vnd.amazon.eventstream` 二进制帧 —— 计量解析不出
+	 * token 数，配额会静默失效，沙箱也拿到自己解析不了的格式。
 	 */
 	path?: string;
 }
@@ -90,6 +98,13 @@ export class ModelGateway {
 	constructor(cfg: ModelGatewayConfig) {
 		this.#cfg = cfg;
 		this.#fetch = cfg.fetchImpl ?? fetch;
+		// 换 token 的端点是网关自身的一条硬编码出口，不像 baseUrl 那样
+		// 天然过 assertAllowed。不校验的话，「allowlist 是唯一事实来源」
+		// 这条不变量就只靠一行注释维持，锁死出口的生产环境里 Vertex 会在
+		// 无人预期的地方 fail。
+		if (cfg.upstreams.some((u) => u.auth?.kind === "gcp")) {
+			assertAllowed(`https://${GCP_TOKEN_HOST}`, cfg.egressAllowlist, "GCP token 端点");
+		}
 		for (const u of cfg.upstreams) {
 			assertAllowed(u.baseUrl, cfg.egressAllowlist);
 			// HTTP header 只能是 ASCII。不在这里查的话，一个含非 ASCII 的凭据
@@ -204,6 +219,9 @@ export class ModelGateway {
 		}
 
 		const upRes = await this.#fetch(target, { method: "POST", headers, body });
+		// 上游的错误正文**有意透传**给沙箱：agent 要据此判断是 rate limit、
+		// context 超长还是参数错误，并决定重试还是改写请求。这与换 token
+		// 失败不同 —— 那种错误对 agent 毫无用处，纯粹是内部拓扑泄漏。
 
 		res.writeHead(upRes.status, {
 			"content-type": upRes.headers.get("content-type") ?? "text/event-stream",
@@ -242,10 +260,10 @@ export class ModelGateway {
 }
 
 /** 出口 allowlist 是真正的安全边界，配置期就要拒绝名单外的上游 */
-export function assertAllowed(baseUrl: string, allowlist: string[]): void {
+export function assertAllowed(baseUrl: string, allowlist: string[], what = "上游"): void {
 	const host = new URL(baseUrl).hostname;
 	if (!allowlist.includes(host)) {
-		throw new Error(`模型网关上游 ${host} 不在 egress allowlist 内：${allowlist.join(", ")}`);
+		throw new Error(`模型网关${what} ${host} 不在 egress allowlist 内：${allowlist.join(", ")}`);
 	}
 }
 

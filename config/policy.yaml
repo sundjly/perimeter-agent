@@ -25,9 +25,10 @@ egress:
     - git-proxy.internal
     # 注意：这份名单管的是**沙箱**的出口。网关自身还有两类出站：
     # 配置好的模型上游（受 ModelGateway 的 assertAllowed 约束），
-    # 以及 Vertex 换 access token 的 oauth2.googleapis.com（固定常量，
-    # 见 upstream-auth.ts 的 GCP_TOKEN_HOST）。锁死出口的生产环境里
-    # 后者容易被漏掉 —— 网关 Pod 的网络策略要单独放通它。
+    # 以及 Vertex 换 access token 的 oauth2.googleapis.com。后者是网关自身的
+    # 硬编码出口，配了 gcp 上游时会被构造期校验强制要求出现在本名单里
+    # （见 ModelGateway 构造函数），所以这里不是靠注释维持的约定。
+    # 网关 Pod 的网络策略同样要放通它。
 
 rules:
   # ── 不可越权改动的路径（对所有非只读工具生效）────────────────

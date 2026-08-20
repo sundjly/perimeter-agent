@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -7,6 +8,7 @@ import { after, test } from "node:test";
 import { AuditLog } from "../src/audit/log.ts";
 import { ModelGateway, assertAllowed } from "../src/modelgw/server.ts";
 import { redact, scanSecrets } from "../src/modelgw/secrets.ts";
+import { GCP_TOKEN_HOST, clearTokenCache } from "../src/modelgw/upstream-auth.ts";
 
 const cleanups: (() => Promise<void> | void)[] = [];
 after(async () => {
@@ -14,15 +16,19 @@ after(async () => {
 });
 
 /** 假上游：记录收到的请求，按 SSE 回一段带 usage 的响应 */
-async function startUpstream(): Promise<{ url: string; host: string; seen: { headers: Record<string, unknown>; body: string }[] }> {
-	const seen: { headers: Record<string, unknown>; body: string }[] = [];
+async function startUpstream(): Promise<{
+	url: string;
+	host: string;
+	seen: { headers: Record<string, unknown>; body: string; url: string }[];
+}> {
+	const seen: { headers: Record<string, unknown>; body: string; url: string }[] = [];
 	const srv = createServer((req, res) => {
 		let body = "";
 		req.on("data", (c) => {
 			body += c;
 		});
 		req.on("end", () => {
-			seen.push({ headers: req.headers, body });
+			seen.push({ headers: req.headers, body, url: req.url ?? "" });
 			res.writeHead(200, { "content-type": "text/event-stream" });
 			res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "上游回复" } }] })}\n\n`);
 			res.write(`data: ${JSON.stringify({ choices: [{ delta: {} }], usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 } })}\n\n`);
@@ -250,4 +256,208 @@ test("健康检查与未知路径", async () => {
 	const base = url.replace("/v1/chat/completions", "");
 	assert.equal((await fetch(`${base}/healthz`)).status, 200);
 	assert.equal((await fetch(`${base}/v1/embeddings`, { method: "POST", headers: { authorization: "Bearer gw-token" }, body: "{}" })).status, 404);
+});
+
+// ── 企业模型通道：走完整的 ModelGateway，而不只是认证函数 ──────────
+// 这些不等于「对真实 Bedrock/Vertex 验证过」—— 上游是假的。
+// 它们验证的是网关这一侧：签名头真的发出去了、token 真的换了、错误不外泄。
+
+test("Bedrock 通道：上游收到 SigV4 签名头，且密钥不出现在请求里", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0,
+		host: "127.0.0.1",
+		token: "gw-token",
+		upstreams: [
+			{
+				id: "bedrock",
+				baseUrl: up.url,
+				path: "/model/{model}/invoke",
+				auth: { kind: "sigv4", accessKeyId: "AKIAEXAMPLE", secretAccessKey: "SECRET", region: "us-east-1" },
+			},
+		],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+
+	const res = await call(
+		`http://127.0.0.1:${port}/v1/chat/completions`,
+		{ model: "bedrock/anthropic.claude-x:0", messages: [] },
+		{ authorization: "Bearer gw-token" },
+	);
+	assert.equal(res.status, 200);
+	await res.text();
+
+	const seen = up.seen.at(-1)!;
+	assert.match(String(seen.headers.authorization), /^AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE\//, "上游必须收到 SigV4 签名");
+
+	// 签名覆盖的 payload 必须就是实际发出去的 body。对不上的话 AWS 只回
+	// 一个 403，不会说是 body 变了还是签名算错了。
+	assert.equal(
+		seen.headers["x-amz-content-sha256"],
+		createHash("sha256").update(seen.body).digest("hex"),
+		"content hash 必须是实际 body 的 sha256",
+	);
+
+	// 「签的 URI == 发的 URI」这个跨函数不变量：provider 前缀在 upstreamUrl
+	// 里被剥掉、模型 id 里的 `:` 被编码，签名必须覆盖替换后的那个路径
+	assert.equal(seen.url, "/v1/model/anthropic.claude-x%3A0/invoke");
+});
+
+test("Vertex 通道：换到的 access token 作为 Bearer 发给上游", async () => {
+	clearTokenCache();
+	const key = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	}).privateKey;
+	const up = await startUpstream();
+	const audit = AuditLog.open(join(mkdtempSync(join(tmpdir(), "mgw-")), "a.jsonl"));
+	cleanups.push(() => audit.close());
+	const gw = new ModelGateway({
+		port: 0,
+		host: "127.0.0.1",
+		token: "gw-token",
+		upstreams: [{ id: "vertex", baseUrl: up.url, auth: { kind: "gcp", clientEmail: "sa@x", privateKey: key } }],
+		// 配了 gcp 上游就必须把 token 端点也写进 allowlist —— 构造期会校验
+		egressAllowlist: [up.host, GCP_TOKEN_HOST],
+		audit,
+		// 注入假的 token 端点：真打 Google 会让测试依赖外网与真实凭据
+		fetchImpl: (async (u: string, init?: RequestInit) => {
+			if (String(u).includes("oauth2.googleapis.com")) {
+				return new Response(JSON.stringify({ access_token: "ya29.injected", expires_in: 3600 }));
+			}
+			return fetch(u, init);
+		}) as unknown as typeof fetch,
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, { model: "m", messages: [] }, {
+		authorization: "Bearer gw-token",
+	});
+	assert.equal(res.status, 200);
+	await res.text();
+	assert.equal(up.seen.at(-1)!.headers.authorization, "Bearer ya29.injected");
+});
+
+test("换 token 失败：沙箱只看到固定文案，上游正文只进审计", async () => {
+	clearTokenCache();
+	const key = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	}).privateKey;
+	const up = await startUpstream();
+	const auditFile = join(mkdtempSync(join(tmpdir(), "mgw-")), "a.jsonl");
+	const audit = AuditLog.open(auditFile);
+	let closed = false;
+	cleanups.push(() => {
+		if (!closed) audit.close();
+	});
+	const gw = new ModelGateway({
+		port: 0,
+		host: "127.0.0.1",
+		token: "gw-token",
+		upstreams: [{ id: "vertex", baseUrl: up.url, auth: { kind: "gcp", clientEmail: "sa-internal@proj", privateKey: key } }],
+		egressAllowlist: [up.host, GCP_TOKEN_HOST],
+		audit,
+		fetchImpl: (async (u: string) => {
+			if (String(u).includes("oauth2.googleapis.com")) {
+				return new Response("invalid_grant: sa-internal@proj not found in org-12345", { status: 400 });
+			}
+			return new Response("{}");
+		}) as unknown as typeof fetch,
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, { model: "m", messages: [] }, {
+		authorization: "Bearer gw-token",
+	});
+	assert.equal(res.status, 502);
+	const text = await res.text();
+	// 上游正文长度无界、内容由上游控制，还会暴露内部拓扑
+	assert.ok(!text.includes("org-12345"), "上游正文不得回给沙箱");
+	assert.ok(!text.includes("sa-internal"), "SA 邮箱不得回给沙箱");
+
+	audit.close();
+	closed = true;
+	const summaries: string[] = [];
+	for await (const e of AuditLog.replay(auditFile)) summaries.push(e.summary);
+	assert.ok(summaries.some((s) => s.includes("org-12345")), "详情必须留在审计里，否则无从排查");
+});
+
+test("新增的 auth 字段不会绕过上游 baseUrl 的 allowlist 校验", () => {
+	// 新增的认证方式不该成为绕过出口控制的口子
+	assert.throws(
+		() =>
+			new ModelGateway({
+				port: 0,
+				host: "127.0.0.1",
+				token: "t",
+				upstreams: [
+					{
+						id: "b",
+						baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+						auth: { kind: "sigv4", accessKeyId: "A", secretAccessKey: "S", region: "us-east-1" },
+					},
+				],
+				egressAllowlist: ["model-gateway.internal"],
+			}),
+		/不在 egress allowlist 内/,
+	);
+});
+
+test("配了 gcp 上游就必须把 token 端点写进 allowlist —— 否则出口名单不是唯一事实来源", () => {
+	// 换 token 是网关自身的一条硬编码出口，不像 baseUrl 那样天然过校验。
+	// 不强制的话，锁死出口的生产环境里 Vertex 会在无人预期的地方 fail。
+	const key = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	}).privateKey;
+	assert.throws(
+		() =>
+			new ModelGateway({
+				port: 0,
+				host: "127.0.0.1",
+				token: "t",
+				upstreams: [{ id: "v", baseUrl: "https://vertex.internal", auth: { kind: "gcp", clientEmail: "sa@x", privateKey: key } }],
+				egressAllowlist: ["vertex.internal"],
+			}),
+		/GCP token 端点 oauth2\.googleapis\.com 不在 egress allowlist/,
+	);
+});
+
+test("上游的错误正文有意透传给沙箱 —— 与换 token 失败的处理刻意不同", async () => {
+	// agent 要据此判断是 rate limit、context 超长还是参数错误，并决定重试
+	// 还是改写请求。而换 token 失败的正文对 agent 毫无用处，纯粹是内部拓扑
+	// 泄漏（见上一条测试）。同一份威胁模型下的两种取舍，差别在「这条信息
+	// 对被隔离的一方有没有用」。
+	//
+	// ⚠️ 代价：上游正文长度无界、内容由上游控制。上游若某天不可信
+	// （比如换成共享的第三方网关），这条透传要重新评估。
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0,
+		host: "127.0.0.1",
+		token: "gw-token",
+		upstreams: [{ id: "u", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+		fetchImpl: (async () =>
+			new Response('{"error":{"message":"context_length_exceeded: 8192 > 4096"}}', {
+				status: 400,
+				headers: { "content-type": "application/json" },
+			})) as unknown as typeof fetch,
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, { model: "u/m", messages: [] }, {
+		authorization: "Bearer gw-token",
+	});
+	assert.equal(res.status, 400, "上游状态码要原样透传");
+	assert.match(await res.text(), /context_length_exceeded/, "agent 需要知道具体是哪种错误才能自行纠正");
 });
