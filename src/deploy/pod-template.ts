@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
@@ -36,6 +37,30 @@ export interface PodVars {
  * 说明（「镜像必须有 tar」「不能把 pi 当主进程」等）。对 apply 到集群无影响，
  * 但要给客户安全团队审阅时，应当给他们看 sandbox.yaml 原文而不是这里的产物。
  */
+/**
+ * 把 sessionId 规范成 K8s 能接受的名字片段。
+ *
+ * 三条约束，任一违反 Pod 都会被直接拒绝，而 schema 校验**看不出来**
+ * （官方 schema 把 name 与 label value 都声明成裸 string）：
+ * - Pod 名要符合 DNS-1123：`[a-z0-9]([-a-z0-9]*[a-z0-9])?`，不许大写与下划线
+ * - label value 上限 63 字符
+ * - 首尾必须是字母数字
+ *
+ * 而 sessionId 是**客户端可指定**的（网关只校验 `[A-Za-z0-9_-]{1,64}`），
+ * 所以 `?session=Fix_Bug` 或一个 64 字符的 id 就能让整个会话起不来。
+ * docker 后端不受影响（容器名允许大写和下划线），所以这条一直没暴露。
+ *
+ * 规范化会让不同的 sessionId 撞名（`Fix_Bug` 与 `fix-bug`），因此补一段
+ * 来自原始值的短 hash 保唯一。
+ */
+export function k8sNameFragment(sessionId: string): string {
+	const hash = createHash("sha256").update(sessionId).digest("hex").slice(0, 8);
+	const lowered = sessionId.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+	// 留出 hash 与连接符的位置；总长控制在 label value 的 63 上限内
+	const body = lowered.slice(0, 40).replace(/^-+|-+$/g, "");
+	return body ? `${body}-${hash}` : hash;
+}
+
 export function renderPodManifest(templatePath: string, vars: PodVars): string {
 	const doc = parseYaml(readFileSync(templatePath, "utf8")) as PodSpec;
 	if (doc?.kind !== "Pod") throw new Error(`模板不是 Pod：${templatePath}`);
@@ -48,7 +73,8 @@ export function renderPodManifest(templatePath: string, vars: PodVars): string {
 	// 但不受 egress 约束 —— 静默失去一条真边界。
 	doc.metadata.labels = {
 		...doc.metadata.labels,
-		"perimeter.dev/session": vars.sessionId,
+		// label value 有 63 字符上限且首尾必须是字母数字，直接放 sessionId 会被拒
+		"perimeter.dev/session": k8sNameFragment(vars.sessionId),
 		...(vars.gatewayId ? { "perimeter.dev/gateway": vars.gatewayId } : {}),
 	};
 

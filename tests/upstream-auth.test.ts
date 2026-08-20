@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { createVerify, generateKeyPairSync } from "node:crypto";
 import { test } from "node:test";
 import { upstreamUrl } from "../src/modelgw/server.ts";
 import { authorizeUpstream, clearTokenCache, gcpAccessToken } from "../src/modelgw/upstream-auth.ts";
@@ -167,4 +167,55 @@ test("私钥轮换后不复用旧 token", async () => {
 
 	assert.equal(await gcpAccessToken({ kind: "gcp", clientEmail: "sa@x", privateKey }, counting), "t1");
 	assert.equal(await gcpAccessToken({ kind: "gcp", clientEmail: "sa@x", privateKey: other }, counting), "t2");
+});
+
+test("发出的 JWT 是密码学有效的 RS256 签名 —— 用公钥验签，不是格式检查", async () => {
+	// 前面那条只解析了 header 与 claims，签名本身没验过。
+	// Google 拒绝一个签名无效的断言时只回 invalid_grant，不会说是签错了。
+	clearTokenCache();
+	const pair = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	});
+	let assertion = "";
+	const capture = (async (_u: string, init: { body: string }) => {
+		assertion = new URLSearchParams(init.body).get("assertion") ?? "";
+		return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }));
+	}) as unknown as typeof fetch;
+	await gcpAccessToken({ kind: "gcp", clientEmail: "sa@x", privateKey: pair.privateKey }, capture);
+
+	const [header, payload, signature] = assertion.split(".");
+	const ok = createVerify("RSA-SHA256")
+		.update(`${header}.${payload}`)
+		.verify(pair.publicKey, Buffer.from(signature!, "base64url"));
+	assert.ok(ok, "签名必须能被对应公钥验证通过");
+
+	// 用**另一个密钥对**的公钥验必须失败。这才钉住「签名用的是
+	// auth.privateKey 而不是某个硬编码或串号的 key」—— 那是能真实发生的 bug。
+	// （改数据后验签失败是 RSA 的性质，测的是 Node crypto 不是本项目。）
+	const other = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	});
+	assert.equal(
+		createVerify("RSA-SHA256").update(`${header}.${payload}`).verify(other.publicKey, Buffer.from(signature!, "base64url")),
+		false,
+		"必须用配置里那把私钥签，不能是别的",
+	);
+});
+
+test("JWT 的有效期不超过 Google 允许的上限", async () => {
+	// exp - iat 超过 1 小时会被拒，而错误信息同样只是 invalid_grant
+	clearTokenCache();
+	let assertion = "";
+	const capture = (async (_u: string, init: { body: string }) => {
+		assertion = new URLSearchParams(init.body).get("assertion") ?? "";
+		return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }));
+	}) as unknown as typeof fetch;
+	await gcpAccessToken({ kind: "gcp", clientEmail: "sa@x", privateKey }, capture);
+
+	const claims = JSON.parse(Buffer.from(assertion.split(".")[1]!, "base64url").toString());
+	assert.ok(claims.exp - claims.iat <= 3600, "Google 拒绝有效期超过 1 小时的断言");
 });

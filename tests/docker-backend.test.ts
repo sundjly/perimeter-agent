@@ -15,6 +15,7 @@ import {
 	containerName,
 	defaultContainerUser,
 } from "../src/gateway/execution-backend.ts";
+import { k8sNameFragment } from "../src/deploy/pod-template.ts";
 import { Gateway } from "../src/gateway/server.ts";
 import { ModelGateway } from "../src/modelgw/server.ts";
 import type { ClientEvent } from "../src/protocol/types.ts";
@@ -137,7 +138,9 @@ test("没有接线 HOME 时给一块 tmpfs —— 根只读，否则 pi 写自�
 test("kubectl 后端生成 exec 命令，`--` 之后才是容器内的命令", () => {
 	const l = new KubectlBackend({ podTemplate: "perimeter-{session}", namespace: "perimeter" }).launch(ctx);
 	assert.equal(l.bin, "kubectl");
-	assert.deepEqual(l.argsPrefix, ["exec", "-i", "perimeter-sess-1", "-n", "perimeter", "--", "pi"]);
+	// Pod 名带规范化后的 sessionId 片段：客户端可指定的 id 允许大写与下划线，
+	// 而 K8s 的 Pod 名必须符合 DNS-1123
+	assert.deepEqual(l.argsPrefix, ["exec", "-i", `perimeter-${k8sNameFragment("sess-1")}`, "-n", "perimeter", "--", "pi"]);
 });
 
 test("容器名可预测，pi 意外退出后还能找回来清理", () => {
@@ -342,26 +345,10 @@ test("kubectl prepare 的两条命令形状 —— 直接测 prepare() 只能断
 
 	// --for=create 是必需的：Pod 由外部编排器创建，两边并发时不加它
 	// 会在「资源还不存在」上立即失败而不是等待
-	assert.deepEqual(wait, [
-		"wait",
-		"--for=create",
-		"--for=condition=Ready",
-		"pod/perimeter-sess-1",
-		"--timeout=60s",
-		"-n",
-		"ns",
-	]);
+	const pod = `perimeter-${k8sNameFragment("sess-1")}`;
+	assert.deepEqual(wait, ["wait", "--for=create", "--for=condition=Ready", `pod/${pod}`, "--timeout=60s", "-n", "ns"]);
 	// 尾部 `/.` 决定复制的是目录内容而非目录本身；去掉它会 cp 成 /home/agent/home/
-	assert.deepEqual(cp, [
-		"cp",
-		"--no-preserve",
-		"/host/home/.",
-		"perimeter-sess-1:/home/agent",
-		"-n",
-		"ns",
-		"-c",
-		"agent",
-	]);
+	assert.deepEqual(cp, ["cp", "--no-preserve", "/host/home/.", `${pod}:/home/agent`, "-n", "ns", "-c", "agent"]);
 });
 
 test("kubectl 目标路径必须与 sandbox.yaml 的 mountPath 一致", () => {

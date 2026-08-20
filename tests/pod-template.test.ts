@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
-import { renderPodManifest } from "../src/deploy/pod-template.ts";
+import { k8sNameFragment, renderPodManifest } from "../src/deploy/pod-template.ts";
 
 /**
  * 每会话 Pod 的渲染。纯函数，所以这些断言测的是真实内容而不是「没抛错」。
@@ -42,7 +42,9 @@ test("产物里不残留任何占位符", () => {
 test("session label 必须渲染出来 —— NetworkPolicy 的 selector 靠它", () => {
 	// 漏掉这个 label 的后果最不该静默：Pod 照常起来，egress 限制却没生效
 	const pod = render();
-	assert.equal(pod.metadata.labels["perimeter.dev/session"], "abc123");
+	// label value 存的是规范化后的片段，不是原始 sessionId ——
+	// 原始值可能含大写/下划线或超长，K8s 会直接拒
+	assert.equal(pod.metadata.labels["perimeter.dev/session"], k8sNameFragment("abc123"));
 
 	const netpol = parseYaml(readFileSync(join(REPO, "deploy/networkpolicy.yaml"), "utf8"));
 	const selector = netpol.spec.podSelector.matchLabels;
@@ -94,4 +96,39 @@ test("模板不是 Pod 时直接报错，而不是 apply 一份垃圾", () => {
 		repo: "r",
 		team: "t",
 	}), /不是 Pod/);
+});
+
+test("sessionId 规范化后必须满足 K8s 的名字与 label 约束", () => {
+	// sessionId 是客户端可指定的（网关只校验 [A-Za-z0-9_-]{1,64}），
+	// 而 K8s 的 Pod 名要符合 DNS-1123、label value 上限 63 字符。
+	// schema 校验对这两条完全看不出来 —— 官方 schema 里它们都是裸 string。
+	const DNS1123 = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
+	const LABEL = /^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/;
+
+	const inputs = [
+		"a",
+		"abc123",
+		"Fix_Bug", // 大写 + 下划线：K8s 拒
+		"abc-", // 以连字符结尾：K8s 拒
+		"-abc",
+		"___",
+		"UPPER_CASE_ID",
+		"x".repeat(64), // 顶格长度：label value 会超 63
+		"9startswithdigit",
+		"a-b_c-D",
+	];
+	for (const id of inputs) {
+		const frag = k8sNameFragment(id);
+		assert.ok(DNS1123.test(`perimeter-${frag}`), `Pod 名非法：${id} → perimeter-${frag}`);
+		assert.ok(LABEL.test(frag) && frag.length <= 63, `label value 非法：${id} → ${frag}（${frag.length} 字符）`);
+	}
+});
+
+test("规范化不同的 sessionId 不会撞名", () => {
+	// Fix_Bug 与 fix-bug 规范化后同形，靠原始值的 hash 区分 ——
+	// 撞名会让两个会话共用一个 Pod，或让后一个 create 失败
+	assert.notEqual(k8sNameFragment("Fix_Bug"), k8sNameFragment("fix-bug"));
+	assert.notEqual(k8sNameFragment("a_b"), k8sNameFragment("a-b"));
+	// 同一个输入必须稳定，否则 cleanup 找不回自己建的 Pod
+	assert.equal(k8sNameFragment("Fix_Bug"), k8sNameFragment("Fix_Bug"));
 });

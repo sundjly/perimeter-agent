@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { renderPodManifest } from "../deploy/pod-template.ts";
+import { k8sNameFragment, renderPodManifest } from "../deploy/pod-template.ts";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -535,7 +535,10 @@ export class KubectlBackend implements ExecutionBackend {
 	}
 
 	#podName(sessionId: string): string {
-		return this.#opts.podTemplate.replace("{session}", sessionId);
+		// 必须规范化：sessionId 客户端可指定，允许大写与下划线，
+		// 而 Pod 名要符合 DNS-1123。不转的话 `?session=Fix_Bug` 直接被 K8s 拒，
+		// 且 schema 校验看不出来（name 在官方 schema 里是裸 string）
+		return this.#opts.podTemplate.replace("{session}", k8sNameFragment(sessionId));
 	}
 }
 

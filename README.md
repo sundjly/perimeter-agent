@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 304 个测试
+npm test          # 315 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -88,7 +88,7 @@ deploy/           K8s 清单
 |---|---|---|
 | `local` | **无** —— agent 与网关同一个 OS 用户 | 默认，开发与 demo 用，**不是生产形态** |
 | `docker` | 只读根、非 root、drop ALL caps、no-new-privileges、内存/PID 上限、独占工作区 | ✅ 本机实测（macOS/OrbStack，见下） |
-| `kubectl` | 由 `deploy/sandbox.yaml` 的 Pod 定义决定 | ❌ 只验证了命令行形状，**未在真实集群跑过**；镜像必须含 `tar` |
+| `kubectl` | 由 `deploy/sandbox.yaml` 的 Pod 定义决定 | ⚠️ 命令行形状 + 清单已过官方 schema 离线校验；**未在真实集群跑过**，镜像必须含 `tar` |
 
 docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时整组跳过并说明原因）：
 
@@ -105,7 +105,8 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 
 **Pod 的创建与回收现在有代码了**（`src/deploy/pod-template.ts` + `KubectlBackend.provision/cleanup/reapOrphans`）：从 `deploy/sandbox.yaml` 渲染每会话 Pod、create、等 Ready、cp 配置进去，会话结束删 Pod，网关重启时按 label 回收孤儿。
 
-但**整条 kubectl 路径未在真实集群跑过**，只验证了渲染产物与命令行形状。所以「每会话独占沙箱」在 docker 后端下是运行中的事实，在 K8s 形态下仍然只是「代码写了、没验过」。另外镜像必须含 `tar`（`kubectl cp` 走 exec+tar），客户自带的 distroless 镜像会让整条路径断掉。
+**整条 kubectl 路径未在真实集群跑过。** 离线能证的已经证了：渲染产物通过 Kubernetes v1.31.0 官方 JSON schema 校验（字段名与类型层面）、Pod 与 NetworkPolicy 的 label/namespace 一致、sessionId 规范化后满足 DNS-1123 与 label 的长度约束。
+但 schema 有明确盲区——枚举值写错、名字非法、`containers: []` 它都放行；准入控制器、配额、runtimeClass 是否存在、镜像能否拉取更在覆盖之外。另外 `deploy/sandbox.yaml` 引用的 `perimeter-policy` ConfigMap **仓库里没有提供**，需由部署侧用 `kubectl create configmap perimeter-policy --from-file=config/policy.yaml` 创建。所以「每会话独占沙箱」在 docker 后端下是运行中的事实，在 K8s 形态下仍然只是「代码写了、没验过」。另外镜像必须含 `tar`（`kubectl cp` 走 exec+tar），客户自带的 distroless 镜像会让整条路径断掉。
 
 **接线：模型网关已接，git 代理未接到 demo：**
 
@@ -122,7 +123,8 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 - **四条模型通道都没对真实上游验证过**。Azure OpenAI（api-key 头）、自托管 vLLM（Bearer）、AWS Bedrock（SigV4 签名）、Google Vertex（service account 换 access token）的认证都实现了，SigV4 比对了 AWS 官方测试向量，但**没有一条打到过真的上游**。
   另外「支持 Bedrock/Vertex」的准确含义是「能用它们的认证方式打到它们的 **OpenAI 兼容端点**」——网关不做协议转换，也不接受原生格式的入站请求。销售材料按这个口径写。
 
-  SigV4 的实现与 `aws4`（aws-sdk-js v2 的签名器）在 64 个组合上做了逐字符交叉验证（16 种路径形态 × 4 种头集合，含生产实际使用的 content-sha 与 IRSA 临时凭据）。这证明签名算法与参考实现一致，**仍不等于 AWS 会接受**。
+  离线能证的已经证了：SigV4 与 `aws4`（aws-sdk-js v2 的签名器）在 64 个组合上逐字符交叉验证（16 种路径形态 × 4 种头集合，含生产实际使用的 content-sha 与 IRSA 临时凭据）；Vertex 的 JWT 断言用配对公钥做了 RS256 密码学验签，并断言有效期不超过 Google 的上限。
+  这些证明的是「签名与断言的构造正确」，**仍不等于上游会接受** —— region/service 选择、端点路径、时钟偏差、配额都在覆盖之外。
 - **身份**。Phase 1 只有共享 token，作用是把演示环境关起来。OIDC/SAML + RBAC 是 Phase 2。且浏览器的 WebSocket 无法自定义 header，token 走 URL query，**会进反向代理与服务器访问日志**
 - 沙箱编排、Helm chart、多 SCM、SIEM 导出、monorepo 支持
 
