@@ -334,3 +334,46 @@ test("调用方传的 docker 客户端变量不会污染容器 env", () => {
 	// 客户端仍用宿主机自己的值，而不是调用方塞的
 	assert.equal(l.env.DOCKER_HOST, process.env.DOCKER_HOST);
 });
+
+test("kubectl prepare 的两条命令形状 —— 直接测 prepare() 只能断言「失败了」，那种断言恒真", () => {
+	const b = new KubectlBackend({ podTemplate: "perimeter-{session}", namespace: "ns", container: "agent" });
+	const [wait, cp] = b.prepareArgs({ ...ctx, home: "/host/home" });
+
+	// --for=create 是必需的：Pod 由外部编排器创建，两边并发时不加它
+	// 会在「资源还不存在」上立即失败而不是等待
+	assert.deepEqual(wait, [
+		"wait",
+		"--for=create",
+		"--for=condition=Ready",
+		"pod/perimeter-sess-1",
+		"--timeout=60s",
+		"-n",
+		"ns",
+	]);
+	// 尾部 `/.` 决定复制的是目录内容而非目录本身；去掉它会 cp 成 /home/agent/home/
+	assert.deepEqual(cp, [
+		"cp",
+		"--no-preserve",
+		"/host/home/.",
+		"perimeter-sess-1:/home/agent",
+		"-n",
+		"ns",
+		"-c",
+		"agent",
+	]);
+});
+
+test("kubectl 目标路径必须与 sandbox.yaml 的 mountPath 一致", () => {
+	const b = new KubectlBackend({ podTemplate: "p-{session}" });
+	const [, cp] = b.prepareArgs({ ...ctx, home: "/h" });
+	const target = cp[3]!.split(":")[1];
+	const yaml = readFileSync(join(REPO, "deploy/sandbox.yaml"), "utf8");
+	// cp 到 emptyDir 之外（只读根上）不会报错，症状只会是「读不到 provider」
+	assert.ok(yaml.includes(`mountPath: ${target}`), `sandbox.yaml 里没有 ${target} 的挂载`);
+	assert.equal(b.launch({ ...ctx, home: "/h" }).homeInContainer, target);
+});
+
+test("没有沙箱 HOME 时 prepare 直接跳过，不做无谓的 kubectl 调用", async () => {
+	const b = new KubectlBackend({ podTemplate: "p-{session}" });
+	await b.prepare({ ...ctx, home: undefined });
+});

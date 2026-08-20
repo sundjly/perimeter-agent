@@ -30,6 +30,9 @@ spec:
   containers:
     - name: agent
       # 客户自带构建镜像：环境保真度是选云沙箱而非浏览器内执行的首要理由
+      # ⚠️ 镜像里**必须有 tar**：网关用 `kubectl cp` 把会话配置送进 Pod，
+      # 而 kubectl cp 走的是 exec+tar。distroless 镜像会让整条会话路径断在
+      # 这里，且错误信息离原因很远。这一条要进部署前置条件清单。
       image: CUSTOMER_BUILD_IMAGE
       imagePullPolicy: IfNotPresent
       # **不能把 pi 作为主进程**：Pod 的 stdin 立即 EOF，pi 随即退出，
@@ -39,13 +42,14 @@ spec:
       command: ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
       workingDir: /workspace
       env:
-        # ⚠️ **会话级配置的注入方式在 K8s 形态下尚未实现。**
-        # docker 后端是把网关生成的 $HOME（models.json + .gitconfig）bind mount
-        # 进去；K8s 这边 sandbox-home 是 emptyDir，网关无法从外部写入它。
-        # 可选方案：Pod 就绪后由网关 `kubectl cp` 写入，或每会话建一个 Secret
-        # 卷（后者与本文件开头「不挂任何 secret」的说法冲突，要先定夺）。
-        # 在做出选择并实现之前，kubectl 后端跑不了真实会话 —— 不要按
-        # 「只差一个集群」来理解。
+        # 会话级配置（models.json + .gitconfig）不走 env，也不走 Secret 卷：
+        # 网关在 Pod Ready 之后用 `kubectl cp` 写进下面的 sandbox-home
+        # （见 KubectlBackend.prepare）。选 cp 而不是 Secret 的理由：Secret 要
+        # 按会话建、按会话回收，多一套生命周期；而且它会在 K8s API 里留一份
+        # 副本，而 cp 进 emptyDir 的东西只在 Pod 内。两者对沙箱都是可读的 ——
+        # 里面本来就是给沙箱用的代理 token，不是上游凭据。
+        #
+        # ⚠️ 整条 kubectl 路径**未在真实集群验证过**，只验证了命令行形状。
         - name: PERIMETER_POLICY_FILE
           value: /etc/perimeter/policy.yaml
         - name: PERIMETER_REPO
@@ -74,7 +78,8 @@ spec:
         - name: policy
           mountPath: /etc/perimeter
           readOnly: true
-        # 沙箱 HOME。必须可写：readOnlyRootFilesystem 下 pi 要写自身状态。
+        # 沙箱 HOME。必须可写：readOnlyRootFilesystem 下 pi 要写自身状态，
+        # 网关也要往这里 cp 会话配置。
         # ⚠️ 策略扩展所在的 /opt/perimeter **由镜像提供**（见
         # deploy/sandbox.Dockerfile），不在这里挂 —— ConfigMap 有 1MiB 上限，
         # 而扩展的依赖有 27MB，用 configMap 会让 Pod 卡在 ContainerCreating。

@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 192 个测试
+npm test          # 200 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -88,7 +88,7 @@ deploy/           K8s 清单
 |---|---|---|
 | `local` | **无** —— agent 与网关同一个 OS 用户 | 默认，开发与 demo 用，**不是生产形态** |
 | `docker` | 只读根、非 root、drop ALL caps、no-new-privileges、内存/PID 上限、独占工作区 | ✅ 本机实测（macOS/OrbStack，见下） |
-| `kubectl` | 由 `deploy/sandbox.yaml` 的 Pod 定义决定 | ❌ 只验证了生成的命令行形状，**未在真实集群跑过** |
+| `kubectl` | 由 `deploy/sandbox.yaml` 的 Pod 定义决定 | ❌ 只验证了命令行形状，**未在真实集群跑过**；镜像必须含 `tar` |
 
 docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时整组跳过并说明原因）：
 

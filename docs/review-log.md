@@ -20,7 +20,8 @@
 | F10 演示链路与文档 | `2d51bd6` | `1881a83` + `55c1565` + `9bdd386` + `45a525d` | ⚠️ review 结论在提交后返回 |
 | F11 组件接线 | `fa7b3ab` | 同提交 | ✅ 先 review |
 | F12 git 端到端 | `b4b0050` | `6a9282e` + `cd97024` | ⚠️ review 结论在提交后返回 |
-| F13 容器执行后端 | `17cbab9` | `57ce5b2` + `51707eb` | ❌ **未 review 即提交** |
+| F13 容器执行后端（docker） | `17cbab9` | `57ce5b2` + `51707eb` | ❌ **未 review 即提交** |
+| F13b K8s 会话配置注入 | 见下 | 同提交 | ✅ 先 review |
 
 ## F13 的流程偏差
 
@@ -56,6 +57,10 @@ review 的代码，但 F13 的 review 发生在 commit 之后而非之前。
    共同点是本机全绿，客户环境静默坏掉。
 2. **按构造不可能失败的断言。** 「上游凭据不在沙箱」曾经无法失败，因为那个值
    根本没有路径流到被检查的文件里。绿灯不等于性质成立。
-3. **骗人的旋钮。** `issueSessionToken`（两个代理只认静态 token，签名让人以为
+3. **自己也会犯前两条。** F13b 第一版的守卫测试是假绿的 —— reviewer 实测
+   删掉守卫后测试照样通过，因为 LocalBackend 没有 prepare，start() 里唯一的
+   挂起点求值成 `await undefined`，pi 必然已经起来了。重写成用可控 prepare
+   闸门卡住会话，并做了负面验证（删守卫变红、恢复变绿）才算数。
+4. **骗人的旋钮。** `issueSessionToken`（两个代理只认静态 token，签名让人以为
    能按会话签发）、`reapOrphans`/`onCleanupError`（零调用方却写进了 commit
    message）、`piBin`（被 backend 抽象架空后传了也没用）。留着比没有更糟。

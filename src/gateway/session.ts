@@ -16,7 +16,7 @@ import {
 	toPiCommand,
 } from "../protocol/translate.ts";
 import { PiSession } from "../rpc/pi-session.ts";
-import { type ExecutionBackend, LocalBackend } from "./execution-backend.ts";
+import { type ExecutionBackend, type LaunchContext, LocalBackend } from "./execution-backend.ts";
 import { type SandboxWiring, writeSandboxConfig } from "./sandbox-config.ts";
 import { APPROVE, AUDIT_PREFIX, REJECT } from "./policy-extension.ts";
 
@@ -75,7 +75,12 @@ interface PendingApproval {
  */
 export class Session {
 	#opts: SessionOptions;
-	#pi: PiSession;
+	#pi!: PiSession;
+	/** 构造期算好、start() 里用的启动参数 */
+	#launch: ReturnType<ExecutionBackend["launch"]>;
+	#backend: ExecutionBackend;
+	#launchCtx!: LaunchContext;
+	#piStarted = false;
 	#tstate: TranslateState = newTranslateState();
 	/** 已发出的事件，供断线续接重放 */
 	#backlog: ClientEvent[] = [];
@@ -99,14 +104,17 @@ export class Session {
 	/** 钩子存活握手 */
 	#hookArmed = false;
 	/**
-	 * 工作区就绪。pi 子进程在构造函数里就 spawn 了，而 clone 在 start() 里 ——
-	 * 只用 #hookArmed 当门的话，用户一连上就发 prompt 会让 agent 在
-	 * clone 还没完成的目录里开工。本机 clone ~120ms 看不出来，中型仓库必现。
+	 * 工作区就绪。现在 clone 排在 #spawnPi 之前，所以 #piStarted 成立时
+	 * 它必然也成立 —— 这道门退化成了廉价兜底。保留它是因为启动顺序一旦
+	 * 再变（比如为了缩短冷启动而并行化），它就是唯一挡住「agent 在半个
+	 * 工作区里开工」的东西。
 	 */
 	#workspaceReady = false;
 	#queuedWhileDisarmed: ClientCommand[] = [];
 
 	#toolNames = new Map<string, string>();
+	#piArgs: string[] = [];
+	#launchEnv: NodeJS.ProcessEnv = {};
 	#sandboxHome: string | undefined;
 	#startedAt = Date.now();
 
@@ -129,7 +137,7 @@ export class Session {
 			PERIMETER_APPROVAL_TIMEOUT_MS: String(opts.approvalTimeoutMs ?? 120_000),
 		};
 		const backend = opts.backend ?? new LocalBackend(opts.piEnv ?? {});
-		const launch = backend.launch({
+		const launchCtx = {
 			sessionId: opts.sessionId,
 			workspace: opts.workspace,
 			home: wired?.home,
@@ -138,21 +146,36 @@ export class Session {
 			// 刻意不在这里传 PERIMETER_POLICY_FILE：它的值取决于 pi 进程
 			// 看到的文件系统，只有后端知道（容器里是挂载点）
 			env: sandboxEnv,
-		});
+		};
+		this.#launchCtx = launchCtx;
+		const launch = backend.launch(launchCtx);
 		// 扩展路径与策略路径都必须是 pi 进程视角的路径：
 		// 容器里是挂载点，本机是仓库路径。两者都由后端给出。
 		const launchEnv = launch.env;
 
+		this.#backend = backend;
+		this.#launch = launch;
+		this.#piArgs = [...launch.argsPrefix, ...(opts.piArgs ?? []), ...(wired?.piArgs ?? []), "-e", launch.extensionPath];
+		this.#launchEnv = launchEnv;
+	}
+
+	/**
+	 * 真正拉起 pi。刻意不在构造函数里做：
+	 * kubectl 后端要先把沙箱配置 cp 进 Pod（prepare），pi 启动时就要能读到
+	 * models.json；在构造函数里 spawn 的话配置根本来不及到位。
+	 */
+	#spawnPi(): void {
+		const opts = this.#opts;
 		this.#pi = new PiSession({
 			cwd: opts.workspace,
-			bin: launch.bin,
-			args: [...launch.argsPrefix, ...(opts.piArgs ?? []), ...(wired?.piArgs ?? []), "-e", launch.extensionPath],
+			bin: this.#launch.bin,
+			args: this.#piArgs,
 			// 只传显式给定的环境变量。继承 process.env 会把网关的共享 token
 			// 与模型 key 一起交给 pi，而 pi 会执行 agent 的 bash 工具 ——
 			// agent 跑一句 env 就拿到了，与「凭据不进沙箱」正面冲突。
 			// 容器后端下环境变量已由后端经 -e 注入容器，这里只剩 docker
 			// 客户端自己需要的 PATH；local 后端则拿到完整的一份。
-			env: { PATH: process.env.PATH, ...launchEnv },
+			env: { PATH: process.env.PATH, ...this.#launchEnv },
 			onEvent: (e) => this.#onPiEvent(e),
 			onResponse: (r) => this.#onPiResponse(r),
 			onExit: (info) => this.#onExit(info),
@@ -162,6 +185,9 @@ export class Session {
 			onProtocolError: (line, err) =>
 				this.#emit({ type: "error", code: "command_failed", message: `协议错误：${String(err)}（${line.slice(0, 80)}）` }),
 		});
+		// 构造成功之后才置真：构造抛错时留下 piStarted=true 而 #pi 未定义，
+		// 会让 handle()/stop() 的守卫全部失效，正好放回它们要防的场景
+		this.#piStarted = true;
 	}
 
 	get sessionId(): string {
@@ -187,7 +213,25 @@ export class Session {
 	 */
 	async start(): Promise<void> {
 		this.#audit({ kind: "session.start", summary: `会话开始 workspace=${this.#opts.workspace}` });
+
+		// 配置先到位，再拉起 agent。kubectl 后端的 Pod HOME 是空 emptyDir，
+		// 不 cp 进去就没有 models.json，pi 起来也读不到 provider。
+		try {
+			// 与构造期传给 launch() 的是同一个 ctx：两者不一致的话，
+			// 哪个后端的 prepare 读了 ctx.env 就会静默拿到空对象
+			await this.#backend.prepare?.(this.#launchCtx);
+		} catch (err) {
+			this.#audit({ kind: "error", summary: `沙箱准备失败：${String(err).slice(0, 200)}` });
+			this.#emit({ type: "error", code: "agent_error", message: `沙箱准备失败：${String(err).slice(0, 300)}` });
+			// 走 stop() 而不是只置 #alive —— 后者会让这个会话永远没有
+			// session.end 记录（理由见 stop() 上方的注释）
+			await this.stop();
+			return;
+		}
+
+		// clone 也要在 pi 之前：agent 拿到控制权时工作区就该是就绪的
 		if (this.#opts.repoUrl && !(await this.#cloneRepo(this.#opts.repoUrl))) return;
+		this.#spawnPi();
 		try {
 			const res = await this.#pi.request({ type: "get_state" });
 			for (const ev of toClientEventFromResponse(res)) {
@@ -196,8 +240,8 @@ export class Session {
 			}
 		} catch (err) {
 			// 起不来就别宣告 ready：前端显示「就绪」而 pi 已死是最难排查的状态
-			this.#alive = false;
 			this.#emit({ type: "error", code: "agent_error", message: `会话启动失败：${String(err)}` });
+			await this.stop();
 			return;
 		}
 		this.#emit({
@@ -213,6 +257,18 @@ export class Session {
 			summary: `会话就绪（冷启动 ${Date.now() - this.#startedAt}ms，含 clone）`,
 			durationMs: Date.now() - this.#startedAt,
 		});
+	}
+
+	/**
+	 * 排队上限：kubectl 后端把「pi 未就绪」的窗口从约 1 秒拉到最坏几分钟，
+	 * 期间客户端可以一直 push。满了就丢最早的并告知。
+	 */
+	#enqueue(cmd: ClientCommand): void {
+		if (this.#queuedWhileDisarmed.length >= 32) {
+			this.#queuedWhileDisarmed.shift();
+			this.#emit({ type: "error", code: "command_failed", message: "会话尚未就绪，排队消息过多，最早的一条已被丢弃" });
+		}
+		this.#queuedWhileDisarmed.push(cmd);
 	}
 
 	/** 两道门都开了才放行排队的 prompt */
@@ -244,9 +300,23 @@ export class Session {
 			this.#resolveApproval(cmd.approvalId, cmd.decision, actor);
 			return;
 		}
+		// pi 还没起来（还在 prepare / clone 阶段）。走到这里的只剩 prompt /
+		// steer / abort —— resume 与 approve 在上面已经 return。
+		// abort 必须在这里挡住：它不走下面那道 hookArmed 门，打到未初始化的
+		// #pi 上会把整个网关进程带崩（连带杀掉所有其他会话）。
+		if (!this.#piStarted) {
+			if (cmd.type === "abort") {
+				// 用户按了停止，排队的 prompt 就不该在启动完成后照样跑
+				this.#queuedWhileDisarmed.length = 0;
+			} else {
+				this.#enqueue(cmd);
+			}
+			return;
+		}
+
 		// 两道门都过了才放行 prompt：钩子未挂 = 无策略保护，工作区未就绪 = 在空目录里瞎改
 		if (!(this.#hookArmed && this.#workspaceReady) && (cmd.type === "prompt" || cmd.type === "steer")) {
-			this.#queuedWhileDisarmed.push(cmd);
+			this.#enqueue(cmd);
 			return;
 		}
 		if (cmd.type === "prompt") {
@@ -337,6 +407,10 @@ export class Session {
 	async stop(): Promise<void> {
 		if (this.#alive) this.#audit({ kind: "session.end", summary: "会话结束" });
 		this.#alive = false;
+		if (!this.#piStarted) {
+			await this.#opts.backend?.cleanup?.(this.#opts.sessionId);
+			return;
+		}
 		// **先杀容器再收客户端**。顺序反过来会挂住：SIGTERM 发给的是宿主机上的
 		// docker 客户端进程，容器内的 pi 收不到，容器继续跑、stdio 管道不关，
 		// pi.stop() 就一直等下去 —— 实测表现为测试进程挂死且容器泄漏。

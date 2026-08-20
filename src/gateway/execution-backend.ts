@@ -4,6 +4,9 @@ import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 
+/** 容器内的 HOME。必须与 deploy/sandbox.yaml 里 sandbox-home 的 mountPath 一致 */
+const CONTAINER_HOME = "/home/agent";
+
 export interface LaunchContext {
 	sessionId: string;
 	/** 宿主机上的工作区路径 */
@@ -55,6 +58,14 @@ export interface ExecutionBackend {
 	cleanup?(sessionId: string): Promise<void>;
 	/** 启动时回收上次遗留的容器，返回被回收的 id。local/kubectl 无需实现 */
 	reapOrphans?(): Promise<string[]>;
+	/**
+	 * 会话启动前把沙箱配置送进执行环境。
+	 *
+	 * local/docker 用不到 —— 它们直接读宿主机目录（bind mount）。
+	 * kubectl 必须实现：Pod 的 HOME 是 emptyDir，创建时为空，
+	 * 网关没法从外部写它，不送进去就没有 models.json，会话起不来。
+	 */
+	prepare?(ctx: LaunchContext): Promise<void>;
 }
 
 /** 直接在网关宿主机上跑。**没有隔离** —— agent 与网关同一个 OS 用户。 */
@@ -177,7 +188,7 @@ export class DockerBackend implements ExecutionBackend {
 
 	launch(ctx: LaunchContext): Launch {
 		const workdir = this.#opts.workdir ?? "/workspace";
-		const home = "/home/agent";
+		const home = CONTAINER_HOME;
 		const name = containerName(ctx.sessionId, this.#gatewayId);
 
 		const mountRoot = "/opt/perimeter";
@@ -318,14 +329,34 @@ export interface KubectlBackendOptions {
 	podTemplate: string;
 	namespace?: string;
 	container?: string;
+	/** 等 Pod Ready 的超时。默认 60s —— 验收指标是冷启动 < 5s，别让前端白等几分钟 */
+	readyTimeoutMs?: number;
+	/** 会话结束时是否删除 Pod。默认 true：不删的话代理 token 会一直躺在 Pod 里 */
+	deletePodOnCleanup?: boolean;
 }
+
 
 /**
  * 生产形态：进预先创建的 Pod 执行。
  *
  * **未在真实集群验证过** —— 本地只验证了生成的命令行形状。
  * Pod 的创建/回收（含 gVisor runtimeClass 与 NetworkPolicy 绑定）
- * 由部署侧或后续的编排器负责，本后端只负责「在已存在的 Pod 里起 pi」。
+ * 由部署侧或后续的编排器负责，本后端只负责「在已存在的 Pod 里起 pi」，
+ * 外加把会话配置送进去（见 prepare）。
+ *
+ * 会话配置为什么走 `kubectl cp` 而不是 Secret 卷：Secret 要按会话创建、
+ * 按会话回收，多一套生命周期要管；而且 sandbox.yaml 的开头就声明了
+ * 「不挂任何 secret」—— 沙箱被攻陷时 Secret 卷里的东西是直接可读的。
+ * cp 进 emptyDir 的东西同样可读，但它本来就是给沙箱用的代理 token，
+ * 不是上游凭据，且不会在 K8s API 里留一份副本。
+ *
+ * ⚠️ **kubectl cp 要求容器镜像里有 tar**（它用 exec+tar 传文件）。参考镜像是
+ * alpine（busybox tar 可用），但生产上是「客户自带构建镜像」—— 客户给一个
+ * distroless 镜像，整条会话路径就断在这里，且错误信息离原因很远。
+ * 这一条必须进部署前置条件清单。
+ *
+ * ⚠️ 安全论证依赖 **Pod 被及时销毁**：代理 token 就躺在 Pod 的 emptyDir 里。
+ * cleanup() 会删 Pod；部署侧若关掉它，兜底只有 activeDeadlineSeconds（4 小时）。
  */
 export class KubectlBackend implements ExecutionBackend {
 	readonly kind = "kubectl" as const;
@@ -335,8 +366,43 @@ export class KubectlBackend implements ExecutionBackend {
 		this.#opts = opts;
 	}
 
+	/**
+	 * 把网关生成的沙箱 HOME 送进 Pod。
+	 * 不做这一步，Pod 里的 HOME 是空的 emptyDir，pi 读不到 models.json。
+	 */
+	/**
+	 * prepare 会执行的两条命令。抽成纯函数是为了可测 —— 直接测 prepare()
+	 * 只能断言「它失败了」，而 execFile 的错误消息对任何 argv 都长一个样，
+	 * 那种断言恒真。
+	 */
+	prepareArgs(ctx: LaunchContext): [string[], string[]] {
+		const pod = this.#podName(ctx.sessionId);
+		const ns = this.#opts.namespace ? ["-n", this.#opts.namespace] : [];
+		const container = this.#opts.container ? ["-c", this.#opts.container] : [];
+		const readyMs = this.#opts.readyTimeoutMs ?? 60_000;
+		return [
+			// `--for=create` 是必需的：Pod 由外部编排器创建，两边并发时不加它
+			// 会在「资源还不存在」上立即失败，而不是等待。
+			["wait", "--for=create", "--for=condition=Ready", `pod/${pod}`, `--timeout=${Math.round(readyMs / 1000)}s`, ...ns],
+			// 尾部的 `/.` 让 cp 复制目录内容而不是目录本身。
+			// --no-preserve：宿主机的属主/权限在 Pod 里没有意义。
+			["cp", "--no-preserve", `${ctx.home}/.`, `${pod}:${CONTAINER_HOME}`, ...ns, ...container],
+		];
+	}
+
+	async prepare(ctx: LaunchContext): Promise<void> {
+		if (!ctx.home) return;
+		// 等 Pod 就绪：刚创建的 Pod 还在 ContainerCreating 时 cp 会失败
+		const [waitArgs, cpArgs] = this.prepareArgs(ctx);
+		const readyMs = this.#opts.readyTimeoutMs ?? 60_000;
+		// `--for=create` 是必需的：Pod 由外部编排器创建，两边并发时不加它
+		// 会在「资源还不存在」上立即失败，而不是等待。
+		await exec("kubectl", waitArgs, { timeout: readyMs + 10_000 });
+		await exec("kubectl", cpArgs, { timeout: 60_000 });
+	}
+
 	launch(ctx: LaunchContext): Launch {
-		const pod = this.#opts.podTemplate.replace("{session}", ctx.sessionId);
+		const pod = this.#podName(ctx.sessionId);
 		const args = ["exec", "-i", pod];
 		if (this.#opts.namespace) args.push("-n", this.#opts.namespace);
 		if (this.#opts.container) args.push("-c", this.#opts.container);
@@ -350,11 +416,29 @@ export class KubectlBackend implements ExecutionBackend {
 			// "no configuration has been provided"。
 			env: kubectlClientEnv(),
 			cwd: ctx.workspace,
-			homeInContainer: "/home/agent",
-			// Pod 里这两个由 deploy/sandbox.yaml 的 configMap 与镜像提供
+			homeInContainer: CONTAINER_HOME,
+			// 扩展由镜像提供（sandbox.Dockerfile 的 COPY），策略走 configMap
 			extensionPath: "/opt/perimeter/src/gateway/policy-extension.ts",
 			policyFile: "/etc/perimeter/policy.yaml",
 		};
+	}
+
+	/**
+	 * 删除 Pod。**不是可选的清理**：代理 token 就在 Pod 的 emptyDir 里，
+	 * Pod 不删它就一直在（兜底只有 4 小时的 activeDeadlineSeconds）。
+	 */
+	async cleanup(sessionId: string): Promise<void> {
+		if (this.#opts.deletePodOnCleanup === false) return;
+		const ns = this.#opts.namespace ? ["-n", this.#opts.namespace] : [];
+		try {
+			await exec("kubectl", ["delete", "pod", this.#podName(sessionId), "--ignore-not-found", ...ns], { timeout: 30_000 });
+		} catch (err) {
+			console.error(`Pod 删除失败 ${this.#podName(sessionId)}（会话配置仍留在 Pod 内）:`, err);
+		}
+	}
+
+	#podName(sessionId: string): string {
+		return this.#opts.podTemplate.replace("{session}", sessionId);
 	}
 }
 
