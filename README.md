@@ -2,7 +2,7 @@
 
 > 一个可完全私有部署的 code agent 运行时，代码与凭据永不出客户网络边界，浏览器只是零安装的操作面。
 
-本仓库是 [`browser-code-agent-strategy.md`](../browser-code-agent-strategy.md) 里工程部分的实现。浏览器 → 网关 → pi → **模型网关** → 上游是一条真实跑通的链路：网关为每个会话生成隔离的 pi HOME，`models.json` 指向模型网关、apiKey 是会话 token，上游凭据只存在于模型网关进程里。git 代理的接线（`insteadOf` 重写）已实现但**未接到 demo 上**，见「边界与已知缺口」。商业动作（客户访谈、融资、付费 POC）不在本仓库范围内。
+本仓库是 [`browser-code-agent-strategy.md`](./docs//browser-code-agent-strategy.md) 里工程部分的实现。浏览器 → 网关 → pi → **模型网关** → 上游是一条真实跑通的链路：网关为每个会话生成隔离的 pi HOME，`models.json` 指向模型网关、apiKey 是会话 token，上游凭据只存在于模型网关进程里。git 代理的接线（`insteadOf` 重写）已实现但**未接到 demo 上**，见「边界与已知缺口」。商业动作（客户访谈、融资、付费 POC）不在本仓库范围内。
 
 底层 agent 用 [pi](https://github.com/badlogic/pi-mono)（MIT）的 RPC 模式，走策略文档 §5 的**路线 C**。
 
