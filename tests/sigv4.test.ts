@@ -100,3 +100,18 @@ test("host 由 URL 推出，调用方不必也不该自己传", () => {
 function sigOf(headers: Record<string, string>): string {
 	return /Signature=([0-9a-f]+)/.exec(headers.authorization!)![1]!;
 }
+
+test("调用方传大小写混用的 header 不会签出重复项", () => {
+	// `Host` 与内部写入的 `host` 并存会签出 SignedHeaders=host;host，
+	// 而且返回的 map 里还留着调用方那个（可能是伪造的）值
+	const h = signV4({
+		method: "POST",
+		url: "https://real.amazonaws.com/",
+		headers: { Host: "evil.example.com", "Content-Type": "application/json", "content-type": "text/plain" },
+		body: "{}",
+		...CREDS,
+	});
+	const signed = /SignedHeaders=([^,]+)/.exec(h.authorization!)![1]!;
+	assert.deepEqual(signed.split(";"), [...new Set(signed.split(";"))], "SignedHeaders 不得有重复项");
+	assert.equal(h.host, "real.amazonaws.com", "host 必须由 url 推出，不接受调用方覆盖");
+});

@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 238 个测试
+npm test          # 304 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -121,6 +121,8 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 
 - **四条模型通道都没对真实上游验证过**。Azure OpenAI（api-key 头）、自托管 vLLM（Bearer）、AWS Bedrock（SigV4 签名）、Google Vertex（service account 换 access token）的认证都实现了，SigV4 比对了 AWS 官方测试向量，但**没有一条打到过真的上游**。
   另外「支持 Bedrock/Vertex」的准确含义是「能用它们的认证方式打到它们的 **OpenAI 兼容端点**」——网关不做协议转换，也不接受原生格式的入站请求。销售材料按这个口径写。
+
+  SigV4 的实现与 `aws4`（aws-sdk-js v2 的签名器）在 64 个组合上做了逐字符交叉验证（16 种路径形态 × 4 种头集合，含生产实际使用的 content-sha 与 IRSA 临时凭据）。这证明签名算法与参考实现一致，**仍不等于 AWS 会接受**。
 - **身份**。Phase 1 只有共享 token，作用是把演示环境关起来。OIDC/SAML + RBAC 是 Phase 2。且浏览器的 WebSocket 无法自定义 header，token 走 URL query，**会进反向代理与服务器访问日志**
 - 沙箱编排、Helm chart、多 SCM、SIEM 导出、monorepo 支持
 

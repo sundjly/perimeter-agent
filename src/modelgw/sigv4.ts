@@ -4,7 +4,7 @@ export interface SigV4Input {
 	method: string;
 	/** 完整 URL，含 query */
 	url: string;
-	/** 已有的请求头。host 会被自动补上 */
+	/** 已有的请求头。key 会被归一到小写；host 由 url 推出，不必也不该自己传 */
 	headers: Record<string, string>;
 	/** 请求体。Bedrock 的 InvokeModel 是 JSON，签名要对它做 hash */
 	body: string | Buffer;
@@ -40,7 +40,12 @@ export function signV4(input: SigV4Input): Record<string, string> {
 	const dateStamp = amzDate.slice(0, 8);
 	const url = new URL(input.url);
 
-	const headers: Record<string, string> = { ...input.headers, host: url.host, "x-amz-date": amzDate };
+	// 调用方给的 key 先归一到小写：`Host` 与内部写入的 `host` 并存会签出
+	// `SignedHeaders=host;host` 这种坏结果，而返回的 map 里还留着调用方那个值
+	const headers: Record<string, string> = {};
+	for (const [k, v] of Object.entries(input.headers)) headers[k.toLowerCase()] = v;
+	headers.host = url.host;
+	headers["x-amz-date"] = amzDate;
 	if (input.sessionToken) headers["x-amz-security-token"] = input.sessionToken;
 
 	const payloadHash = sha256Hex(input.body);

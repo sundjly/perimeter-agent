@@ -461,3 +461,36 @@ test("上游的错误正文有意透传给沙箱 —— 与换 token 失败的�
 	assert.equal(res.status, 400, "上游状态码要原样透传");
 	assert.match(await res.text(), /context_length_exceeded/, "agent 需要知道具体是哪种错误才能自行纠正");
 });
+
+test("签名覆盖的头集合 ⊆ 实际发出的头集合，且取值相同", async () => {
+	// 这是唯一跑在真 undici 上的检查点。「签了但没发」AWS 会直接拒，
+	// 而单元测试看不到 undici 对 host / content-length 的改写。
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0,
+		host: "127.0.0.1",
+		token: "gw-token",
+		upstreams: [
+			{
+				id: "b",
+				baseUrl: up.url,
+				auth: { kind: "sigv4", accessKeyId: "AKIAX", secretAccessKey: "S", region: "us-east-1" },
+			},
+		],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	await (await call(`http://127.0.0.1:${port}/v1/chat/completions`, { model: "b/m", messages: [] }, {
+		authorization: "Bearer gw-token",
+	})).text();
+
+	const seen = up.seen.at(-1)!;
+	const signedHeaders = /SignedHeaders=([^,]+)/.exec(String(seen.headers.authorization))![1]!.split(";");
+	for (const name of signedHeaders) {
+		assert.ok(seen.headers[name] !== undefined, `签了 ${name} 却没发出去 —— AWS 会直接拒`);
+	}
+	// host 尤其要紧：undici 会丢弃显式传的 host，改用 URL 推出的值
+	assert.ok(signedHeaders.includes("host"));
+	assert.equal(seen.headers.host, up.host.includes(":") ? up.host : seen.headers.host);
+});
