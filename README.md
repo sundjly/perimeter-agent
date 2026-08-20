@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 341 个测试
+npm test          # 358 个测试
 npm run typecheck
 npm run gen:deploy  # 从 config/policy.yaml 重新生成 NetworkPolicy 与策略 ConfigMap
 ```
@@ -35,7 +35,7 @@ npm run gen:deploy  # 从 config/policy.yaml 重新生成 NetworkPolicy 与策�
 
 | 铁律 | 落地位置 | 现状 |
 |---|---|---|
-| 代码永不离开 Data Plane | 审计只记 hash 不记源码（`src/audit/log.ts`） | ⚠️ 有一处有意例外：`command` 存原文（heredoc 写文件、带凭据的 curl 同样会落库），导出 SIEM 前须视为敏感字段 |
+| 代码永不离开 Data Plane | 审计只记 hash 不记源码（`src/audit/log.ts`） | ⚠️ 有一处有意例外：`command` 存原文，且 `summary` 含命令前 120 字符。SIEM 导出默认把两者都关掉（`src/audit/siem.ts`），`--command redacted` 只挡已知形态的凭据 |
 | 凭据永不进沙箱 | git 凭据代理（`src/gitproxy/`）、模型网关（`src/modelgw/`）、pi 子进程 env 白名单 | ✅ 端到端验证：三种凭据分处三地，两组测试各自遍历沙箱全树：wiring 那组断言无模型 key 与网关 token，git-e2e 那组断言无上游 git token、且代理 token 不在 workspace 内（落进去就会被 agent 一句 git add -A 推到上游） |
 | egress 双出口 + 默认拒绝 | `config/policy.yaml` 的 `egress.deny_all_except` → 生成 `deploy/networkpolicy.yaml` | ❌ **设计承诺，不是运行中的事实**。清单只做了生成与静态校验，没有任何代码去 apply 它 |
 | 每次工具调用过策略且留痕 | pi 扩展注入 `tool_call` 钩子（`src/gateway/policy-extension.ts`） | ✅ 钩子级粒度，容器里同样生效。但**路径规则对 bash 不生效**，见「边界」 |
@@ -126,7 +126,7 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
   离线能证的已经证了：SigV4 与 `aws4`（aws-sdk-js v2 的签名器）在 64 个组合上逐字符交叉验证（16 种路径形态 × 4 种头集合，含生产实际使用的 content-sha 与 IRSA 临时凭据）；Vertex 的 JWT 断言用配对公钥做了 RS256 密码学验签，并断言有效期不超过 Google 的上限。
   这些证明的是「签名与断言的构造正确」，**仍不等于上游会接受** —— region/service 选择、端点路径、时钟偏差、配额都在覆盖之外。
 - **身份**。Phase 1 只有共享 token，作用是把演示环境关起来。OIDC/SAML + RBAC 是 Phase 2。且浏览器的 WebSocket 无法自定义 header，token 走 URL query，**会进反向代理与服务器访问日志**
-- 沙箱编排、Helm chart、多 SCM、SIEM 导出、monorepo 支持
+- 沙箱编排、Helm chart、多 SCM、monorepo 支持
 
 **能力边界（不是缺口，是设计上的取舍）：**
 

@@ -17,7 +17,8 @@
     "demo": "node scripts/demo.ts",
     "gen:netpol": "node scripts/gen-netpol.ts",
     "gen:policy-cm": "node scripts/gen-policy-cm.ts",
-    "gen:deploy": "npm run gen:netpol && npm run gen:policy-cm"
+    "gen:deploy": "npm run gen:netpol && npm run gen:policy-cm",
+    "export:siem": "node scripts/export-siem.ts"
   },
   "dependencies": {
     "ws": "^8.18.0",

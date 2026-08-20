@@ -20,7 +20,8 @@ interface Rule {
 	re: RegExp;
 }
 
-const RULES: Rule[] = [
+/** 凭据形态的正则表。审计导出层复用它做脱敏 —— 同一份规则，两处用 */
+export const RULES: Rule[] = [
 	{ kind: "aws-access-key", re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
 	{ kind: "github-token", re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/g },
 	{ kind: "gitlab-token", re: /\bglpat-[A-Za-z0-9_-]{20,}\b/g },
