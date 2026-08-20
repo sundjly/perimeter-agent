@@ -167,7 +167,8 @@ function messageEl(id, role) {
 }
 
 function appendText(id, delta) {
-	// textContent 而非 innerHTML：模型输出与工具结果都是不可信文本
+	// 一律用 textContent 赋值：模型输出与工具结果都是不可信文本，
+	// 走 HTML 注入接口等于把这道防线拆掉（有测试守着）
 	messageEl(id, "assistant").lastChild.textContent += delta;
 }
 
