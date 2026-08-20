@@ -260,3 +260,12 @@ button.danger {
 		border-bottom: 1px solid var(--border);
 	}
 }
+
+/* 断线期间丢失的记录：必须显眼，不能和助手正文长得一样 */
+.msg.gap {
+	color: var(--warn);
+	border: 1px solid var(--warn);
+	border-radius: 6px;
+	padding: 8px 10px;
+	font-size: 13px;
+}

@@ -348,3 +348,102 @@ test("会话数上限拦住无限拉起 pi 进程", async () => {
 	await second.waitFor(() => second.controls.some((m) => m.control === "error"));
 	assert.match(String(second.controls.find((m) => m.control === "error")?.message), /上限/);
 });
+
+test("缓冲溢出后续接：必须告知客户端丢了什么，而不是假装完整", async () => {
+	// backlog 是有上限的，断线久了最老的事件被挤掉。客户端不知道自己丢了
+	// 东西的话会以为界面完整 —— 而丢掉的可能正是一条 policy.denied
+	const env = await startGateway([{ text: "干完了" }], { backlogSize: 3 });
+	const c = await connect(env);
+	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
+
+	c.send({ type: "prompt", text: "干活" });
+	await c.waitFor(() => c.events.some((e) => e.type === "agent.end"));
+	const lastSeq = c.seqs.at(-1)!;
+	assert.ok(lastSeq > 5, `事件数不足以撑破 3 条的缓冲（lastSeq=${lastSeq}）`);
+
+	c.events.length = 0;
+	c.seqs.length = 0;
+	c.send({ type: "resume", since: 1 });
+	await c.waitFor(() => c.events.some((e) => e.type === "session.gap"));
+
+	// gap 必须是重放的第一条，且它的 seq 必须落在缺口末尾 ——
+	// 带最新 seq 的话，前端 `seq <= state.seq` 的去重会把随后重放的事件全吃掉
+	assert.equal(c.events[0]!.type, "session.gap", "gap 应当先于重放到达");
+	const gap = c.events[0] as { missedFrom: number; missedTo: number };
+	assert.equal(gap.missedFrom, 2, "缺口应当从客户端已知的下一条算起");
+	// backlogSize=3 ⇒ firstSeq = lastSeq-2 ⇒ missedTo = lastSeq-3。钉住算术，不写恒真式
+	assert.equal(gap.missedTo, lastSeq - 3);
+	assert.equal(c.seqs[0], gap.missedTo, "gap 的 seq 必须是 missedTo，否则前端游标会被顶到最新");
+
+	// 缓冲里那 3 条必须真的送到，且 seq 都大于 gap 的
+	const after = c.seqs.slice(1);
+	assert.equal(after.length, 3, `缓冲里的 3 条都要重放，实际 ${after.length}`);
+	assert.ok(
+		after.every((q) => q > gap.missedTo),
+		"重放事件的 seq 必须大于 gap 的，否则会被前端去重丢掉",
+	);
+});
+
+test("缓冲未溢出时不报缺口 —— 别制造假警报", async () => {
+	const env = await startGateway([{ text: "ok" }], { backlogSize: 2000 });
+	const c = await connect(env);
+	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
+	c.events.length = 0;
+
+	c.send({ type: "resume", since: 0 });
+	await new Promise((r) => setTimeout(r, 300));
+	assert.ok(!c.events.some((e) => e.type === "session.gap"), "缓冲够用时不该报缺口");
+	assert.ok(c.events.length > 0, "但历史事件要重放");
+});
+
+test("resume 的 since 越界不崩，也不重复投递", async () => {
+	const env = await startGateway([{ text: "还在" }]);
+	const c = await connect(env);
+	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
+	const seen = c.seqs.at(-1)!;
+	c.events.length = 0;
+
+	// 客户端声称已收到远超实际的 seq
+	c.send({ type: "resume", since: seen + 10_000 });
+	await new Promise((r) => setTimeout(r, 300));
+	assert.equal(c.events.length, 0, "since 超前时不该重放任何东西");
+
+	// 负数会算出 missedFrom 为负的虚构缺口，前端照着会报「有 5 条未恢复」
+	c.send({ type: "resume", since: -5 });
+	await new Promise((r) => setTimeout(r, 300));
+	assert.ok(!c.events.some((e) => e.type === "session.gap"), "负数 since 不该造出缺口");
+	assert.ok(
+		c.events.some((e) => e.type === "error"),
+		"畸形的 since 要有明确反馈，而不是静默按 0 处理",
+	);
+	c.send({ type: "prompt", text: "还活着吗" });
+	await c.waitFor(() => c.events.some((e) => e.type === "agent.end"));
+});
+
+test("续接时重发挂起的审批 —— 否则 agent 一直等到超时而用户看不到框", async () => {
+	// approval.request 滚出缓冲后，服务端 agent 还阻塞着，客户端却永远
+	// 看不到对话框。用户只看到「丢了 N 条记录」，不会想到有东西等着他批。
+	const env = await startGateway([{ tool: "bash", args: { command: "git push origin main" } }, { text: "推完了" }], {
+		backlogSize: 3,
+		approvalTimeoutMs: 60_000,
+	});
+	const c = await connect(env);
+	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
+	c.send({ type: "prompt", text: "推一下" });
+	await c.waitFor(() => c.events.some((e) => e.type === "approval.request"));
+	const original = c.events.find((e) => e.type === "approval.request") as { approvalId: string };
+
+	// 制造缺口：审批请求已被挤出缓冲
+	c.events.length = 0;
+	c.seqs.length = 0;
+	c.send({ type: "resume", since: 1 });
+	await c.waitFor(() => c.events.some((e) => e.type === "approval.request"));
+
+	const resent = c.events.find((e) => e.type === "approval.request") as { approvalId: string; expiresAt: number };
+	assert.equal(resent.approvalId, original.approvalId, "必须用同一个 id，否则前端会开出第二个框");
+	assert.ok(resent.expiresAt > Date.now(), "重发的对话框要能算出倒计时");
+
+	// 用重发的 id 批准，工具应当真的执行
+	c.send({ type: "approve", approvalId: resent.approvalId, decision: "allow" });
+	await c.waitFor(() => c.events.some((e) => e.type === "agent.end"));
+});

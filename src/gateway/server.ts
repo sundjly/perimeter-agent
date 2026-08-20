@@ -31,6 +31,12 @@ export interface GatewayConfig {
 	idleTimeoutMs?: number;
 	/** 同时存活的会话上限，防止一条 token 把节点打满 */
 	maxSessions?: number;
+	/**
+	 * 断线续接的事件缓冲条数。默认 2000。
+	 * 缓冲满了最老的事件会被挤掉，续接时客户端会收到 session.gap ——
+	 * 调小它等于让「断线久了会丢记录」更早发生。
+	 */
+	backlogSize?: number;
 	/** 每个会话可用的 repo/team。策略作用域必须由服务端决定，不能让客户端自选 */
 	resolveScope?: (actor: string) => { repo: string; team: string };
 	/**
@@ -209,6 +215,7 @@ export class Gateway {
 			piArgs: this.#cfg.piArgs,
 			piEnv: this.#cfg.piEnv,
 			approvalTimeoutMs: this.#cfg.approvalTimeoutMs,
+			backlogSize: this.#cfg.backlogSize,
 			wiring: this.#cfg.wiring,
 			// HOME 放在 workspace 之外：放在里面的话，agent 一句
 			// git add -A && git commit 就把含 token 的 .gitconfig 提交进仓库

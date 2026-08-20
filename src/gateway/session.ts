@@ -59,6 +59,10 @@ interface PendingApproval {
 	action: ActionDescriptor;
 	rule: string;
 	reason: string;
+	/** 用于续接时重发对话框 —— 没有它就算不出倒计时 */
+	expiresAt?: number;
+	/** 同上：重发时要用同一个 id，否则前端会开出第二个框 */
+	approvalId?: string;
 }
 
 /**
@@ -421,9 +425,38 @@ export class Session {
 	/** 重放 since 之后的事件。只回发起方，避免洪泛给其他标签页。 */
 	#replay(since: number, to?: unknown): void {
 		const firstSeq = this.#seq - this.#backlog.length + 1;
+		// 缓冲是有上限的，断线久了最老的事件已经被挤掉。这时**必须告诉客户端**：
+		// 它不知道自己丢了东西的话，会以为界面是完整的 —— 而丢掉的可能正是
+		// 那条 policy.denied 或一个还等着人批的审批请求。
+		if (since < firstSeq - 1) {
+			// seq 必须是 firstSeq-1，**不能是 #seq**：前端按 `seq <= state.seq` 去重，
+			// 带最新 seq 的 gap 先到会把游标顶到最新，随后重放的事件全部被丢掉 ——
+			// 那比不报缺口更糟（告诉用户丢了 10 条，然后把本来救得回来的 3 条也丢了）。
+			// 也不能用 since：那会被 `<=` 判定丢弃。
+			// 语义上 gap 正好"顶替"了缺失区间，终点就是 missedTo。
+			this.#opts.send({ type: "session.gap", missedFrom: since + 1, missedTo: firstSeq - 1 }, firstSeq - 1, to);
+		}
 		for (let i = 0; i < this.#backlog.length; i++) {
 			const seq = firstSeq + i;
 			if (seq > since) this.#opts.send(this.#backlog[i]!, seq, to);
+		}
+
+		// 挂起的审批必须重发。它一旦滚出缓冲，客户端永远看不到对话框，
+		// 而服务端 agent 还阻塞在那儿等到超时按拒绝 —— 用户只看到一句
+		// 「丢了 N 条记录」，不会想到有个东西正等着他批。
+		// 放在重放之后并用 #seq：早于重放的话会踩到与 gap 同样的去重坑。
+		for (const [approvalId, p] of this.#pendingApprovals) {
+			this.#opts.send(
+				{
+					type: "approval.request",
+					approvalId,
+					action: p.action,
+					reason: p.reason,
+					expiresAt: p.expiresAt ?? Date.now() + (this.#opts.approvalTimeoutMs ?? 120_000),
+				},
+				this.#seq,
+				to,
+			);
 		}
 	}
 
@@ -508,6 +541,9 @@ export class Session {
 		this.#pendingApprovals.set(approvalId, pending);
 
 		const timeout = typeof ev.timeout === "number" ? ev.timeout : (this.#opts.approvalTimeoutMs ?? 120_000);
+		// 存下来，续接时要按同一个 id 与到期时间重发
+		pending.approvalId = approvalId;
+		pending.expiresAt = Date.now() + timeout;
 		this.#emit({
 			type: "approval.request",
 			approvalId,
@@ -662,7 +698,11 @@ function validate(cmd: unknown): string | null {
 			if (typeof c.approvalId !== "string") return "approve 缺少 approvalId";
 			return c.decision === "allow" || c.decision === "deny" ? null : "approve 的 decision 只能是 allow/deny";
 		case "resume":
-			return typeof c.since === "number" && Number.isFinite(c.since) ? null : "resume 的 since 必须是数字";
+			// 非负整数：负数会算出 missedFrom 为负的虚构缺口，
+			// 前端照着 missedTo-missedFrom+1 会报"有 5 条未恢复"，纯属假警报
+			return typeof c.since === "number" && Number.isInteger(c.since) && c.since >= 0
+				? null
+				: "resume 的 since 必须是非负整数";
 		default:
 			return `未知命令：${String(c.type)}`;
 	}

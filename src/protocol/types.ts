@@ -10,6 +10,12 @@
 export type ClientEvent =
 	| { type: "session.ready"; sessionId: string; workspace: string; model: string | null }
 	| { type: "session.state"; streaming: boolean; messageCount: number; model: string | null }
+	/**
+	 * 续接时发现有事件已滚出服务端缓冲。**必须显式告知** ——
+	 * 客户端不知道自己丢了东西的话，会以为界面是完整的，
+	 * 而丢掉的可能正是那条 policy.denied 或审批请求。
+	 */
+	| { type: "session.gap"; missedFrom: number; missedTo: number }
 	| { type: "agent.start" }
 	| { type: "agent.end"; willRetry: boolean }
 	| { type: "agent.settled" }
@@ -47,6 +53,7 @@ export type ClientEvent =
 export const CLIENT_EVENT_TYPES = [
 	"session.ready",
 	"session.state",
+	"session.gap",
 	"agent.start",
 	"agent.end",
 	"agent.settled",

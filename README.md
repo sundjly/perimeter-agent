@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 358 个测试
+npm test          # 362 个测试
 npm run typecheck
 npm run gen:deploy  # 从 config/policy.yaml 重新生成 NetworkPolicy 与策略 ConfigMap
 ```

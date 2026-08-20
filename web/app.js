@@ -39,7 +39,10 @@ function connect() {
 		setDot("on");
 		state.retryMs = 0;
 		// 断线期间任务仍在服务端跑，重连后补齐错过的事件
-		if (state.seq > 0) send({ type: "resume", since: state.seq });
+		// 用 sessionId 而不是 seq 做守卫：刷新后 seq 归零（没有持久化），
+	// 用 `seq > 0` 会把刷新这条主路径整个挡掉 —— 一条历史都不重放。
+	// 带 ?session= 的刷新应当 since:0 全量重放，去重逻辑天然放行。
+	if (state.sessionId) send({ type: "resume", since: state.seq });
 	};
 	ws.onclose = () => {
 		setDot("");
@@ -79,6 +82,18 @@ function render(ev) {
 			if (ev.model) $("model").textContent = ev.model;
 			setDot(ev.streaming ? "busy" : "on");
 			break;
+
+		case "session.gap": {
+			// 缓冲有上限，断线久了最老的事件已被挤掉。宁可显眼地告诉用户
+			// 少了什么，也不要让界面看起来是完整的 —— 丢掉的可能正是
+			// 一条策略拒绝，或一个还等着批的审批
+			const gap = document.createElement("div");
+			gap.className = "msg gap";
+			gap.textContent = `⚠ 断线期间有 ${ev.missedTo - ev.missedFrom + 1} 条记录未能恢复（#${ev.missedFrom}–#${ev.missedTo}）。完整记录在服务端的审计日志文件里。`;
+			$("stream").append(gap);
+			autoScroll();
+			break;
+		}
 
 		case "agent.start":
 			setDot("busy");
