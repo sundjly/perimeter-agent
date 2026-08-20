@@ -1,5 +1,8 @@
 import { execFile } from "node:child_process";
-import { hostname } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { renderPodManifest } from "../deploy/pod-template.ts";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -333,16 +336,30 @@ export interface KubectlBackendOptions {
 	readyTimeoutMs?: number;
 	/** 会话结束时是否删除 Pod。默认 true：不删的话代理 token 会一直躺在 Pod 里 */
 	deletePodOnCleanup?: boolean;
+	/**
+	 * Pod 模板路径。给了就由本后端**创建** Pod（每会话一个）；
+	 * 不给则沿用旧行为：假设 Pod 已由外部编排器创建好。
+	 */
+	templatePath?: string;
+	/** 沙箱镜像。生产上是客户自带的构建镜像 */
+	image?: string;
+	/** runtimeClass。传 null 显式去掉 —— 集群没装 gVisor 时留着会让 Pod 一直 pending */
+	runtimeClass?: string | null;
+	/** 网关实例标识。默认 hostname+pid —— 见 DockerBackendOptions.gatewayId */
+	gatewayId?: string;
 }
 
 
 /**
- * 生产形态：进预先创建的 Pod 执行。
+ * 生产形态：K8s Pod。
  *
- * **未在真实集群验证过** —— 本地只验证了生成的命令行形状。
- * Pod 的创建/回收（含 gVisor runtimeClass 与 NetworkPolicy 绑定）
- * 由部署侧或后续的编排器负责，本后端只负责「在已存在的 Pod 里起 pi」，
- * 外加把会话配置送进去（见 prepare）。
+ * 给了 templatePath 就由本后端按会话创建 Pod（从 deploy/sandbox.yaml 渲染）；
+ * 不给则沿用「Pod 已由外部编排器建好」的假设。
+ *
+ * **未在真实集群验证过** —— 本地只验证了渲染产物与命令行形状。
+ * 给了 templatePath 时，本后端负责 Pod 的创建（provision）、配置注入
+ * （prepare）、销毁（cleanup）与孤儿回收（reapOrphans）；
+ * 不给则只负责「在已存在的 Pod 里起 pi」。
  *
  * 会话配置为什么走 `kubectl cp` 而不是 Secret 卷：Secret 要按会话创建、
  * 按会话回收，多一套生命周期要管；而且 sandbox.yaml 的开头就声明了
@@ -361,9 +378,12 @@ export interface KubectlBackendOptions {
 export class KubectlBackend implements ExecutionBackend {
 	readonly kind = "kubectl" as const;
 	#opts: KubectlBackendOptions;
+	#gatewayId: string;
 
 	constructor(opts: KubectlBackendOptions) {
 		this.#opts = opts;
+		// 与 docker 侧同理：两个网关共用一个集群时，A 的 reap 不该删掉 B 的 Pod
+		this.#gatewayId = opts.gatewayId ?? `${hostname()}-${process.pid}`;
 	}
 
 	/**
@@ -390,15 +410,71 @@ export class KubectlBackend implements ExecutionBackend {
 		];
 	}
 
+	/**
+	 * 创建这个会话的 Pod。templatePath 没给就跳过 —— 那种部署里 Pod
+	 * 由外部编排器负责，本后端只管进去执行。
+	 */
+	/** provision 会写出的 manifest 与要执行的 argv。抽出来是为了可测 */
+	provisionPlan(ctx: LaunchContext): { manifest: string; args: string[] } | null {
+		if (!this.#opts.templatePath) return null;
+		if (!this.#opts.image) throw new Error("配置了 templatePath 就必须同时给 image");
+		// namespace 不能省：NetworkPolicy 是 namespace-scoped 的，Pod 落到
+		// 别的 ns 就完全不受 egress 约束，而且 Pod 照常起来 —— 静默失去一条真边界
+		if (!this.#opts.namespace) throw new Error("配置了 templatePath 就必须同时给 namespace，否则 NetworkPolicy 不生效");
+		const manifest = renderPodManifest(this.#opts.templatePath, {
+			name: this.#podName(ctx.sessionId),
+			sessionId: ctx.sessionId,
+			image: this.#opts.image,
+			repo: String(ctx.env.PERIMETER_REPO ?? ""),
+			team: String(ctx.env.PERIMETER_TEAM ?? ""),
+			namespace: this.#opts.namespace,
+			runtimeClass: this.#opts.runtimeClass,
+			gatewayId: this.#gatewayId,
+		});
+		// create 而非 apply：Pod 的 spec 大部分字段不可变，同名 Pod 存在时
+		// apply 要么报错要么是 no-op —— 后者会把上一个会话遗留的 Pod
+		// （emptyDir 里还有它的 HOME 与 workspace）交给这次会话用。
+		// sessionId 由客户端指定，这是可被主动触发的。先删再建，快失败。
+		return { manifest, args: ["create", "-f", "PLACEHOLDER", "-n", this.#opts.namespace] };
+	}
+
+	async provision(ctx: LaunchContext): Promise<void> {
+		const plan = this.provisionPlan(ctx);
+		if (!plan) return;
+		const ns = ["-n", this.#opts.namespace!];
+		// 走临时文件而不是 stdin：复用 promisified exec 就白拿超时、stderr
+		// 与完整错误消息。stdin 那条路要自己接 EPIPE，否则 kubectl 先退出时
+		// 一个未处理的 socket error 就能打崩整个网关进程。
+		const file = join(mkdtempSync(join(tmpdir(), "perimeter-pod-")), "pod.yaml");
+		try {
+			writeFileSync(file, plan.manifest);
+			await exec("kubectl", ["delete", "pod", this.#podName(ctx.sessionId), "--ignore-not-found", ...ns], {
+				timeout: 30_000,
+			});
+			await exec("kubectl", ["create", "-f", file, ...ns], { timeout: 30_000 });
+		} catch (err) {
+			// execFile 的错误消息里带 stderr，直接透出去 —— 这条路径没在真实
+			// 集群验证过，第一个用户不该只看到一个退出码
+			throw new Error(`创建 Pod 失败：${err instanceof Error ? err.message : String(err)}`);
+		} finally {
+			rmSync(dirname(file), { recursive: true, force: true });
+		}
+	}
+
 	async prepare(ctx: LaunchContext): Promise<void> {
-		if (!ctx.home) return;
+		// 先把 Pod 建出来，再等它 Ready，最后送配置进去
+		await this.provision(ctx);
+		// 自建 Pod 时必须等 Ready：刚 create 出来还在 ContainerCreating，
+		// launch() 的 kubectl exec 会直接打空
+		const selfProvisioned = Boolean(this.#opts.templatePath);
+		if (!ctx.home && !selfProvisioned) return;
 		// 等 Pod 就绪：刚创建的 Pod 还在 ContainerCreating 时 cp 会失败
 		const [waitArgs, cpArgs] = this.prepareArgs(ctx);
 		const readyMs = this.#opts.readyTimeoutMs ?? 60_000;
 		// `--for=create` 是必需的：Pod 由外部编排器创建，两边并发时不加它
 		// 会在「资源还不存在」上立即失败，而不是等待。
 		await exec("kubectl", waitArgs, { timeout: readyMs + 10_000 });
-		await exec("kubectl", cpArgs, { timeout: 60_000 });
+		if (ctx.home) await exec("kubectl", cpArgs, { timeout: 60_000 });
 	}
 
 	launch(ctx: LaunchContext): Launch {
@@ -427,6 +503,27 @@ export class KubectlBackend implements ExecutionBackend {
 	 * 删除 Pod。**不是可选的清理**：代理 token 就在 Pod 的 emptyDir 里，
 	 * Pod 不删它就一直在（兜底只有 4 小时的 activeDeadlineSeconds）。
 	 */
+	/** 回收本网关遗留的 Pod。与 docker 侧的 reapOrphans 对称 */
+	async reapOrphans(): Promise<string[]> {
+		if (!this.#opts.templatePath || !this.#opts.namespace) return [];
+		try {
+			const sel = `perimeter.dev/gateway=${this.#gatewayId}`;
+			const { stdout } = await exec(
+				"kubectl",
+				["get", "pods", "-l", sel, "-o", "name", "-n", this.#opts.namespace],
+				{ timeout: 15_000 },
+			);
+			const names = stdout.split("\n").map((x) => x.trim()).filter(Boolean);
+			if (names.length > 0) {
+				await exec("kubectl", ["delete", "-l", sel, "pod", "-n", this.#opts.namespace], { timeout: 60_000 });
+			}
+			return names;
+		} catch (err) {
+			console.error("孤儿 Pod 扫描失败（带 token 的 Pod 可能仍在运行）:", err);
+			return [];
+		}
+	}
+
 	async cleanup(sessionId: string): Promise<void> {
 		if (this.#opts.deletePodOnCleanup === false) return;
 		const ns = this.#opts.namespace ? ["-n", this.#opts.namespace] : [];

@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 200 个测试
+npm test          # 211 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -103,7 +103,9 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 - **egress 在 docker 后端下默认是通的**。后端默认用 `bridge` 网络，容器能出公网。要落地「egress 默认 deny」得用 `docker network create --internal` 并把两个代理放进去，或者在 K8s 侧靠 NetworkPolicy。四条铁律里这一条在 docker 后端下**不成立**。
 - **只在 macOS 验证过**。Linux 的 bind mount 保留宿主机属主，因此容器身份默认取网关自己的 uid 而不是镜像里的 10001（`DockerBackendOptions.user` 可覆盖）；macOS 的 Docker Desktop / OrbStack 做属主重映射，这条差异在本机测不出来。
 
-仍未做的是 **Pod 的创建与回收**（gVisor runtimeClass、NetworkPolicy 绑定）：`deploy/` 下的清单只做了生成与静态校验，没有代码去创建它们。因此「每会话独占沙箱」在 docker 后端下成立，在 K8s 形态下仍是设计承诺。
+**Pod 的创建与回收现在有代码了**（`src/deploy/pod-template.ts` + `KubectlBackend.provision/cleanup/reapOrphans`）：从 `deploy/sandbox.yaml` 渲染每会话 Pod、create、等 Ready、cp 配置进去，会话结束删 Pod，网关重启时按 label 回收孤儿。
+
+但**整条 kubectl 路径未在真实集群跑过**，只验证了渲染产物与命令行形状。所以「每会话独占沙箱」在 docker 后端下是运行中的事实，在 K8s 形态下仍然只是「代码写了、没验过」。另外镜像必须含 `tar`（`kubectl cp` 走 exec+tar），客户自带的 distroless 镜像会让整条路径断掉。
 
 **接线：模型网关已接，git 代理未接到 demo：**
 

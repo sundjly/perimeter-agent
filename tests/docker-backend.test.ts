@@ -7,6 +7,7 @@ import { after, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
+import { parse as parseYaml } from "yaml";
 import {
 	DockerBackend,
 	KubectlBackend,
@@ -376,4 +377,35 @@ test("kubectl 目标路径必须与 sandbox.yaml 的 mountPath 一致", () => {
 test("没有沙箱 HOME 时 prepare 直接跳过，不做无谓的 kubectl 调用", async () => {
 	const b = new KubectlBackend({ podTemplate: "p-{session}" });
 	await b.prepare({ ...ctx, home: undefined });
+});
+
+test("provisionPlan 建的 Pod 名与 wait/exec/cleanup 用的是同一个", () => {
+	// 两处各拼一次名字的话：wait 干等到超时、cleanup 删一个不存在的名字
+	// （--ignore-not-found 让它静默成功），每失败一次泄漏一个带 token 的 Pod
+	const b = new KubectlBackend({
+		podTemplate: "perimeter-{session}",
+		namespace: "perimeter",
+		templatePath: join(REPO, "deploy/sandbox.yaml"),
+		image: "img:v1",
+	});
+	const plan = b.provisionPlan(ctx)!;
+	const podName = (parseYaml(plan.manifest) as { metadata: { name: string } }).metadata.name;
+	const [wait, cp] = b.prepareArgs({ ...ctx, home: "/h" });
+	assert.equal(wait[3], `pod/${podName}`, "wait 的目标必须是刚建出来的那个 Pod");
+	assert.ok(cp[3]!.startsWith(`${podName}:`), "cp 的目标必须是同一个 Pod");
+});
+
+test("配了 templatePath 却缺 namespace 时拒绝启动 —— NetworkPolicy 是 namespace-scoped 的", () => {
+	const b = new KubectlBackend({
+		podTemplate: "p-{session}",
+		templatePath: join(REPO, "deploy/sandbox.yaml"),
+		image: "img:v1",
+	});
+	// Pod 落到别的 ns 会照常起来，但完全不受 egress 约束
+	assert.throws(() => b.provisionPlan(ctx), /必须同时给 namespace/);
+});
+
+test("没有 templatePath 时不创建 Pod —— 沿用外部编排器建好的那个", () => {
+	const b = new KubectlBackend({ podTemplate: "p-{session}", namespace: "ns" });
+	assert.equal(b.provisionPlan(ctx), null);
 });
