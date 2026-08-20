@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AuditLog } from "../audit/log.ts";
 import { scanSecrets } from "./secrets.ts";
+import { type UpstreamAuth, authorizeUpstream } from "./upstream-auth.ts";
 
 export interface UpstreamConfig {
 	/** provider id，客户端用 model 前缀或 header 选择 */
@@ -11,6 +12,17 @@ export interface UpstreamConfig {
 	apiKey?: string;
 	/** 认证方式：多数是 Authorization: Bearer，Azure 用 api-key */
 	authHeader?: string;
+	/**
+	 * 非 OpenAI 兼容通道的认证（Bedrock 的 SigV4、Vertex 的 service account）。
+	 * 给了就用它，apiKey/authHeader 被忽略。
+	 */
+	auth?: UpstreamAuth;
+	/**
+	 * 上游路径，默认 `/chat/completions`（OpenAI 兼容）。
+	 * Bedrock 是 `/model/{model}/invoke-with-response-stream`，
+	 * `{model}` 会用请求体里的 model 字段替换。
+	 */
+	path?: string;
 }
 
 export interface Quota {
@@ -51,13 +63,22 @@ interface Usage {
  * 3. **凭据/PII 检测**：audit-only，见 secrets.ts 里的理由。
  * 4. **计量与配额**：按 team 累计 token，超限拒绝。
  *
- * **接入方式与一个已知缺口**：本网关说 OpenAI 兼容协议
- * （/v1/chat/completions），pi 侧用 models.json 的 baseUrl 指过来即可，
- * 这条路已实测跑通且零额外依赖。Azure OpenAI 与自托管 vLLM 原生就是
- * 这个协议。**Bedrock 与 Vertex 的原生协议不是**，它们需要各自 SDK 签名
- * （且 Bedrock 只能在服务端调）—— 这两条通道是 Phase 1 的已知缺口，
- * 企业客户多数已有 OpenAI 兼容的内部网关可先接上，但销售材料里
- * 不要写成「已支持 Bedrock/Vertex」。
+ * **接入方式**：本网关对沙箱说 OpenAI 兼容协议（/v1/chat/completions），
+ * pi 侧用 models.json 的 baseUrl 指过来即可。四条企业通道的差别落在
+ * **认证**与**上游路径**上，由 UpstreamConfig 的 auth/path 表达：
+ *
+ * - Azure OpenAI：api-key 头 + 原生 OpenAI 兼容面
+ * - 自托管 vLLM：Bearer + 原生 OpenAI 兼容面
+ * - AWS Bedrock：SigV4 签名 + 上游的 OpenAI 兼容端点
+ * - Google Vertex：service account 换 access token + 上游的 OpenAI 兼容端点
+ *
+ * **边界要说准确**：网关不做协议转换，也不接受原生格式的入站请求
+ * （路由只认 /chat/completions）。所以「支持 Bedrock/Vertex」的准确含义是
+ * 「能用它们的认证方式打到它们的 OpenAI 兼容端点」，不是「实现了它们的
+ * 原生 API」。销售材料按这个口径写。
+ *
+ * ⚠️ 四条通道**都没有对真实上游验证过** —— 认证算法有测试（SigV4 比对了
+ * 官方向量），但没有一条打到过真的 Bedrock/Vertex/Azure。
  */
 export class ModelGateway {
 	#cfg: ModelGatewayConfig;
@@ -73,7 +94,8 @@ export class ModelGateway {
 			assertAllowed(u.baseUrl, cfg.egressAllowlist);
 			// HTTP header 只能是 ASCII。不在这里查的话，一个含非 ASCII 的凭据
 			// 会变成运行时 502，而不是启动时一眼可见的配置错误。
-			if (u.apiKey && !/^[\x20-\x7e]*$/.test(u.apiKey)) {
+			const staticKey = u.apiKey ?? (u.auth?.kind === "static" ? u.auth.apiKey : undefined);
+			if (staticKey && !/^[\x20-\x7e]*$/.test(staticKey)) {
 				throw new Error(`模型网关上游 ${u.id} 的 apiKey 含非 ASCII 字符，无法作为 HTTP header 发送`);
 			}
 		}
@@ -155,18 +177,33 @@ export class ModelGateway {
 			return;
 		}
 
+		const target = upstreamUrl(upstream, body);
 		const headers: Record<string, string> = { "content-type": "application/json" };
-		if (upstream.apiKey) {
-			// 凭据只在这里注入 —— 沙箱侧从头到尾看不到它
-			headers[upstream.authHeader ?? "authorization"] =
-				upstream.authHeader ? upstream.apiKey : `Bearer ${upstream.apiKey}`;
+		// 凭据只在这里注入 —— 沙箱侧从头到尾看不到它
+		const auth = upstream.auth ?? (upstream.apiKey ? staticAuth(upstream) : null);
+		if (auth) {
+			try {
+				const signed = await authorizeUpstream(auth, { method: "POST", url: target, body }, this.#fetch);
+				Object.assign(headers, signed.headers);
+			} catch (err) {
+				// 详情进审计日志，**不回给沙箱**：换 token 失败的消息里嵌着
+				// 上游响应正文，长度无界、内容由上游控制，还会暴露 SA 邮箱
+				// 之类的内部拓扑
+				const detail = err instanceof Error ? err.message : String(err);
+				this.#cfg.audit?.append({
+					kind: "error",
+					sessionId: "-",
+					actor: "modelgw",
+					summary: `上游 ${upstream.id} 认证失败：${detail.slice(0, 500)}`,
+				});
+				res.writeHead(502, { "content-type": "application/json" }).end(
+					JSON.stringify({ error: { message: "上游认证失败，详情见网关审计日志" } }),
+				);
+				return;
+			}
 		}
 
-		const upRes = await this.#fetch(`${upstream.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-			method: "POST",
-			headers,
-			body,
-		});
+		const upRes = await this.#fetch(target, { method: "POST", headers, body });
 
 		res.writeHead(upRes.status, {
 			"content-type": upRes.headers.get("content-type") ?? "text/event-stream",
@@ -273,4 +310,38 @@ async function readBody(req: IncomingMessage): Promise<string> {
 	const chunks: Buffer[] = [];
 	for await (const c of req) chunks.push(c as Buffer);
 	return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * 上游 URL。默认 OpenAI 兼容的 /chat/completions；
+ * Bedrock 那种带模型 id 的路径用 {model} 占位，从请求体里取。
+ */
+export function upstreamUrl(upstream: UpstreamConfig, body: string): string {
+	const base = upstream.baseUrl.replace(/\/$/, "");
+	const path = upstream.path ?? "/chat/completions";
+	if (!path.includes("{model}")) return `${base}${path}`;
+
+	let model = "";
+	try {
+		model = String((JSON.parse(body) as { model?: unknown }).model ?? "");
+	} catch {
+		// body 不是 JSON 时留空，让上游去报错 —— 网关不解析 body 是有意的
+	}
+	// 剥掉选路用的 provider 前缀：#pickUpstream 认的是 `<provider>/<model>`，
+	// 而上游要的是不带前缀的模型 id。不剥的话 URL 里会多一段 provider 名
+	if (model.startsWith(`${upstream.id}/`)) model = model.slice(upstream.id.length + 1);
+
+	// model 来自沙箱，会被拼进 URL 路径。encodeURIComponent 不转义 `.`，
+	// 所以 `..` 能穿越一层目录（主机换不掉，但路径会变，且穿越后仍被合法签名）。
+	// 模型 id 与 ARN 都在这个字符集内。
+	if (model && !/^[A-Za-z0-9._:/-]+$/.test(model)) {
+		throw new Error(`非法的 model 值：${model.slice(0, 60)}`);
+	}
+	if (model.split("/").some((seg) => seg === "..")) throw new Error("model 不得含路径穿越");
+
+	return `${base}${path.replace("{model}", encodeURIComponent(model))}`;
+}
+
+function staticAuth(u: UpstreamConfig): UpstreamAuth {
+	return { kind: "static", apiKey: u.apiKey!, header: u.authHeader };
 }

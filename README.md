@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 211 个测试
+npm test          # 232 个测试
 npm run typecheck
 npm run gen:netpol  # 从 config/policy.yaml 重新生成沙箱 NetworkPolicy
 ```
@@ -119,7 +119,8 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 
 **明确没做：**
 
-- **Bedrock / Vertex 的原生协议**。模型网关说 OpenAI 兼容协议（Azure OpenAI、自托管 vLLM 原生就是），Bedrock 与 Vertex 需要各自 SDK 签名 —— 不要写成「已支持 Bedrock/Vertex」
+- **四条模型通道都没对真实上游验证过**。Azure OpenAI（api-key 头）、自托管 vLLM（Bearer）、AWS Bedrock（SigV4 签名）、Google Vertex（service account 换 access token）的认证都实现了，SigV4 比对了 AWS 官方测试向量，但**没有一条打到过真的上游**。
+  另外「支持 Bedrock/Vertex」的准确含义是「能用它们的认证方式打到它们的 **OpenAI 兼容端点**」——网关不做协议转换，也不接受原生格式的入站请求。销售材料按这个口径写。
 - **身份**。Phase 1 只有共享 token，作用是把演示环境关起来。OIDC/SAML + RBAC 是 Phase 2。且浏览器的 WebSocket 无法自定义 header，token 走 URL query，**会进反向代理与服务器访问日志**
 - 沙箱编排、Helm chart、多 SCM、SIEM 导出、monorepo 支持
 
