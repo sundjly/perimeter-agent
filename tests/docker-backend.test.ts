@@ -7,7 +7,13 @@ import { after, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
-import { DockerBackend, KubectlBackend, LocalBackend, containerName } from "../src/gateway/execution-backend.ts";
+import {
+	DockerBackend,
+	KubectlBackend,
+	LocalBackend,
+	containerName,
+	defaultContainerUser,
+} from "../src/gateway/execution-backend.ts";
 import { Gateway } from "../src/gateway/server.ts";
 import { ModelGateway } from "../src/modelgw/server.ts";
 import type { ClientEvent } from "../src/protocol/types.ts";
@@ -65,12 +71,18 @@ test("local 后端在没有接线 HOME 时不覆盖调用方的 HOME", () => {
 	assert.equal(l.env.HOME, "/caller/home");
 });
 
-test("docker 后端的收紧项与 deploy/sandbox.yaml 一一对应", () => {
+test("docker 后端的五项收紧与 deploy/sandbox.yaml 对应", () => {
 	const l = new DockerBackend({ image: IMAGE, repoRoot: "/repo" }).launch(ctx);
 	assert.equal(l.bin, "docker");
 	const a = l.argsPrefix.join(" ");
 	assert.match(a, /--read-only/);
-	assert.match(a, /--user 10001:10001/);
+	// 默认取网关自己的 uid —— Linux 上 bind mount 保留宿主机属主，
+	// 固定 10001 会让容器写不进工作区（macOS 会重映射所以本机测不出来）
+	assert.match(a, new RegExp(`--user ${defaultContainerUser()}`));
+	// 上限必须有默认值：没有的话一句 dd 就能吃掉宿主机内存
+	assert.match(a, /--memory 4g/);
+	assert.match(a, /--pids-limit 512/);
+	assert.match(a, /--tmpfs \/tmp:rw,noexec,nosuid,nodev,size=512m/);
 	assert.match(a, /--cap-drop ALL/);
 	assert.match(a, /--security-opt no-new-privileges/);
 	// -i 是 RPC 的前提：没有它 stdin 立刻关闭，协议根本跑不起来
@@ -89,21 +101,35 @@ test("docker 后端只挂工作区、HOME 与扩展所需的三个只读子树",
 		"/repo/config:/opt/perimeter/config:ro",
 		"/repo/node_modules:/opt/perimeter/node_modules:ro",
 	]);
-	// 刻意不整仓挂载：audit-data/ 与 workspaces/ 都在仓库里
-	assert.ok(!mounts.some((m) => m === "/repo:/opt/perimeter" || m.startsWith("/repo:")));
 	// 扩展与策略走容器内路径
 	assert.equal(l.extensionPath, "/opt/perimeter/src/gateway/policy-extension.ts");
 	assert.equal(l.policyFile, "/opt/perimeter/config/policy.yaml");
 });
 
-test("docker 后端把策略上下文经 -e 注入容器", () => {
+test("环境变量用 -e KEY 传，值不进 argv —— argv 对同机用户可见", () => {
 	const l = new DockerBackend({ image: IMAGE, repoRoot: "/repo" }).launch(ctx);
 	const envArgs = l.argsPrefix.filter((_, i) => l.argsPrefix[i - 1] === "-e");
-	assert.ok(envArgs.includes("PERIMETER_REPO=web"));
-	assert.ok(envArgs.includes("PERIMETER_TEAM=platform"));
-	assert.ok(envArgs.includes("HOME=/home/agent"));
-	// 宿主机侧的 docker 客户端不该再拿到这些
-	assert.deepEqual(l.env, {});
+	assert.ok(envArgs.includes("PERIMETER_REPO"), "应当是裸 KEY");
+	assert.ok(!envArgs.some((e) => e.startsWith("PERIMETER_REPO=")), "值不得写进 argv");
+	assert.ok(!l.argsPrefix.join(" ").includes("=web"), "argv 里不该出现变量值");
+	// 值改由 docker 客户端的进程环境携带
+	assert.equal(l.env.PERIMETER_REPO, "web");
+	assert.equal(l.env.PERIMETER_POLICY_FILE, "/opt/perimeter/config/policy.yaml");
+});
+
+test("容器名带网关标识 —— 两个网关共用一个 daemon 时不会互杀", () => {
+	assert.equal(containerName("s1"), "perimeter-s1");
+	assert.equal(containerName("s1", "gw-a"), "perimeter-gw-a-s1");
+	const a = new DockerBackend({ image: IMAGE, repoRoot: "/r", gatewayId: "gw-a" }).launch(ctx);
+	const b = new DockerBackend({ image: IMAGE, repoRoot: "/r", gatewayId: "gw-b" }).launch(ctx);
+	const nameOf = (l: { argsPrefix: string[] }) => l.argsPrefix[l.argsPrefix.indexOf("--name") + 1];
+	assert.notEqual(nameOf(a), nameOf(b));
+	assert.ok(a.argsPrefix.includes("perimeter.gateway=gw-a"), "孤儿回收的抓手");
+});
+
+test("没有接线 HOME 时给一块 tmpfs —— 根只读，否则 pi 写自身状态就失败", () => {
+	const l = new DockerBackend({ image: IMAGE, repoRoot: "/repo" }).launch({ ...ctx, home: undefined });
+	assert.match(l.argsPrefix.join(" "), /--tmpfs \/home\/agent:rw/);
 });
 
 test("kubectl 后端生成 exec 命令，`--` 之后才是容器内的命令", () => {

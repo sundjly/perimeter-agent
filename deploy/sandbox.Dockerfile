@@ -3,7 +3,9 @@
 # 而不是浏览器内执行的首要理由，那些依赖只有客户自己的镜像才有。
 #
 # 本文件的用途是给出最小可用形态，并作为容器执行后端的验证基线。
-FROM node:22-alpine
+# 锁小版本：仓库要求 node >= 22.18（容器里跑的正是 .ts 扩展，
+# 无标志的 type stripping 依赖它）。浮动的 node:22 有可能滑到更低的补丁版。
+FROM node:22.18-alpine
 
 # git 是必需的：agent 要在工作区里 commit，凭据由 git 代理注入
 RUN apk add --no-cache git

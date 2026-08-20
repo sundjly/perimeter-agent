@@ -96,8 +96,27 @@ export interface DockerBackendOptions {
 	workdir?: string;
 	/** 额外的 docker run 参数 */
 	extraArgs?: string[];
+	/** 默认 4g。不设上限等于把宿主机内存交给 agent */
 	memory?: string;
+	/** 默认 2 */
 	cpus?: string;
+	/** 默认 512，挡 fork bomb */
+	pidsLimit?: number;
+	/**
+	 * 容器内的运行身份，形如 "1000:1000"。
+	 *
+	 * 默认取**网关自己的 uid/gid**，而不是镜像里那个固定的 10001。原因：
+	 * Linux 的 bind mount 保留宿主机属主，而工作区与沙箱 HOME 是网关以
+	 * 自己的身份创建的 —— 容器里换成 10001 就写不进去，pi 起不来或第一次
+	 * 写文件就 EACCES。macOS 的 Docker Desktop / OrbStack 做属主重映射，
+	 * 所以这个坑在本机测不出来，只在真实部署的 Linux 上炸。
+	 *
+	 * K8s 那侧不存在这个问题：用的是 emptyDir + fsGroup，见 deploy/sandbox.yaml。
+	 *
+	 * 网关以 root 运行时会回退到 10001 —— root 建的目录 10001 同样写不了，
+	 * 那种部署必须由部署侧保证属主（或让网关别用 root 跑）。
+	 */
+	user?: string;
 	env?: NodeJS.ProcessEnv;
 	/**
 	 * 仓库根。策略扩展跑在 pi 进程内，而 pi 在容器里 —— 扩展代码必须
@@ -109,16 +128,36 @@ export interface DockerBackendOptions {
 	 * 挂进去等于让 agent 读到审计日志和别的会话的工作区。
 	 */
 	repoRoot: string;
+	/**
+	 * 本网关实例的标识，进容器名与 label。
+	 *
+	 * 两个作用：① 容器名去重 —— sessionId 由客户端指定，两个网关共用一个
+	 * docker daemon 时，A 的 cleanup 会杀掉 B 的同名容器；② 孤儿回收 ——
+	 * 网关被 SIGKILL 时容器会残留（--rm 只保证退出后删记录，不保证退出），
+	 * 下次启动按 label 一次扫净。
+	 */
+	gatewayId?: string;
+	/** 清理失败时的告警通道。吞掉错误等于让容器静默泄漏 */
+	onCleanupError?: (sessionId: string, err: unknown) => void;
 }
 
 /**
  * 容器执行后端。
  *
- * 安全设置与 deploy/sandbox.yaml 一一对应，两处必须同步改：
- * 只读根、非 root、丢弃全部 capability、禁止提权、独占工作区。
+ * 与 deploy/sandbox.yaml 对应的是**下列五项**，改动要同步：
+ * 只读根、非 root(10001)、丢弃全部 capability、禁止提权、独占工作区。
+ * 两侧刻意不同的部分：gVisor runtimeClass（K8s 有、docker 没有）、
+ * 资源上限的表达方式、会话生命周期上限、以及挂载面 ——
+ * K8s 只挂一个 policy configMap，docker 这边为了让扩展跑起来挂了三个子树。
  *
- * **挂载的只有工作区与 HOME**，宿主机其余部分（含网关自身的代码、
- * 审计日志、策略文件）在容器里根本不存在 —— 这正是 local 后端给不了的。
+ * 挂进容器的是：工作区、沙箱 HOME，以及策略扩展所需的 src/、config/、
+ * node_modules/（只读）。宿主机其余部分 —— 尤其是**审计日志与其他会话的
+ * 工作区** —— 在容器里不存在，这是 local 后端给不了的。
+ *
+ * ⚠️ **bind mount 的属主语义在 Linux 与 macOS 上不同**：Linux 保留宿主机
+ * 属主，而网关是以自己的 uid 建的工作区与 HOME，容器里的 10001 会写不进去；
+ * macOS 的 Docker Desktop / OrbStack 做属主重映射所以本机看不出来。
+ * 因此工作区与 HOME 在创建后要 chown 到容器 uid（见 CONTAINER_UID）。
  */
 export class DockerBackend implements ExecutionBackend {
 	readonly kind = "docker" as const;
@@ -131,7 +170,7 @@ export class DockerBackend implements ExecutionBackend {
 	launch(ctx: LaunchContext): Launch {
 		const workdir = this.#opts.workdir ?? "/workspace";
 		const home = "/home/agent";
-		const name = containerName(ctx.sessionId);
+		const name = containerName(ctx.sessionId, this.#opts.gatewayId);
 
 		const mountRoot = "/opt/perimeter";
 		const args = [
@@ -146,11 +185,14 @@ export class DockerBackend implements ExecutionBackend {
 			// 与 deploy/sandbox.yaml 对齐的收紧项
 			"--read-only",
 			"--user",
-			"10001:10001",
+			this.#opts.user ?? defaultContainerUser(),
 			"--cap-drop",
 			"ALL",
 			"--security-opt",
 			"no-new-privileges",
+			// 孤儿回收的抓手：网关被 SIGKILL 后容器会残留，下次启动按它扫净
+			"--label",
+			`perimeter.gateway=${this.#opts.gatewayId ?? "default"}`,
 			// 只挂工作区与 HOME；宿主机其余部分在容器里不存在
 			"-v",
 			`${ctx.workspace}:${workdir}`,
@@ -163,9 +205,14 @@ export class DockerBackend implements ExecutionBackend {
 			`${this.#opts.repoRoot}/config:${mountRoot}/config:ro`,
 			"-v",
 			`${this.#opts.repoRoot}/node_modules:${mountRoot}/node_modules:ro`,
-			// 只读根意味着这些可写目录要显式给
+			// 只读根意味着这些可写目录要显式给。
+			// noexec/nosuid/nodev 与 no-new-privileges 配套；size 不能太大 ——
+			// tmpfs 写入直接算宿主机内存，没有 memory 上限时是一条 DoS 路径。
 			"--tmpfs",
-			"/tmp:rw,size=2g",
+			"/tmp:rw,noexec,nosuid,nodev,size=512m",
+			// 没有 wiring 时不挂 HOME，而根是只读的 —— 镜像里的 /home/agent
+			// 写不进去，pi 写自身状态就失败。给一块 tmpfs 兜住。
+			...(ctx.home ? [] : ["--tmpfs", `${home}:rw,nosuid,nodev,size=64m`]),
 			"-w",
 			workdir,
 			"-e",
@@ -174,24 +221,34 @@ export class DockerBackend implements ExecutionBackend {
 
 		// 容器内的策略文件路径。ctx.env 里若带了宿主机路径，必须被覆盖掉 ——
 		// 扩展会在容器里 readFileSync 它，宿主机路径在容器里不存在。
-		const containerEnv = {
+		const containerEnv: NodeJS.ProcessEnv = {
 			...this.#opts.env,
 			...ctx.env,
 			PERIMETER_POLICY_FILE: `${mountRoot}/config/policy.yaml`,
 		};
-		for (const [k, v] of Object.entries(containerEnv)) {
-			if (v !== undefined) args.push("-e", `${k}=${v}`);
+		// 用 `-e KEY`（不带值）而不是 `-e KEY=VALUE`：后者把值写进 argv，
+		// 同机其他用户 `ps aux` 就能看到。当前这五个变量都不敏感，但
+		// K8s 那侧的等价配置里是有会话 token 的（secretKeyRef），
+		// 这个写法能保证以后有人往里加 token 时不会静默泄漏。
+		// 注意：`docker inspect` 仍会留存值，要彻底避免只能走文件（如 models.json）。
+		for (const k of Object.keys(containerEnv)) {
+			if (containerEnv[k] !== undefined) args.push("-e", k);
 		}
-		if (this.#opts.memory) args.push("--memory", this.#opts.memory);
-		if (this.#opts.cpus) args.push("--cpus", this.#opts.cpus);
+		// 上限必须有默认值。做成「可选项、不传就无限制」的话，一句
+		// `dd if=/dev/zero of=/tmp/x` 就能吃掉宿主机内存，把网关和其他
+		// 所有会话一起 OOM 掉 —— 对照 sandbox.yaml 是写死了 limits 的。
+		args.push("--memory", this.#opts.memory ?? "4g");
+		args.push("--cpus", this.#opts.cpus ?? "2");
+		args.push("--pids-limit", String(this.#opts.pidsLimit ?? 512));
+		args.push("--ulimit", "nofile=4096:8192");
 		args.push(...(this.#opts.extraArgs ?? []));
 		args.push(this.#opts.image, "pi");
 
 		return {
 			bin: "docker",
 			argsPrefix: args,
-			// 环境变量已经经 -e 进了容器，宿主机侧的 docker 客户端不需要
-			env: {},
+			// `-e KEY` 从 docker 客户端自己的环境取值，所以这里必须把它们给出来
+			env: containerEnv,
 			cwd: ctx.workspace,
 			homeInContainer: home,
 			extensionPath: `${mountRoot}/src/gateway/policy-extension.ts`,
@@ -206,9 +263,32 @@ export class DockerBackend implements ExecutionBackend {
 	 */
 	async cleanup(sessionId: string): Promise<void> {
 		try {
-			await exec("docker", ["rm", "-f", containerName(sessionId)]);
-		} catch {
-			// 容器已不存在是正常路径（正常退出时 --rm 已经收掉了）
+			// 必须带超时：daemon 卡住时没有超时会让 Gateway.close() 永久挂起
+			await exec("docker", ["rm", "-f", containerName(sessionId, this.#opts.gatewayId)], { timeout: 10_000 });
+		} catch (err) {
+			// 「容器已不存在」是正常路径（正常退出时 --rm 已经收掉了）；
+			// 其余情况意味着容器可能泄漏了，不能和前者一样静默吞掉
+			const msg = err instanceof Error ? err.message : String(err);
+			if (!/No such container/i.test(msg)) {
+				this.#opts.onCleanupError?.(sessionId, err);
+			}
+		}
+	}
+
+	/**
+	 * 回收本网关遗留的孤儿容器。启动时调一次。
+	 * 网关被 SIGKILL 时来不及走 cleanup，容器会一直跑下去。
+	 */
+	async reapOrphans(): Promise<string[]> {
+		const label = `perimeter.gateway=${this.#opts.gatewayId ?? "default"}`;
+		try {
+			const { stdout } = await exec("docker", ["ps", "-aq", "--filter", `label=${label}`], { timeout: 10_000 });
+			const ids = stdout.split("\n").map((x) => x.trim()).filter(Boolean);
+			if (ids.length > 0) await exec("docker", ["rm", "-f", ...ids], { timeout: 30_000 });
+			return ids;
+		} catch (err) {
+			this.#opts.onCleanupError?.("<orphan-scan>", err);
+			return [];
 		}
 	}
 }
@@ -255,7 +335,23 @@ export class KubectlBackend implements ExecutionBackend {
 	}
 }
 
-/** 容器名必须可预测，才能在 pi 意外退出后找回来清理 */
-export function containerName(sessionId: string): string {
-	return `perimeter-${sessionId}`;
+/**
+ * 容器内的默认运行身份：网关自己的 uid/gid。
+ * 见 DockerBackendOptions.user 里关于 bind mount 属主的说明。
+ */
+export function defaultContainerUser(): string {
+	const uid = process.getuid?.();
+	const gid = process.getgid?.();
+	// root 或拿不到 uid（Windows）时退回镜像里的固定非 root 用户
+	if (uid === undefined || uid === 0) return "10001:10001";
+	return `${uid}:${gid ?? uid}`;
+}
+
+/**
+ * 容器名必须可预测，才能在 pi 意外退出后找回来清理。
+ * 带 gatewayId 是为了让共用一个 docker daemon 的两个网关互不干扰 ——
+ * sessionId 由客户端指定，不加前缀的话 A 的 cleanup 会杀掉 B 的容器。
+ */
+export function containerName(sessionId: string, gatewayId?: string): string {
+	return gatewayId ? `perimeter-${gatewayId}-${sessionId}` : `perimeter-${sessionId}`;
 }

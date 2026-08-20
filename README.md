@@ -81,7 +81,7 @@ deploy/           K8s 清单
 | 后端 | 隔离 | 状态 |
 |---|---|---|
 | `local` | **无** —— agent 与网关同一个 OS 用户 | 默认，开发与 demo 用，**不是生产形态** |
-| `docker` | 只读根、非 root、drop ALL caps、no-new-privileges、只挂工作区与 HOME | ✅ 本机实测（见下） |
+| `docker` | 只读根、非 root、drop ALL caps、no-new-privileges、内存/PID 上限、独占工作区 | ✅ 本机实测（macOS/OrbStack，见下） |
 | `kubectl` | 由 `deploy/sandbox.yaml` 的 Pod 定义决定 | ❌ 只验证了生成的命令行形状，**未在真实集群跑过** |
 
 docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时整组跳过并说明原因）：
@@ -91,6 +91,11 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 - 挂进去的策略扩展与策略文件是**只读**的 —— agent 改不了自己的策略
 - `--network none` 下确实无法出网，证明 egress 阻断机制有效
 - **端到端：整个会话跑在容器里，策略钩子照常拦下写 CI 配置的操作**
+
+两点必须说清楚，否则会被误读：
+
+- **egress 在 docker 后端下默认是通的**。后端默认用 `bridge` 网络，容器能出公网。要落地「egress 默认 deny」得用 `docker network create --internal` 并把两个代理放进去，或者在 K8s 侧靠 NetworkPolicy。四条铁律里这一条在 docker 后端下**不成立**。
+- **只在 macOS 验证过**。Linux 的 bind mount 保留宿主机属主，因此容器身份默认取网关自己的 uid 而不是镜像里的 10001（`DockerBackendOptions.user` 可覆盖）；macOS 的 Docker Desktop / OrbStack 做属主重映射，这条差异在本机测不出来。
 
 仍未做的是 **Pod 的创建与回收**（gVisor runtimeClass、NetworkPolicy 绑定）：`deploy/` 下的清单只做了生成与静态校验，没有代码去创建它们。因此「每会话独占沙箱」在 docker 后端下成立，在 K8s 形态下仍是设计承诺。
 

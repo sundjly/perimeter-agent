@@ -32,23 +32,26 @@ spec:
       # 客户自带构建镜像：环境保真度是选云沙箱而非浏览器内执行的首要理由
       image: CUSTOMER_BUILD_IMAGE
       imagePullPolicy: IfNotPresent
-      command: ["pi", "--mode", "rpc"]
+      # **不能把 pi 作为主进程**：Pod 的 stdin 立即 EOF，pi 随即退出，
+      # restartPolicy: Never 让 Pod 进入 Completed，之后 KubectlBackend 的
+      # `kubectl exec` 就无处可 exec 了。主进程只负责让 Pod 活着，
+      # pi 由网关经 exec 拉起（每个会话一次）。
+      command: ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
       workingDir: /workspace
       env:
-        # 沙箱只知道两个内部地址，不知道任何真实凭据
-        - name: PERIMETER_MODEL_GATEWAY
-          value: http://model-gateway.internal:8080/v1
-        - name: PERIMETER_GIT_PROXY
-          value: http://git-proxy.internal:8080
+        # 只有策略文件路径走 env。模型网关地址、git 代理地址与代理 token
+        # **不在这里** —— 它们由网关的 sandbox-config.ts 生成成
+        # $HOME/.pi/agent/models.json 与 $HOME/.gitconfig，经 sandbox-home
+        # 卷送进来。走文件而不是 env 是有意的：env 会出现在 `kubectl describe`
+        # 与容器的 /proc/1/environ 里。
         - name: PERIMETER_POLICY_FILE
           value: /etc/perimeter/policy.yaml
-        # 会话 token 不是 git/模型凭据：它只能用来访问上面两个代理，
-        # 且被代理按 repo allowlist 与 egress allowlist 二次约束
-        - name: PERIMETER_SESSION_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: perimeter-session-SESSION_ID
-              key: token
+        - name: PERIMETER_REPO
+          value: REPO_NAME
+        - name: PERIMETER_TEAM
+          value: TEAM_NAME
+        - name: HOME
+          value: /home/agent
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
@@ -69,6 +72,16 @@ spec:
         - name: policy
           mountPath: /etc/perimeter
           readOnly: true
+        # 策略扩展跑在 pi 进程内。没有这一份，K8s 形态下就没有 tool_call
+        # 钩子 —— 钩子级拦截是产品的核心卖点，缺了它审计与审批门全部落空。
+        # 内容与 docker 后端只读挂载的三个子树等价，随镜像一起构建更稳妥
+        # （node_modules 有平台相关性，不要从宿主机挂）。
+        - name: perimeter-runtime
+          mountPath: /opt/perimeter
+          readOnly: true
+        # 沙箱 HOME：models.json 与 .gitconfig 由网关写入后挂进来
+        - name: sandbox-home
+          mountPath: /home/agent
   volumes:
     # 工作区不共享：横向移动的前提之一就是共享卷
     - name: workspace
@@ -80,3 +93,11 @@ spec:
     - name: policy
       configMap:
         name: perimeter-policy
+    # 与 docker 后端的三个只读挂载等价。用 image 里自带的一份更稳妥：
+    # node_modules 是平台相关的，从宿主机挂会在 ABI 上出问题。
+    - name: perimeter-runtime
+      configMap:
+        name: perimeter-runtime
+    - name: sandbox-home
+      emptyDir:
+        sizeLimit: 64Mi
