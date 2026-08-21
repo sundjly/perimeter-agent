@@ -408,18 +408,36 @@ export class Session {
 		return true;
 	}
 
-	async stop(): Promise<void> {
-		if (this.#alive) this.#audit({ kind: "session.end", summary: "会话结束" });
+	/**
+	 * 停止会话。**清理路径上的每一步都各自兜住**：任何一步失败都不中断后续，
+	 * 否则会留下更难收拾的东西（pi 子进程连同 stdio 句柄泄漏，整个进程退不出）。
+	 *
+	 * 失败最终以 throw 上报，调用方负责记成「沙箱可能泄漏」。
+	 * **调用方必须接住** —— start() 里的失败路径也会走到这儿，
+	 * 而那条路径上一个未接的拒绝会打死整个多租户网关。
+	 */
+	async stop(reason = "会话结束"): Promise<void> {
+		// 只在这里写 session.end，调用方把原因传进来 —— 两处各写一条会让
+		// SIEM 侧按 event.type:"end" 统计的会话数翻倍，start/end 也不再配对
+		if (this.#alive) this.#audit({ kind: "session.end", summary: reason });
 		this.#alive = false;
-		if (!this.#piStarted) {
+
+		let cleanupErr: unknown;
+		try {
 			await this.#opts.backend?.cleanup?.(this.#opts.sessionId);
-			return;
+		} catch (err) {
+			cleanupErr = err;
 		}
-		// **先杀容器再收客户端**。顺序反过来会挂住：SIGTERM 发给的是宿主机上的
-		// docker 客户端进程，容器内的 pi 收不到，容器继续跑、stdio 管道不关，
-		// pi.stop() 就一直等下去 —— 实测表现为测试进程挂死且容器泄漏。
-		await this.#opts.backend?.cleanup?.(this.#opts.sessionId);
-		await this.#pi.stop();
+
+		// pi 没起来就没有子进程要收。但 cleanup 仍要做（后端可能已经建了容器/Pod），
+		// 而这条早返回分支恰恰是失败高发路径 —— 它对应 prepare/clone 失败，
+		// 也就是后端最可能同时挂掉的时刻。
+		if (this.#piStarted) {
+			// **先杀容器再收客户端**：SIGTERM 发给的是宿主机上的 docker 客户端进程，
+			// 容器内的 pi 收不到，容器继续跑、stdio 管道不关，pi.stop() 就一直等下去。
+			await this.#pi.stop();
+		}
+		if (cleanupErr) throw cleanupErr;
 	}
 
 	/** 重放 since 之后的事件。只回发起方，避免洪泛给其他标签页。 */

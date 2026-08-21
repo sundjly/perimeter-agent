@@ -86,6 +86,8 @@ export class Gateway {
 	/** sessionId → 创建它的身份。别人拿到 id 也接不进来 */
 	#owners = new Map<string, string>();
 	#reaper: NodeJS.Timeout;
+	/** close 之后审计 fd 已关，在途的 reap 不能再写 */
+	#closed = false;
 	#webRoot: string;
 
 	constructor(cfg: GatewayConfig) {
@@ -110,8 +112,14 @@ export class Gateway {
 			this.#wss.handleUpgrade(req, socket, head, (ws) => this.#onConnection(ws, req));
 		});
 
-		// 空闲回收：没有它，会话与 pi 进程只增不减
-		this.#reaper = setInterval(() => this.#reap(), 30_000);
+		// 空闲回收：没有它，会话与 pi 进程只增不减。
+		// 间隔取 idleTimeoutMs 的一半（上限 30s）—— 固定 30s 的话，
+		// 把 idleTimeoutMs 配成 5s 仍要等 30s 才回收，是意外行为
+		const tick = Math.max(1_000, Math.min(30_000, Math.floor((cfg.idleTimeoutMs ?? 30 * 60_000) / 2)));
+		this.#reaper = setInterval(() => {
+			// 回调是 async：不接住的话一次拒绝就是未处理的 rejection
+			void this.#reap().catch((err) => console.error("回收会话失败:", err));
+		}, tick);
 		this.#reaper.unref();
 	}
 
@@ -134,8 +142,18 @@ export class Gateway {
 	}
 
 	async close(): Promise<void> {
+		this.#closed = true;
 		clearInterval(this.#reaper);
-		for (const s of this.#sessions.values()) await s.stop();
+		// 一个停不掉的会话不该让整个网关关不掉：抛出去的话后面的 session、
+		// WebSocket 与 http server 全都不会被清理，进程挂在那里退不出。
+		// 与 #reap 同理，失败要留痕（沙箱可能泄漏），但不能中断收尾。
+		for (const [id, s] of this.#sessions) {
+			try {
+				await s.stop();
+			} catch (err) {
+				this.#auditLeak(id, this.#owners.get(id) ?? "system", err);
+			}
+		}
 		this.#sessions.clear();
 		this.#owners.clear();
 		// 必须先断开在途连接：http.close() 要等所有连接关闭才回调，
@@ -151,15 +169,66 @@ export class Gateway {
 		return this.#sessions.size;
 	}
 
-	/** 回收空闲会话与已死会话，连同它们的 pi 进程 */
-	#reap(): void {
+	/**
+	 * 回收空闲与已死的会话。
+	 *
+	 * 三件事都要做，缺一件就成了「沙箱泄漏」：
+	 * 1. 从表里删掉（否则 maxSessions 会被僵尸占满）
+	 * 2. 真的把执行后端停掉，**并检查它有没有停成功** ——
+	 *    容器/Pod 停不掉时会话已经从表里消失，没人再会去收它
+	 * 3. 留痕。「因空闲被回收」与「自己结束」在审计里必须能分辨，
+	 *    否则运维只看到会话没了、不知道为什么
+	 */
+	async #reap(): Promise<void> {
+		if (this.#closed) return;
 		const idleLimit = this.#cfg.idleTimeoutMs ?? 30 * 60_000;
-		for (const [id, session] of this.#sessions) {
-			if (!session.alive || session.idleMs > idleLimit) {
-				this.#sessions.delete(id);
-				this.#owners.delete(id);
-				void session.stop();
+		for (const [id, session] of [...this.#sessions]) {
+			const idle = session.idleMs > idleLimit;
+			if (session.alive && !idle) continue;
+			// **delete 的返回值就是并发闸**：setInterval 不等上一次跑完，
+			// 上一轮的陈旧快照会在 await 之后重新轮到已被这一轮收走的会话，
+			// 于是同一个容器被 docker rm 两次 —— 第二次必然「no such container」，
+			// 被记成一条假的泄漏告警。deny 类告警一旦开始出假阳性，规则就废了。
+			if (!this.#sessions.delete(id)) continue;
+			const owner = this.#owners.get(id) ?? "system";
+			this.#owners.delete(id);
+
+			// session.end 只由 session.stop() 写一条，原因从这里传进去。
+			// 两处各写一条会让 SIEM 按 event.type:"end" 统计的会话数翻倍
+			try {
+				await session.stop(idle ? `空闲 ${Math.round(session.idleMs / 1000)}s 被网关回收` : "会话已终止");
+			} catch (err) {
+				this.#auditLeak(id, owner, err);
 			}
+			// close() 可能在 await 期间跑完并关掉了审计 fd
+			if (this.#closed) return;
+		}
+	}
+
+	/**
+	 * 记一条「沙箱可能泄漏」。会话已经从表里删了，没人再会去收它，
+	 * 而容器还持有工作区与代理 token —— 吞掉它等于让它无限期存活。
+	 */
+	#auditLeak(sessionId: string, actor: string, err: unknown): void {
+		this.#tryAudit({
+			kind: "error",
+			sessionId,
+			actor,
+			summary: `清理失败，沙箱可能泄漏：${err instanceof Error ? err.message : String(err)}`,
+			verdict: "deny",
+		});
+	}
+
+	/**
+	 * 写审计但不让失败冲出调用点。
+	 * append 会 fdatasync，磁盘满或 fd 已关（close 与在途 reap 竞态）都会抛 ——
+	 * 抛出去的话整轮清理会在半路中断，而那正是本该被清理的东西最多的时候。
+	 */
+	#tryAudit(input: Parameters<AuditLog["append"]>[0]): void {
+		try {
+			this.#audit.append(input);
+		} catch (err) {
+			console.error("写审计失败:", err instanceof Error ? err.message : err);
 		}
 	}
 
@@ -230,7 +299,10 @@ export class Gateway {
 		this.#sessions.set(sessionId, session);
 		this.#owners.set(sessionId, actor);
 		attach(ws, session, actor);
-		void session.start();
+		// **必须接住**：start() 的失败路径里会 await this.stop()，而 stop 在
+		// 清理失败时会 throw。不接的话一个会话的清理失败会打死整个多租户网关
+		// —— 那比静默泄漏一个容器严重得多。
+		void session.start().catch((err) => this.#auditLeak(sessionId, "gateway-start", err));
 	}
 
 	#serveStatic(req: IncomingMessage, res: ServerResponse): void {

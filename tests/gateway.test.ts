@@ -7,6 +7,7 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { AuditLog } from "../src/audit/log.ts";
+import { type ExecutionBackend, LocalBackend } from "../src/gateway/execution-backend.ts";
 import { Gateway } from "../src/gateway/server.ts";
 import type { ClientEvent } from "../src/protocol/types.ts";
 
@@ -24,6 +25,8 @@ interface Env {
 	auditFile: string;
 	workspaceRoot: string;
 	gateway: Gateway;
+	/** 暴露给需要自建 backend 的用例：不带上它，pi 找不到 mock provider */
+	piEnv: NodeJS.ProcessEnv;
 }
 
 async function startGateway(script: unknown[], extra: Partial<ConstructorParameters<typeof Gateway>[0]> = {}): Promise<Env> {
@@ -68,7 +71,7 @@ async function startGateway(script: unknown[], extra: Partial<ConstructorParamet
 	});
 	cleanups.push(() => gateway.close());
 	const listening = await gateway.listen();
-	return { url: `http://127.0.0.1:${listening}`, auditFile, workspaceRoot, gateway };
+	return { url: `http://127.0.0.1:${listening}`, auditFile, workspaceRoot, gateway, piEnv: { PATH: process.env.PATH, HOME: home } };
 }
 
 interface Client {
@@ -79,6 +82,12 @@ interface Client {
 	waitFor: (pred: () => boolean, ms?: number) => Promise<void>;
 	find: <T extends ClientEvent["type"]>(type: T) => Extract<ClientEvent, { type: T }> | undefined;
 	send: (cmd: unknown) => void;
+}
+
+async function auditEntries(file: string): Promise<import("../src/audit/log.ts").AuditEntry[]> {
+	const out: import("../src/audit/log.ts").AuditEntry[] = [];
+	for await (const e of AuditLog.replay(file)) out.push(e);
+	return out;
 }
 
 async function connect(env: Env, query = ""): Promise<Client> {
@@ -446,4 +455,115 @@ test("续接时重发挂起的审批 —— 否则 agent 一直等到超时而�
 	// 用重发的 id 批准，工具应当真的执行
 	c.send({ type: "approve", approvalId: resent.approvalId, decision: "allow" });
 	await c.waitFor(() => c.events.some((e) => e.type === "agent.end"));
+});
+
+test("空闲会话被回收，且审计能分辨「被回收」与「自己结束」", async () => {
+	// 运维只看到会话没了、不知道为什么，是排查时最耗时的一类状态
+	const env = await startGateway([{ text: "ok" }], { idleTimeoutMs: 1_000 });
+	const c = await connect(env);
+	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
+	assert.equal(env.gateway.sessionCount, 1);
+
+	// 轮询而不是睡死：同时钉住「间隔跟着 idleTimeoutMs 走」——
+	// 此前 reaper 固定 30s，配 1s 也要等 30s 才回收
+	const t0 = Date.now();
+	while (env.gateway.sessionCount > 0 && Date.now() - t0 < 4_000) {
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	assert.equal(env.gateway.sessionCount, 0, "空闲超时的会话应当被回收");
+
+	const entries = await auditEntries(env.auditFile);
+	const ends = entries.filter((e) => e.kind === "session.end");
+	assert.equal(ends.length, 1, `一个会话只该有一条 session.end，实际 ${ends.length} 条 —— 多了会让 SIEM 的会话数翻倍`);
+	assert.match(ends[0]!.summary, /空闲 \d+s 被网关回收/, "要能看出是因为空闲");
+	// 归属不能丢：一条泄漏告警要答得上「谁的会话」，而 owner 就在手边
+	assert.equal(ends[0]!.actor, "demo@local", "回收记录要保留会话归属，不能换成 gateway-reaper");
+});
+
+test("停不掉的会话被记为沙箱泄漏 —— 不能从表里删掉就当没事", async () => {
+	// 会话已从表里消失，没人再会去收它，而容器还持有工作区与代理 token。
+	// 用一个 cleanup 必失败的后端把这条路径逼出来。
+	// 惰性 holder：launch 只在 connect() 时才被调到，所以拿到 env 后再赋值就够，
+	// 不必为了取 piEnv 多起一整个 gateway
+	let inner: ExecutionBackend;
+	const failing: ExecutionBackend = {
+		kind: "local",
+		launch: (ctx) => inner.launch(ctx),
+		cleanup: () => Promise.reject(new Error("容器停不掉")),
+	};
+	const env = await startGateway([{ text: "ok" }], { idleTimeoutMs: 1_000, backend: failing });
+	inner = new LocalBackend(env.piEnv);
+	const c = await connect(env);
+	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
+
+	await new Promise((r) => setTimeout(r, 3_000));
+	assert.equal(env.gateway.sessionCount, 0, "即便停不掉也要从表里删掉，否则 maxSessions 会被僵尸占满");
+
+	const entries = await auditEntries(env.auditFile);
+	const leak = entries.find((e) => e.summary.includes("沙箱可能泄漏"));
+	assert.ok(leak, "停不掉必须留痕 —— 吞掉它等于让持有 token 的容器无限期存活");
+	assert.equal(leak!.verdict, "deny", "泄漏要能被 SIEM 的告警规则捞出来");
+	assert.match(leak!.summary, /容器停不掉/, "要带上真实原因，否则无从排查");
+	assert.equal(leak!.actor, "demo@local", "泄漏告警要答得上「谁的会话」");
+});
+
+test("会话启动失败 + 清理失败：网关进程必须活下来", async () => {
+	// stop() 在清理失败时会 throw，而 start() 的失败路径里就 await 它。
+	// 调用点不接的话，一个会话的清理失败会打死整个多租户网关 ——
+	// 比静默泄漏一个容器严重得多。这是 kubectl 后端「Pod 起不来且删不掉」
+	// 这个很真实的组合。
+	const bad: ExecutionBackend = {
+		kind: "local",
+		launch: () => ({
+			bin: "/nonexistent-binary-xyz",
+			argsPrefix: [],
+			env: {},
+			cwd: process.cwd(),
+			homeInContainer: "/tmp",
+			extensionPath: "/tmp/x.ts",
+			policyFile: join(REPO, "config/policy.yaml"),
+		}),
+		cleanup: () => Promise.reject(new Error("Pod 也删不掉")),
+	};
+	const env = await startGateway([{ text: "ok" }], { backend: bad });
+	const c = await connect(env);
+
+	// 会话起不来，但网关要活着：还能接新连接、还能正常关闭
+	await c.waitFor(() => c.events.some((e) => e.type === "error"));
+	const c2 = await connect(env);
+	await new Promise((r) => setTimeout(r, 300));
+	assert.ok(c2.ws.readyState === c2.ws.OPEN, "网关必须还能接新连接");
+
+	const leak = (await auditEntries(env.auditFile)).find((e) => e.summary.includes("沙箱可能泄漏"));
+	assert.ok(leak, "启动路径上的清理失败同样要记成泄漏");
+	assert.match(leak!.summary, /Pod 也删不掉/);
+});
+
+test("停不掉的会话不占 maxSessions 的坑", async () => {
+	// 从表里删掉是三件事里的第一件：不删的话 maxSessions 会被僵尸占满，
+	// 而它们对应的容器早就没人管了
+	let inner: ExecutionBackend;
+	const failing: ExecutionBackend = {
+		kind: "local",
+		launch: (ctx) => inner.launch(ctx),
+		cleanup: () => Promise.reject(new Error("停不掉")),
+	};
+	const env = await startGateway([{ text: "ok" }], { idleTimeoutMs: 1_000, maxSessions: 1, backend: failing });
+	inner = new LocalBackend(env.piEnv);
+
+	const c1 = await connect(env);
+	await c1.waitFor(() => c1.events.some((e) => e.type === "session.ready"));
+	assert.equal(env.gateway.sessionCount, 1);
+
+	// 等它被回收（清理会失败，但表项必须腾出来）
+	const t0 = Date.now();
+	while (env.gateway.sessionCount > 0 && Date.now() - t0 < 5_000) {
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	assert.equal(env.gateway.sessionCount, 0, "停不掉也要腾出坑位");
+
+	// maxSessions=1，僵尸不占坑的话新连接应当能建起来
+	const c2 = await connect(env);
+	await c2.waitFor(() => c2.events.some((e) => e.type === "session.ready"));
+	assert.ok(!c2.controls.some((m) => m.control === "error"), "新会话不该被僵尸挡住");
 });
