@@ -148,6 +148,43 @@ data:
           - "* /repos/*/issues/*/comments*"
           - "* /projects/*/merge_requests/*/notes*"
 
+      # ── 凭据外泄形态 ───────────────────────────────────────────
+      - name: credential-exfiltration
+        tool: bash
+        require_approval:
+          # **按数据源匹配，不按外发工具匹配。**
+          #
+          # 按 sink（`* | curl *`）匹配的是「是否在往外发」—— 而往外发在 CI 里
+          # 是正常行为：传构建产物、报覆盖率、发 webhook 全中招。实测那种写法
+          # 对合法上传误伤 6/12，对攻击只命中 4/9，信噪比是反的。
+          # 按 source 匹配的是「是否在往外发**凭据**」，实测攻击 8/9、误伤 0/12。
+          #
+          # 定位要说准确：它挡不住有意的攻击者（base64、分片、DNS 隧道、
+          # 解释器一行流都能绕），真边界仍是 egress deny-all。它挡的是
+          # 被 prompt injection 诱导、并不在对抗引擎的 agent —— 但要注意
+          # **写恶意指令的人是适应性对手**，所以形态要覆盖到位，
+          # 只挡「直白形态的一半」等于声明与实现不符。
+          - "*.env*|*"
+          - "*.aws/credentials*|*"
+          - "*.ssh/id_*|*"
+          - "*.npmrc*|*"
+          - "*.git-credentials*|*"
+          - "*.kube/config*|*"
+          # curl/wget 的 @file 上传：不带管道，是这类工具的标准写法
+          - "*-d @*.env*"
+          - "*-d @*credentials*"
+          - "*-d @*id_rsa*"
+          - "*--data-binary @*.env*"
+          - "*--data-binary @*credentials*"
+          - "*-F *=@*.env*"
+          - "*-F *=@*credentials*"
+          - "*--post-file*.env*"
+          - "*--post-file*credentials*"
+          # 直接把凭据文件传走
+          - "scp *.env *"
+          - "scp *credentials *"
+          - "rsync *.env *"
+
       # ── 高风险路径：允许改但要人过目 ────────────────────────────
       - name: sensitive-paths-need-review
         tool: "*"
