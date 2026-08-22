@@ -1,0 +1,14 @@
+id: semver-parse-coverage
+type: test-coverage
+repo: semver-parse
+prompt: |
+  parse.js 里的 compare() 完全没有测试，parse() 也只测了成功路径。
+  往 parse.test.js 补测试，把行覆盖率提到 90% 以上：
+  非法输入返回 null、带预发布号的解析、以及 compare 的主次修订号比较与
+  「预发布版本排在同版号正式版之前」这条规则。
+verify:
+  - node --test --experimental-test-coverage --test-coverage-lines=90
+  # 删光测试文件时覆盖率命令同样退出 0：没有文件被加载，阈值无从判起
+  - "node --test 2>&1 | grep -qE '^ℹ pass [2-9]'"
+failsAtStart: [0, 1]
+maxApprovals: 2

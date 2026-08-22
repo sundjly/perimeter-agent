@@ -396,3 +396,15 @@ test("没有 templatePath 时不创建 Pod —— 沿用外部编排器建好的
 	const b = new KubectlBackend({ podTemplate: "p-{session}", namespace: "ns" });
 	assert.equal(b.provisionPlan(ctx), null);
 });
+
+test("exec 的 argv：进本会话的容器、切到容器内工作区、命令整体交给 sh", () => {
+	const b = new DockerBackend({ image: "img", repoRoot: "/repo", gatewayId: "gw" });
+	const args = b.execArgs("s1", "node --test && echo ok");
+	// -w 指的是**容器内**挂载点，与宿主机工作区路径无关
+	assert.deepEqual(args.slice(0, 3), ["exec", "-w", "/workspace"]);
+	// 命令必须作为单个 argv 交给 sh，拆开的话 `&&` 与重定向会被当成 docker 的参数
+	assert.deepEqual(args.slice(-3), ["/bin/sh", "-c", "node --test && echo ok"]);
+	assert.match(String(args[3]), /s1/, "容器名要认到具体会话");
+	// 自定义挂载点要跟着走，否则验收会跑在容器的默认 cwd 上
+	assert.equal(new DockerBackend({ image: "i", repoRoot: "/r", workdir: "/src" }).execArgs("s", "x")[2], "/src");
+});

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
+import { KubectlBackend } from "../src/gateway/execution-backend.ts";
 import { k8sNameFragment, renderPodManifest } from "../src/deploy/pod-template.ts";
 
 /**
@@ -131,4 +132,19 @@ test("规范化不同的 sessionId 不会撞名", () => {
 	assert.notEqual(k8sNameFragment("a_b"), k8sNameFragment("a-b"));
 	// 同一个输入必须稳定，否则 cleanup 找不回自己建的 Pod
 	assert.equal(k8sNameFragment("Fix_Bug"), k8sNameFragment("Fix_Bug"));
+});
+
+test("kubectl exec 的 argv：命名空间与容器都要带上，工作目录靠 cd", () => {
+	const b = new KubectlBackend({ podTemplate: "sbx-{session}", namespace: "agents", container: "sandbox" });
+	const args = b.execArgs("s1", "/workspace", "node --test");
+	assert.equal(args[0], "exec");
+	// Pod 名带 gatewayId 派生的后缀（两个网关共用集群时防撞名），这里只认会话那半段
+	assert.match(String(args[1]), /^sbx-s1-/);
+	assert.ok(args.includes("-n") && args.includes("agents"), "漏了 namespace 会打到 default 去");
+	assert.ok(args.includes("-c") && args.includes("sandbox"));
+	// `--` 之后 kubectl 不再解析，验收命令里的 -flag 才不会被它吃掉
+	const dashdash = args.indexOf("--");
+	assert.ok(dashdash > 0 && args[dashdash + 1] === "/bin/sh");
+	// kubectl exec 没有 -w，工作目录只能 cd；路径要引起来，带空格的挂载点才不会拆成两个词
+	assert.equal(args.at(-1), 'cd "/workspace" && node --test');
 });

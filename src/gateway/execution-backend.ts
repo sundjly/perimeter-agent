@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -69,6 +69,109 @@ export interface ExecutionBackend {
 	 * 网关没法从外部写它，不送进去就没有 models.json，会话起不来。
 	 */
 	prepare?(ctx: LaunchContext): Promise<void>;
+	/**
+	 * 在会话的执行环境里跑一条 shell 命令，返回退出码与输出。
+	 *
+	 * Golden task suite 的验收步骤靠它。验收命令跑的是 **agent 刚写进工作区的
+	 * 代码**，走后端换来的是**隔离** —— docker/kubectl 下它落在沙箱里，
+	 * 而不是网关的 OS 用户身份上。
+	 *
+	 * ⚠️ **这条路径不过策略引擎、不进审计、不受 egress allowlist 约束。**
+	 * 它是一个「在沙箱里跑任意 shell」的通用能力，挂在网关自己也持有的接口上。
+	 * 今天只有评测的验收步骤调它；再多一处调用方，就要先想清楚那处是不是
+	 * 在给 agent 开策略旁路。
+	 *
+	 * 不抛异常：命令失败（非零退出）是验收的正常结果，不是错误。
+	 */
+	exec?(sessionId: string, workspace: string, command: string, timeoutMs?: number): Promise<ExecResult>;
+}
+
+export interface ExecResult {
+	code: number;
+	stdout: string;
+	stderr: string;
+}
+
+/**
+ * 交给验收命令的环境变量白名单。
+ *
+ * **不能直接继承 process.env**，主要理由只有一个，但它足够硬：
+ *
+ * node 的 test runner 会给子进程注入 `NODE_TEST_CONTEXT` 等变量。验收命令里的
+ * `node --test` 看到它就以为自己是被托管的子进程，输出改走 IPC、退出码不再
+ * 反映测试结果 —— 于是**验收恒真**。任何在 test runner 里跑评测的场合都会
+ * 撞上（`npm test` 也算），本机单独手跑 CLI 才看不见。
+ *
+ * 顺带挡掉网关环境里的上游凭据（模型 key、SCM token），但**别把这当成安全
+ * 边界**：白名单里就有 `HOME`，而凭据大多住在 `$HOME` 下；local 后端里验收
+ * 命令以网关的 OS 用户身份无隔离运行，`cat ~/.aws/credentials` 一句话的事。
+ * 环境变量挡得住，磁盘挡不住。真正的边界是换成 docker / kubectl 后端。
+ */
+const EXEC_ENV_KEYS = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TZ"] as const;
+
+function minimalEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const merged = { ...process.env, ...base };
+	const out: NodeJS.ProcessEnv = {};
+	for (const k of EXEC_ENV_KEYS) {
+		const v = merged[k];
+		if (v !== undefined) out[k] = v;
+	}
+	return out;
+}
+
+/** 超时的退出码。与 GNU timeout 对齐 —— 命令自身极少用到这个值 */
+export const TIMEOUT_EXIT = 124;
+
+/**
+ * 把 execFile 的失败归一成退出码。
+ * 命令返回非零时 execFile 会 reject，而对验收来说那只是「没通过」。
+ * 超时另算 —— 它没有有意义的退出码，用 124 与 GNU timeout 对齐。
+ */
+const OUTPUT_CAP = 8 * 1024 * 1024;
+
+function runCapturing(
+	bin: string,
+	args: string[],
+	timeoutMs: number,
+	cwd?: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<ExecResult> {
+	return new Promise((resolve) => {
+		// `detached` 把命令放进独立进程组，超时时才能整组杀掉。
+		// execFile 的 timeout 只杀直接子进程（这里是 /bin/sh），验收命令
+		// fork 出来的孙进程 —— `node --test` 的每个 worker —— 会全部活下来。
+		// 评测是反复跑的，每次超时泄漏一批，攒起来能把机器拖垮。
+		const child = spawn(bin, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		// 输出要设上限：这条路径上跑的是 agent 写的代码，一个死循环里的
+		// console.log 就能把网关的内存吃光
+		child.stdout.on("data", (d) => {
+			if (stdout.length < OUTPUT_CAP) stdout += d;
+		});
+		child.stderr.on("data", (d) => {
+			if (stderr.length < OUTPUT_CAP) stderr += d;
+		});
+		const timer = setTimeout(() => {
+			timedOut = true;
+			try {
+				// 负号 = 整个进程组。pid 取不到时退回只杀直接子进程
+				if (child.pid) process.kill(-child.pid, "SIGKILL");
+				else child.kill("SIGKILL");
+			} catch {
+				child.kill("SIGKILL");
+			}
+		}, timeoutMs);
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({ code: 1, stdout, stderr: stderr || String(err) });
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			resolve({ code: timedOut ? TIMEOUT_EXIT : (code ?? 1), stdout, stderr });
+		});
+	});
 }
 
 /** 直接在网关宿主机上跑。**没有隔离** —— agent 与网关同一个 OS 用户。 */
@@ -94,6 +197,18 @@ export class LocalBackend implements ExecutionBackend {
 			extensionPath: ctx.extensionPath,
 			policyFile: ctx.policyFile,
 		};
+	}
+
+	/**
+	 * ⚠️ 在网关宿主机上直接跑 agent 写的代码，**没有任何隔离**。
+	 * 与 launch 的处境一样，但后果更集中：评测会反复触发它。
+	 * 评测报告因此必须带上 backend 字段，让「这个数字是在无隔离环境下跑的」
+	 * 跟着数据走 —— 一个开关拦不住，标注跟得住。
+	 */
+	async exec(_sessionId: string, workspace: string, command: string, timeoutMs = 120_000): Promise<ExecResult> {
+		// cwd 必须是工作区。漏了它，验收命令就在网关自己的仓库根上跑 ——
+		// `node --test` 会去跑 perimeter-agent 的测试套件然后报告「任务通过」
+		return runCapturing("/bin/sh", ["-c", command], timeoutMs, workspace, minimalEnv(this.#env));
 	}
 }
 
@@ -292,6 +407,24 @@ export class DockerBackend implements ExecutionBackend {
 	 * 而杀掉宿主机上的 docker 客户端进程并不会让容器内的进程收到信号 ——
 	 * 容器会继续跑、stdio 管道不关，等它的一方就永远等下去。
 	 */
+	/**
+	 * `docker exec` 的 argv。抽成纯函数是为了在没有 daemon 的机器上也能
+	 * 断言命令形状 —— 直接测 exec() 只能拿到「连不上 daemon」，
+	 * 那种断言对任何 argv 都成立。
+	 */
+	execArgs(sessionId: string, command: string): string[] {
+		// 容器内的工作区路径是固定挂载点，与宿主机路径无关，
+		// 所以 exec() 的 workspace 参数在本后端里被忽略
+		const workdir = this.#opts.workdir ?? "/workspace";
+		return ["exec", "-w", workdir, containerName(sessionId, this.#gatewayId), "/bin/sh", "-c", command];
+	}
+
+	async exec(sessionId: string, _workspace: string, command: string, timeoutMs = 120_000): Promise<ExecResult> {
+		// docker 客户端自身的环境也要收窄：不传的话 DOCKER_* 之外的一切
+		// 都跟着进来，`launch` 路径上那套客户端变量消毒在这条路上就不成立了
+		return runCapturing("docker", this.execArgs(sessionId, command), timeoutMs, undefined, minimalEnv(this.#opts.env ?? {}));
+	}
+
 	async cleanup(sessionId: string): Promise<void> {
 		try {
 			// 必须带超时：daemon 卡住时没有超时会让 Gateway.close() 永久挂起
@@ -522,6 +655,26 @@ export class KubectlBackend implements ExecutionBackend {
 			console.error("孤儿 Pod 扫描失败（带 token 的 Pod 可能仍在运行）:", err);
 			return [];
 		}
+	}
+
+	/**
+	 * `kubectl exec` 的 argv。同样抽成纯函数 —— 没有集群时只能断言形状。
+	 *
+	 * kubectl exec 没有 docker 那样的 `-w`，工作目录只能靠 `cd`。
+	 * 因此 workspace 必须是 **Pod 内**的路径（launch 里 cwd 就是原样的
+	 * ctx.workspace，两处是同一个约定）。
+	 */
+	execArgs(sessionId: string, workspace: string, command: string): string[] {
+		const args = ["exec", this.#podName(sessionId)];
+		if (this.#opts.namespace) args.push("-n", this.#opts.namespace);
+		if (this.#opts.container) args.push("-c", this.#opts.container);
+		// `--` 之后的内容不再被 kubectl 解析，验收命令里的 -flag 才不会被它吃掉
+		args.push("--", "/bin/sh", "-c", `cd ${JSON.stringify(workspace)} && ${command}`);
+		return args;
+	}
+
+	async exec(sessionId: string, workspace: string, command: string, timeoutMs = 120_000): Promise<ExecResult> {
+		return runCapturing("kubectl", this.execArgs(sessionId, workspace, command), timeoutMs, undefined, minimalEnv({}));
 	}
 
 	async cleanup(sessionId: string): Promise<void> {

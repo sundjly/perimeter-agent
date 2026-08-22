@@ -1,0 +1,14 @@
+id: range-sum-off-by-one
+type: bug-fix
+repo: range-utils
+prompt: |
+  sum.js 的 sumRange 应该算闭区间 [from, to] 的整数和，
+  但 sumRange(1, 5) 返回 10 而不是 15，sumRange(3, 3) 返回 0 而不是 3。
+  修好它，让 node --test 通过。
+verify:
+  - node --test
+  # 光看退出码不够：`node --test` 找不到任何测试文件时退出码是 0，
+  # 于是「删掉 sum.test.js」就能拿到完成。这条数实际跑过的用例
+  - "node --test 2>&1 | grep -qE '^ℹ pass [1-9]'"
+failsAtStart: [0, 1]
+maxApprovals: 2

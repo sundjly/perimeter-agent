@@ -1,0 +1,17 @@
+id: slice-guard-dedupe
+type: refactor
+repo: slice-guard
+prompt: |
+  slice.js 里 head/tail/drop 三个函数各自复制了一份一模一样的区间校验。
+  把它抽成一处，行为保持完全不变（越界、负数、非整数仍抛 RangeError）。
+verify:
+  - node --test
+  - "node --test 2>&1 | grep -qE '^ℹ pass [1-9]'"
+  # 结构判据是 proxy 而非真判据：它数的是 throw 点有几处。
+  # 数校验条件本身（`n < 0`）更弱 —— 改个空格写成 `n<0` 就骗过去了；
+  # 数 RangeError 至少被测试锁着：三个函数的越界行为都有断言，
+  # 想把 throw 减到一处就只能真的抽出来（抽到别的文件也算，那确实抽了）。
+  # 它仍是 proxy，真正的把关是人看 diff（策略文档的「diff 接受率」）。
+  - "test -f slice.js && test \"$(grep -c RangeError slice.js)\" -le 1"
+failsAtStart: [2]
+maxApprovals: 2
