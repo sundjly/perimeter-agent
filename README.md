@@ -2,7 +2,7 @@
 
 > 一个可完全私有部署的 code agent 运行时，代码与凭据永不出客户网络边界，浏览器只是零安装的操作面。
 
-本仓库是 [`browser-code-agent-strategy.md`](./docs//browser-code-agent-strategy.md) 里工程部分的实现。浏览器 → 网关 → pi → **模型网关** → 上游是一条真实跑通的链路：网关为每个会话生成隔离的 pi HOME，`models.json` 指向模型网关、apiKey 是会话 token，上游凭据只存在于模型网关进程里。git 代理的接线（`insteadOf` 重写）已实现但**未接到 demo 上**，见「边界与已知缺口」。商业动作（客户访谈、融资、付费 POC）不在本仓库范围内。
+本仓库是 [`browser-code-agent-strategy.md`](./docs//browser-code-agent-strategy.md) 里工程部分的实现。浏览器 → 网关 → pi → **模型网关** → 上游是一条真实跑通的链路：网关为每个会话生成隔离的 pi HOME，`models.json` 指向模型网关、apiKey 是会话 token，上游凭据只存在于模型网关进程里。git 代理的接线（`insteadOf` 重写）也已接上 demo，会话启动时经代理 clone、审批通过后真的推到上游。各条铁律的现状见下表与「边界与已知缺口」。商业动作（客户访谈、融资、付费 POC）不在本仓库范围内。
 
 底层 agent 用 [pi](https://github.com/badlogic/pi-mono)（MIT）的 RPC 模式，走策略文档 §5 的**路线 C**。
 
@@ -26,7 +26,7 @@ npm install && npm run demo
 演示用 mock 模型端点，**不需要任何 API key、不需要外网**。这既是钩子测试的前提，也是策略文档要求的「演示环境挂掉时的保险」。接真实模型：`PERIMETER_DEMO_REAL=1 npm run demo`，并按 pi 的常规方式配好 provider。
 
 ```bash
-npm test          # 370 个测试
+npm test          # 387 个测试
 npm run typecheck
 npm run gen:deploy  # 从 config/policy.yaml 重新生成 NetworkPolicy 与策略 ConfigMap
 ```
@@ -157,6 +157,12 @@ runner 更糟，因为完成率是 Phase 1 的验收指标：
   结果不同 —— 而回归基线的全部价值就是可重复。现在验收之前先发 `abort` 并
   等 agent 真的收尾，等不到就在报告里留痕。
 
+## 交接
+
+[docs/handoff.md](docs/handoff.md) —— 给下一个接手的人：读代码的顺序、
+五个从代码里看不出来的设计判断、十条会静默失败的坑、以及「什么验过 /
+什么没验 / 各自缺什么」的状态清单。
+
 ## Review 记录
 
 每个功能的流程是「实现 → subagent review → 修复 → commit」。覆盖情况、
@@ -195,7 +201,7 @@ docker 后端的实测结论（`tests/docker-backend.test.ts`，无 docker 时�
 **整条 kubectl 路径未在真实集群跑过。** 离线能证的已经证了：渲染产物通过 Kubernetes v1.31.0 官方 JSON schema 校验（字段名与类型层面）、Pod 与 NetworkPolicy 的 label/namespace 一致、sessionId 规范化后满足 DNS-1123 与 label 的长度约束。
 但 schema 有明确盲区——枚举值写错、名字非法、`containers: []` 它都放行；准入控制器、配额、runtimeClass 是否存在、镜像能否拉取更在覆盖之外。部署时 `deploy/` 下的三份清单都要 apply：`policy-configmap.yaml`（策略，由 `npm run gen:policy-cm` 从 `config/policy.yaml` 生成）、`networkpolicy.yaml`（egress，由 `npm run gen:netpol` 生成）、以及每会话的 Pod（由网关在运行时渲染）。前两份是生成物，改策略后要重新生成——有测试守着漂移。所以「每会话独占沙箱」在 docker 后端下是运行中的事实，在 K8s 形态下仍然只是「代码写了、没验过」。另外镜像必须含 `tar`（`kubectl cp` 走 exec+tar），客户自带的 distroless 镜像会让整条路径断掉。
 
-**接线：模型网关已接，git 代理未接到 demo：**
+**接线：模型网关与 git 代理都已接上 demo：**
 
 网关会为每个会话生成沙箱侧配置（`src/gateway/sandbox-config.ts`）：`models.json` 的 baseUrl 指向模型网关、apiKey 写会话 token；git 的 `insteadOf` 规则把上游 SCM 重写到 git 代理并关掉本地 credential helper。
 
