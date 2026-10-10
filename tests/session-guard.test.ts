@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -47,7 +48,6 @@ function gatedSession(): { session: Session; release: () => void; events: Client
 		workspace: join(dir, "ws"),
 		policyFile: join(REPO, "config/policy.yaml"),
 		audit,
-		piArgs: ["--no-session"],
 		backend,
 		send: (ev) => events.push(ev),
 	});
@@ -74,7 +74,7 @@ test("pi 未启动时 prompt 排队而不是下发", async () => {
 	const { session, release, events } = gatedSession();
 	void session.start();
 	await new Promise((r) => setTimeout(r, 30));
-	session.handle({ type: "prompt", text: "早到的 prompt" });
+	session.handle({ type: "prompt", requestId: randomUUID(), text: "早到的 prompt" });
 	// 排队意味着此刻不该有任何 prompt 的审计条目
 	assert.ok(!events.some((e) => e.type === "audit.entry" && e.entry.kind === "prompt"));
 	void release;
@@ -84,10 +84,10 @@ test("abort 会清掉排队的 prompt —— 用户按了停止，队列就不�
 	const { session, release, events } = gatedSession();
 	void session.start();
 	await new Promise((r) => setTimeout(r, 30));
-	session.handle({ type: "prompt", text: "先排一条" });
+	session.handle({ type: "prompt", requestId: randomUUID(), text: "先排一条" });
 	session.handle({ type: "abort" });
 	// 队列被清空后再灌满上限也不该告警：说明之前那条已经不在队里了
-	for (let i = 0; i < 32; i++) session.handle({ type: "prompt", text: `${i}` });
+	for (let i = 0; i < 32; i++) session.handle({ type: "prompt", requestId: randomUUID(), text: `${i}` });
 	assert.ok(!events.some((e) => e.type === "error" && e.message.includes("排队消息过多")));
 	void release;
 });
@@ -96,7 +96,7 @@ test("排队有上限，不会被无限 push 撑爆", async () => {
 	const { session, release, events } = gatedSession();
 	void session.start();
 	await new Promise((r) => setTimeout(r, 30));
-	for (let i = 0; i < 40; i++) session.handle({ type: "prompt", text: `第 ${i} 条` });
+	for (let i = 0; i < 40; i++) session.handle({ type: "prompt", requestId: randomUUID(), text: `第 ${i} 条` });
 	assert.ok(
 		events.some((e) => e.type === "error" && e.message.includes("排队消息过多")),
 		"超过上限应当告知客户端，而不是静默囤积",

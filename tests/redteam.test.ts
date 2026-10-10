@@ -86,7 +86,7 @@ test("已声明的边界：命令黑名单挡不住有意的绕过 —— 真边
 	// **这里只能断言到清单层面** —— 生成的 NetworkPolicy 不放通它。
 	// 运行时是否真的拦住，取决于清单被部署到一个支持 NetworkPolicy 的集群，
 	// 而那一步尚未在真实 K8s 上验证过（见 README 的「边界与已知缺口」）。
-	assert.deepEqual(POLICY.egressAllowlist, ["model-gateway.internal", "git-proxy.internal"]);
+	assert.deepEqual(POLICY.egressAllowlist, ["git-proxy.internal"]);
 	assert.ok(!POLICY.egressAllowlist.includes("evil.example.com"));
 });
 

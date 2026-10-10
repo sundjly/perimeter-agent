@@ -7,6 +7,7 @@ import { AuditLog } from "../audit/log.ts";
 import type { ClientCommand, ClientEvent, Role } from "../protocol/types.ts";
 import type { ExecutionBackend } from "./execution-backend.ts";
 import type { SandboxWiring } from "./sandbox-config.ts";
+import type { ModelGateway } from "../runtime/models.ts";
 import { Session } from "./session.ts";
 
 export interface GatewayConfig {
@@ -19,25 +20,12 @@ export interface GatewayConfig {
 	workspaceRoot: string;
 	stateRoot?: string;
 	webRoot: string;
-	piBin?: string;
-	piArgs?: string[];
-	/**
-	 * 传给 pi 子进程的环境变量。**刻意不默认继承 process.env** ——
-	 * pi 会执行 agent 的 bash 工具，继承等于把网关的共享 token 与模型 key
-	 * 一并交给 agent，一句 env 就拿到了。
-	 */
-	piEnv?: NodeJS.ProcessEnv;
+	model?: ModelGateway;
 	approvalTimeoutMs?: number;
 	/** 会话空闲多久后回收（连同 pi 进程） */
 	idleTimeoutMs?: number;
 	/** 同时存活的会话上限，防止一条 token 把节点打满 */
 	maxSessions?: number;
-	/**
-	 * 断线续接的事件缓冲条数。默认 2000。
-	 * 缓冲满了最老的事件会被挤掉，续接时客户端会收到 session.gap ——
-	 * 调小它等于让「断线久了会丢记录」更早发生。
-	 */
-	backlogSize?: number;
 	/** 每个会话可用的 repo/team。策略作用域必须由服务端决定，不能让客户端自选 */
 	resolveScope?: (actor: string) => { repo: string; team: string };
 	/**
@@ -95,12 +83,12 @@ export class Gateway {
 	constructor(cfg: GatewayConfig) {
 		this.#cfg = cfg;
 		this.#webRoot = resolve(cfg.webRoot);
-		// 代理 token 会写进沙箱可读的 models.json。它若等于网关 token，
-		// agent 就能连回网关、以任意 actor 接入会话并批准自己挂起的审批 ——
-		// 等于把审批门的钥匙交给被审批的一方。这条必须在启动时炸掉。
-		if (cfg.wiring && cfg.wiring.proxyToken === cfg.token) {
-			throw new Error("wiring.proxyToken 不能等于网关 token：它会写进沙箱可读的配置，agent 读到就能连回网关批准自己的审批");
+		// 凭据域必须分开；沙箱的 git token 不能访问模型或会话网关。
+		const modelToken = cfg.model?.token ?? cfg.wiring?.proxyToken;
+		if (modelToken === cfg.token || cfg.wiring?.gitProxyToken === cfg.token) {
+			throw new Error("模型/git 代理 token 不能等于网关 token：凭据域必须分开");
 		}
+		if (modelToken && modelToken === cfg.wiring?.gitProxyToken) throw new Error("模型 token 不能与 gitProxyToken 相同");
 		mkdirSync(cfg.workspaceRoot, { recursive: true });
 		this.#audit = AuditLog.open(cfg.auditFile);
 
@@ -202,6 +190,7 @@ export class Gateway {
 			} catch (err) {
 				this.#auditLeak(id, owner, err);
 			}
+			for (const conn of transports.get(session) ?? []) conn.ws.close(idle ? 1012 : 4003, idle ? "空闲会话请重连" : "会话已终止");
 			// close() 可能在 await 期间跑完并关掉了审计 fd
 			if (this.#closed) return;
 		}
@@ -243,11 +232,15 @@ export class Gateway {
 	}
 
 	#onConnection(ws: WebSocket, req: IncomingMessage): void {
+		try { this.#acceptConnection(ws, req); } catch { closeWith(ws, "会话接入失败"); }
+	}
+
+	#acceptConnection(ws: WebSocket, req: IncomingMessage): void {
 		const url = new URL(req.url ?? "/", "http://localhost");
 		const actor = url.searchParams.get("actor") ?? "demo@local";
 		const requested = url.searchParams.get("session");
 
-		if (requested && !SESSION_ID.test(requested)) {
+		if (requested !== null && !SESSION_ID.test(requested)) {
 			// sessionId 参与工作区路径拼接：`../../..` 能把 agent 的 cwd
 			// 指到网关主机上任意目录，顺带让所有按仓库相对路径写的策略脱靶
 			closeWith(ws, "非法的 session id");
@@ -255,11 +248,10 @@ export class Gateway {
 		}
 
 		if (requested) {
-			const ownerFile = join(this.#cfg.stateRoot ?? join(this.#cfg.workspaceRoot, "..", "state"), "sessions", requested, "owner.json");
-			const metaFile = join(this.#cfg.stateRoot ?? join(this.#cfg.workspaceRoot, "..", "state"), "sessions", requested, "meta.json");
-			const permitted = existsSync(metaFile) ? Object.hasOwn(JSON.parse(readFileSync(metaFile, "utf8")).members, actor) : !existsSync(ownerFile) || JSON.parse(readFileSync(ownerFile, "utf8")).actor === actor;
-			if (!permitted) { closeWith(ws, "无权接入该会话"); return; }
+			const metaFile = join(this.#cfg.stateRoot ?? this.#cfg.workspaceRoot + ".state", "sessions", requested, "meta.json");
+			if (existsSync(metaFile) && !Object.hasOwn(JSON.parse(readFileSync(metaFile, "utf8")).members, actor)) { closeWith(ws, "无权接入该会话"); return; }
 		}
+
 		const existing = requested ? this.#sessions.get(requested) : undefined;
 		if (existing) {
 			if (!roleOf(metas.get(existing)!.data, actor)) {
@@ -278,14 +270,13 @@ export class Gateway {
 		}
 
 		const sessionId = requested ?? randomUUID();
-		const ownerDir = join(this.#cfg.stateRoot ?? join(this.#cfg.workspaceRoot, "..", "state"), "sessions", sessionId);
+		const ownerDir = join(this.#cfg.stateRoot ?? this.#cfg.workspaceRoot + ".state", "sessions", sessionId);
 		mkdirSync(ownerDir, { recursive: true });
-		writeFileSync(join(ownerDir, "owner.json"), JSON.stringify({ actor }));
 		// 策略作用域由服务端决定：客户端自选 repo/team 等于自选适用规则
 		const scope = this.#cfg.resolveScope?.(actor) ?? { repo: "default", team: "default" };
 		const metaFile = join(ownerDir, "meta.json");
 		const metadata: Meta = existsSync(metaFile) ? JSON.parse(readFileSync(metaFile, "utf8")) : { id: sessionId, owner: actor, ...scope, createdAt: new Date().toISOString(), members: { [actor]: "owner" } };
-		writeFileSync(metaFile, JSON.stringify(metadata));
+		if (!existsSync(metaFile)) { writeFileSync(metaFile + ".tmp", JSON.stringify(metadata)); renameSync(metaFile + ".tmp", metaFile); }
 		const session = new Session({
 			sessionId,
 			actor: metadata.owner,
@@ -295,11 +286,8 @@ export class Gateway {
 			stateDirectory: ownerDir,
 			policyFile: this.#cfg.policyFile,
 			audit: this.#audit,
-			piBin: this.#cfg.piBin,
-			piArgs: this.#cfg.piArgs,
-			piEnv: this.#cfg.piEnv,
+			model: this.#cfg.model,
 			approvalTimeoutMs: this.#cfg.approvalTimeoutMs,
-			backlogSize: this.#cfg.backlogSize,
 			wiring: this.#cfg.wiring,
 			// HOME 放在 workspace 之外：放在里面的话，agent 一句
 			// git add -A && git commit 就把含 token 的 .gitconfig 提交进仓库
@@ -376,9 +364,8 @@ function attach(ws: WebSocket, session: Session, actor: string): void {
 			if (role !== "owner" || typeof cmd.actor !== "string" || !cmd.actor || cmd.actor === meta.data.owner || (cmd.type === "share" && !["editor", "viewer"].includes(cmd.role))) {
 				ws.send(JSON.stringify({ event: { type: "error", code: "command_failed", message: "非法共享命令或无权共享" } })); return;
 			}
-			const members = { ...meta.data.members };
-			if (cmd.type === "share") members[cmd.actor] = cmd.role;
-			else delete members[cmd.actor];
+			const members = cmd.type === "share" ? { ...meta.data.members, [cmd.actor]: cmd.role } : { ...meta.data.members };
+			if (cmd.type === "unshare") delete members[cmd.actor];
 			writeFileSync(meta.file + ".tmp", JSON.stringify({ ...meta.data, members })); renameSync(meta.file + ".tmp", meta.file);
 			meta.data.members = members;
 			for (const client of set) if (!roleOf(meta.data, client.actor)) { set.delete(client); client.ws.close(4003, "共享已撤销"); }
@@ -397,20 +384,20 @@ function attach(ws: WebSocket, session: Session, actor: string): void {
 	// 全部被「seq <= state.seq」的去重逻辑丢掉 —— 断线期间的事件实际补不回来。
 	ws.send(JSON.stringify({ type: "control", control: "attached", lastSeq: session.lastSeq }));
 	conn.overflow = true;
-	void session.snapshotFrame().then((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => ws.close());
+	void session.snapshotFrame((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => ws.close());
 }
 
 function broadcast(session: Session, event: ClientEvent, seq: number, target?: unknown): void {
 	for (const conn of transports.get(session) ?? []) {
 		if (target && conn !== target) continue;
-		const personalized = event.type === "session.snapshot" ? { ...event, view: { ...event.view, role: metas.get(session)!.data.members[conn.actor], participants: participants(session) } } : event;
+		const personalized = event.type === "session.snapshot" ? { ...event, view: { ...event.view, role: roleOf(metas.get(session)!.data, conn.actor), participants: participants(session) } } : event.type === "session.presence" ? { ...event, role: roleOf(metas.get(session)!.data, conn.actor) } : event;
 		const payload = JSON.stringify({ seq, event: personalized });
 		if (conn.ws.readyState !== conn.ws.OPEN) continue;
 		if (conn.overflow) { if (event.type === "error" && conn.queue.length < 100) conn.queue.push(payload); continue; }
 		if (conn.queue.length >= 100) {
 			conn.queue.length = 0;
 			conn.overflow = true;
-			void session.snapshotFrame().then((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => conn.ws.close());
+			void session.snapshotFrame((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => conn.ws.close());
 		} else { conn.queue.push(payload); drain(conn); }
 	}
 }
@@ -454,11 +441,7 @@ if (process.argv[1] && import.meta.filename === process.argv[1]) {
 		auditFile: process.env.PERIMETER_AUDIT_FILE ?? join(root, "audit-data/audit.jsonl"),
 		workspaceRoot: process.env.PERIMETER_WORKSPACES ?? join(root, "workspaces"),
 		webRoot: join(root, "web"),
-		piArgs: process.env.PERIMETER_PI_ARGS?.split(" ").filter(Boolean),
-		// 显式白名单：pi 只拿到跑起来必需的变量，网关的 token 不在其中
-		// 刻意不传 HOME：这个入口没配 wiring，传了的话 agent 一句
-		// cat ~/.pi/agent/models.json 就拿到操作员真实的 provider API key
-		piEnv: { PATH: process.env.PATH, LANG: process.env.LANG },
+		model: { baseUrl: process.env.PERIMETER_MODEL_GATEWAY_URL ?? "http://127.0.0.1:8080/v1", token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: process.env.PERIMETER_MODEL ?? "default" },
 	});
 	const port = await gw.listen();
 	console.log(`网关已启动 http://127.0.0.1:${port}/?token=${token}`);

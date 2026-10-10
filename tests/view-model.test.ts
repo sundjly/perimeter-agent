@@ -20,3 +20,10 @@ test("网页、第二标签与 CLI 从同一快照和事件得到相同状态", 
 	assert.deepEqual(states[0], states[1]);
 	assert.deepEqual(states[1], states[2]);
 });
+
+test("已接入的 editor 降级 viewer 时，presence 立即更新自己的角色", () => {
+	const editor = { ...initialState(), role: "editor" as const };
+	const viewer = reduce(editor, { type: "session.presence", participants: [], role: "viewer" });
+	assert.equal(viewer.role, "viewer");
+	assert.equal(editor.role, "editor");
+});

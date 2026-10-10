@@ -5,10 +5,10 @@
   "type": "module",
   "description": "可完全私有部署的 code agent 运行时 —— 代码与凭据永不出客户网络边界，浏览器只是零安装的操作面",
   "engines": {
-    "node": ">=22.18"
+    "node": ">=22.19"
   },
   "scripts": {
-    "test": "node --test \"tests/**/*.test.ts\"",
+    "test": "node --test --test-reporter=spec \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "crossverify": "node --test tests/sigv4-crossverify.test.ts",
     "gateway": "node src/gateway/server.ts",

@@ -9,6 +9,6 @@ prompt: |
 verify:
   - node --test --experimental-test-coverage --test-coverage-lines=90
   # 删光测试文件时覆盖率命令同样退出 0：没有文件被加载，阈值无从判起
-  - "node --test 2>&1 | grep -qE '^ℹ pass [2-9]'"
+  - "node --test --test-reporter=spec 2>&1 | grep -qE '^ℹ pass [2-9]'"
 failsAtStart: [0, 1]
 maxApprovals: 2

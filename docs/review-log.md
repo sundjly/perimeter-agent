@@ -108,3 +108,9 @@ reviewer 的其余各条独立核过，大部分成立并已修：预检位置�
 4. **骗人的旋钮。** `issueSessionToken`（两个代理只认静态 token，签名让人以为
    能按会话签发）、`reapOrphans`/`onCleanupError`（零调用方却写进了 commit
    message）、`piBin`（被 backend 抽象架空后传了也没用）。留着比没有更糟。
+
+## Pi Durable 重构（M0–M7，2026-10-11）
+
+按规格顺序逐里程碑 subagent review、修复、npm test/typecheck 全绿并单独提交，不 push。审查发现并修复：依赖精确版本守卫、审批决定漏审计/等待异常、Docker HOME、持久 owner gate、K8s 远程 clone、启动关闭竞态与审计失败清理、快照游标/同步入队、原型成员越权、请求 id 命名空间碰撞、角色降级 UI、CLI 历史与实时审批输出、wss 保留。最终补充 NodeExecutionEnv 环境继承与校验先于 beforeTool 的真实源码差异，并以负面验证守住。
+
+实际 demo 三段、两个浏览器标签与 CLI、viewer 页面/服务端拒绝、kill -9 恢复已验证。守卫变异覆盖凭据、角色、稳定前缀/tools、确定性拒绝、亲和透传、后台压缩、命中率与 XSS；改坏变红后恢复。真实 Docker/K8s、生产 egress、真实模型/缓存收益与可信身份未验证/未做，详见重构规格 §9，未把离线绿灯描述成生产实证。

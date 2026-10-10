@@ -1,8 +1,10 @@
 import { cpSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { WebSocket } from "ws";
 import { type ExecutionBackend, LocalBackend, TIMEOUT_EXIT } from "../gateway/execution-backend.ts";
 import { Gateway } from "../gateway/server.ts";
+import type { ModelGateway } from "../runtime/models.ts";
 import type { ClientEvent } from "../protocol/types.ts";
 import type { TaskSpec } from "./suite.ts";
 
@@ -37,16 +39,8 @@ export interface RunOptions {
 	reposRoot: string;
 	/** 本次运行的临时根目录（工作区与审计日志都落在这里） */
 	runRoot: string;
-	piArgs: string[];
-	piEnv: NodeJS.ProcessEnv;
-	/**
-	 * 验收命令的执行环境。不给则按 piEnv 构造 LocalBackend。
-	 *
-	 * ⚠️ 自己传 LocalBackend 时**必须把 piEnv 传给它的构造函数**：
-	 * Session 只在 backend 缺省时才注入 piEnv（`opts.backend ?? new LocalBackend(opts.piEnv)`），
-	 * 传了自定义实例就绕过那一步，pi 会因为读不到 models.json 而报
-	 * 「Unknown provider」—— 症状离原因很远。
-	 */
+	model: ModelGateway;
+	/** 验收执行环境；local 无隔离，生产传 docker/kubectl。 */
 	backend?: ExecutionBackend;
 	approvals?: ApprovalMode;
 }
@@ -104,6 +98,7 @@ export async function runTask(task: TaskSpec, opts: RunOptions): Promise<TaskRes
 	const started = Date.now();
 	const sessionId = task.id;
 	const result: TaskResult = {
+		cacheHitRate: null,
 		id: task.id,
 		type: task.type,
 		completed: false,
@@ -118,7 +113,7 @@ export async function runTask(task: TaskSpec, opts: RunOptions): Promise<TaskRes
 	const workspace = materialize(task, opts, sessionId);
 	const workspaceRoot = join(opts.runRoot, "workspaces");
 	// 缺省时自己构造，把 piEnv 一并交给它 —— 见 RunOptions.backend 上的警告
-	const backend = opts.backend ?? new LocalBackend(opts.piEnv);
+	const backend = opts.backend ?? new LocalBackend();
 	// 验收命令的上限沿用任务的墙钟上限。硬编码一个更小的值会让慢机器上的
 	// 覆盖率任务超时，而超时和「测试没过」在退出码上分不开
 	const verifyTimeoutMs = Math.min(task.timeoutMs, 300_000);
@@ -142,9 +137,9 @@ export async function runTask(task: TaskSpec, opts: RunOptions): Promise<TaskRes
 		policyFile: join(opts.repoRoot, "config/policy.yaml"),
 		auditFile: join(opts.runRoot, `audit-${task.id}.jsonl`),
 		workspaceRoot,
+		stateRoot: join(opts.runRoot, "state", randomUUID()),
 		webRoot: join(opts.repoRoot, "web"),
-		piArgs: opts.piArgs,
-		piEnv: opts.piEnv,
+		model: opts.model,
 		backend,
 		approvalTimeoutMs: Math.min(task.timeoutMs, 60_000),
 	});
@@ -214,7 +209,7 @@ export async function runTask(task: TaskSpec, opts: RunOptions): Promise<TaskRes
 				if (pre.ok) throw new PrecheckError(`起点预检失败：verify[${i}] 在 agent 动手之前就通过了（${command}）`);
 			}
 
-			socket.send(JSON.stringify({ type: "prompt", text: task.prompt }));
+			socket.send(JSON.stringify({ type: "prompt", text: task.prompt, requestId: randomUUID() }));
 			// willRetry 必须查：agent.end 带它为 true 时 agent 还会继续，
 			// 只认事件名的话会在半道上收尾，把「还没做完」记成「做完了没通过」
 			const done = () => events.some((e) => e.type === "agent.end" && !e.willRetry);

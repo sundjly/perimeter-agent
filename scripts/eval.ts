@@ -13,9 +13,8 @@ import { loadSuite } from "../src/evals/suite.ts";
  *   node scripts/eval.ts --task range-sum-off-by-one --approve
  *   node scripts/eval.ts --json report.json
  *
- * 用的是**你本机的 pi 配置**（~/.pi/agent/models.json），所以要先能
- * 正常跑 pi。没有模型凭据就跑不出基线数字 —— 这是设计如此：
- * 完成率脱离具体模型没有意义。
+ * 模型配置来自可信网关的环境变量，不读取沙箱或全局 pi 配置。
+ * 没有模型凭据不能跑出基线，完成率须对应具体模型。
  *
  * 只支持 local 后端：验收命令因此在本机跑，没有隔离。
  * docker / kubectl 形态请直接调 runTask 并传对应 backend ——
@@ -41,13 +40,8 @@ if (tasks.length === 0) {
 	process.exit(2);
 }
 
-const piArgs = ["--no-session"];
-if (provider) piArgs.push("--provider", provider);
-if (model) piArgs.push("--model", model);
-
 const runRoot = mkdtempSync(join(tmpdir(), "perimeter-eval-"));
-const piEnv = { ...process.env };
-const backend = new LocalBackend(piEnv);
+const backend = new LocalBackend();
 // 警告要在**跑之前**打。放到报告末尾的话，人已经看到数字了才被告知
 // 那批数字是在无隔离环境下产生的 —— 顺序决定它是提醒还是免责声明
 console.error(`⚠ ${backend.kind} 后端：验收命令以你自己的身份、在本机直接跑 agent 写的代码，没有隔离`);
@@ -59,8 +53,7 @@ for (const task of tasks) {
 		repoRoot: REPO,
 		reposRoot: join(REPO, "evals/repos"),
 		runRoot,
-		piArgs,
-		piEnv,
+		model: { baseUrl: process.env.PERIMETER_MODEL_GATEWAY_URL ?? "http://127.0.0.1:8080/v1", token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: model ?? process.env.PERIMETER_MODEL ?? "default", provider },
 		backend,
 		approvals,
 	});

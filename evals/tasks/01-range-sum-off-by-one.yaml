@@ -9,6 +9,6 @@ verify:
   - node --test
   # 光看退出码不够：`node --test` 找不到任何测试文件时退出码是 0，
   # 于是「删掉 sum.test.js」就能拿到完成。这条数实际跑过的用例
-  - "node --test 2>&1 | grep -qE '^ℹ pass [1-9]'"
+  - "node --test --test-reporter=spec 2>&1 | grep -qE '^ℹ pass [1-9]'"
 failsAtStart: [0, 1]
 maxApprovals: 2

@@ -94,7 +94,7 @@ test("路径规则覆盖所有非只读工具，而不是硬编码的 write/edit
 
 test("只读工具不触发路径审批，否则每次读 package.json 都要人批一次", () => {
 	assert.equal(std.evaluate({ tool: "read", path: "package.json" }, CTX).decision, "allow");
-	assert.equal(std.evaluate({ tool: "grep", path: ".env" }, CTX).decision, "allow");
+	assert.equal(std.evaluate({ tool: "read", path: ".env" }, CTX).decision, "allow");
 	assert.equal(std.evaluate({ tool: "write", path: "package.json" }, CTX).decision, "require_approval");
 });
 
@@ -225,7 +225,7 @@ test("策略文件写错必须在加载时炸掉，而不是带着静默失效�
 });
 
 test("egress allowlist 作为沙箱网络策略的唯一事实来源被读出", () => {
-	assert.deepEqual(std.egressAllowlist, ["model-gateway.internal", "git-proxy.internal"]);
+	assert.deepEqual(std.egressAllowlist, ["git-proxy.internal"]);
 });
 
 test("egress 校验最严：类型写错或放通一切都必须启动失败", () => {
@@ -238,7 +238,7 @@ test("egress 校验最严：类型写错或放通一切都必须启动失败", (
 
 test("egress allowlist 返回副本，外部改动不影响引擎", () => {
 	std.egressAllowlist.push("evil.example.com");
-	assert.deepEqual(std.egressAllowlist, ["model-gateway.internal", "git-proxy.internal"]);
+	assert.deepEqual(std.egressAllowlist, ["git-proxy.internal"]);
 });
 
 test("空策略不崩溃", () => {

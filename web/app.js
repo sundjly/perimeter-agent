@@ -19,7 +19,7 @@ function render(state) {
 	$("usage").textContent = `token ${state.usage.total} · 缓存 ${state.usage.cacheHitRate == null ? "—" : (100 * state.usage.cacheHitRate).toFixed(1) + "%"}`;
 	const stream = $("stream");
 	const children = [];
-	for (const message of state.messages) children.push({ order: message.order ?? 0, element: node("div", `${message.actor ?? (message.role === "user" ? "用户" : "助手")}\n${message.text}`, `msg ${message.role}`) });
+	for (const message of state.messages) if (message.text || message.thinking) children.push({ order: message.order ?? 0, element: node("div", `${message.actor ?? (message.role === "user" ? "用户" : "助手")}\n${message.text}`, `msg ${message.role}`) });
 	for (const tool of state.tools) {
 		const card = node("details", "", `tool ${tool.ok === false ? "deny" : "info"}`);
 		card.open = expanded.has(tool.callId);
@@ -31,7 +31,7 @@ function render(state) {
 		const card = node("div", `${labels.pending} · ${approval.actor ?? "用户"}\n${approval.action.tool}: ${approval.action.command ?? approval.action.path ?? ""}\n${approval.reason}\n${Math.max(0, Math.ceil((approval.expiresAt - Date.now()) / 1000))} 秒 · 无人应答按拒绝处理`, "approval pending");
 		if (state.role !== "viewer") for (const decision of ["allow", "deny"]) {
 			const button = node("button", labels[decision]);
-			button.disabled = Date.now() >= approval.expiresAt;
+			button.disabled = !connected || Date.now() >= approval.expiresAt;
 			button.onclick = () => send({ type: "approve", approvalId: approval.approvalId, decision });
 			card.append(button);
 		}
@@ -39,7 +39,7 @@ function render(state) {
 	}
 	for (const error of state.errors) children.push({ order: Number.MAX_SAFE_INTEGER, element: node("div", error, "deny") });
 	stream.replaceChildren(...children.sort((a, b) => a.order - b.order).map((item) => item.element));
-	$("audit").replaceChildren(...state.audit.map((entry) => node("div", `${entry.at} ${entry.kind} ${entry.summary}`, "audit-row")));
+	$("audit").replaceChildren(...state.audit.map((entry) => node("div", `${entry.at} ${entry.kind} ${entry.actor ?? ""} ${entry.approver ? "审批人 " + entry.approver : ""} ${entry.summary}`, "audit-row")));
 	$("audit-count").textContent = `${state.audit.length} 条`;
 	$("send").textContent = state.streaming ? labels.queue : labels.send;
 	$("send").disabled = $("input").disabled = state.role === "viewer" || !connected;
@@ -51,8 +51,8 @@ function connect() {
 	if (state.sessionId) query.set("session", state.sessionId);
 	ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/?${query}`);
 	ws.onopen = () => { connected = true; render(state); };
-	ws.onmessage = ({ data }) => { const frame = JSON.parse(data); if (frame.event) { state = reduce(state, frame.event); render(state); } };
-	ws.onclose = () => { connected = false; render(state); setTimeout(connect, 1000); };
+	ws.onmessage = ({ data }) => { const frame = JSON.parse(data); if (frame.event) { state = reduce(state, frame.event); if (state.sessionId) { params.set("session", state.sessionId); history.replaceState(null, "", "?" + params.toString()); } render(state); } else if (frame.control === "error") { state = reduce(state, { type: "error", message: frame.message }); render(state); } };
+	ws.onclose = ({ code }) => { connected = false; render(state); if (code !== 4003) setTimeout(connect, 1000); };
 	ws.onerror = () => ws.close();
 }
 function prompt(type) { const text = $("input").value.trim(); if (!text) return; send({ type, text, requestId: crypto.randomUUID() }); $("input").value = ""; }

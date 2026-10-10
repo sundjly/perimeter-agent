@@ -72,7 +72,7 @@ interface Usage {
  * 4. **计量与配额**：按 team 累计 token，超限拒绝。
  *
  * **接入方式**：本网关对沙箱说 OpenAI 兼容协议（/v1/chat/completions），
- * pi 侧用 models.json 的 baseUrl 指过来即可。四条企业通道的差别落在
+ * 可信网关的 pi-ai 模型目录用 baseUrl 指过来即可。四条企业通道的差别落在
  * **认证**与**上游路径**上，由 UpstreamConfig 的 auth/path 表达：
  *
  * - Azure OpenAI：api-key 头 + 原生 OpenAI 兼容面

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -111,8 +112,7 @@ async function startPoisoned(script: unknown[]): Promise<Env> {
 		auditFile,
 		workspaceRoot,
 		webRoot: join(REPO, "web"),
-		piArgs: ["--no-session", "--provider", "mock", "--model", "mock-model"],
-		piEnv: { PATH: process.env.PATH, HOME: home },
+		model: { baseUrl: `http://127.0.0.1:${port}/v1`, token: "dummy", model: "mock-model" },
 		approvalTimeoutMs: 60_000,
 	});
 	cleanups.push(() => gateway.close());
@@ -141,7 +141,7 @@ async function drive(env: Env, prompt: string) {
 		}
 	};
 	await waitFor(() => events.some((e) => e.type === "session.ready"));
-	ws.send(JSON.stringify({ type: "prompt", text: prompt }));
+	ws.send(JSON.stringify({ type: "prompt", requestId: randomUUID(), text: prompt }));
 	return { events, waitFor, ws };
 }
 
@@ -171,7 +171,7 @@ test("被 AGENTS.md 诱导去改 CI 配置：钩子在写入前拦下，文件�
 	const entries = await auditEntries(env.auditFile);
 	const record = entries.find((e) => e.kind === "policy.verdict" && e.verdict === "deny");
 	assert.ok(record, "拒绝必须进审计");
-	assert.match(record!.summary, /\.github\/workflows\/ci\.yml/);
+	assert.equal(record!.path, ".github/workflows/ci.yml");
 });
 
 test("被诱导去 force push：审批门拦下，等人工确认而不是直接执行", async () => {

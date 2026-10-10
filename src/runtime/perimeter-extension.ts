@@ -1,4 +1,4 @@
-import { defineExtension, hook, section, ToolTask, type ToolHooks, type HookApi } from "@earendil-works/pi-durable";
+import { defineExtension, hook, section, ToolTask, GenerationTask, type ToolHooks, type HookApi } from "@earendil-works/pi-durable";
 import type { AuditInput } from "../audit/log.ts";
 import { contentHash } from "../audit/log.ts";
 import type { PolicyEngine } from "../policy/engine.ts";
@@ -28,7 +28,7 @@ export function perimeterExtension(opts: PerimeterOptions) {
 			...(verdict.decision === "allow" ? {} : { rule: verdict.rule }) });
 		if (verdict.decision === "allow") return undefined;
 		if (verdict.decision === "deny") {
-			opts.emit({ type: "policy.denied", action: { tool: action.tool, path: action.path, command: action.command }, rule: verdict.rule, reason: verdict.reason });
+			opts.emit({ type: "policy.denied", callId: call.id, action: { tool: action.tool, path: action.path, command: action.command }, rule: verdict.rule, reason: verdict.reason });
 			return { block: `策略拒绝（${verdict.rule}）：${verdict.reason}` };
 		}
 		opts.audit({ kind: "approval.request", actor, callId: call.id, rule: verdict.rule, summary: `审批 ${action.tool}` });
@@ -41,6 +41,14 @@ export function perimeterExtension(opts: PerimeterOptions) {
 		hooks: [hook(ToolTask, { beforeTool, afterTool: async (call, result, api) => {
 			opts.audit({ kind: "tool.result", actor: await opts.actor(api), callId: call.id, tool: call.name, ok: !result.isError, summary: `工具结果 ${call.name}` });
 			return undefined;
+		} }), hook(GenerationTask, { afterResponse: async (message, api) => {
+			// 参数校验先于 beforeTool，模型工具意图也要过策略并留下 hash。
+			for (const call of message.content) if (call.type === "toolCall") {
+				const action = toActionDescriptor(call.name, call.arguments);
+				const verdict = opts.policy.evaluate(action, { repo: opts.repo, team: opts.team });
+				opts.audit({ kind: "policy.verdict", actor: await opts.actor(api), callId: call.id, tool: action.tool, path: action.path, command: action.command,
+					summary: `工具意图预检 ${action.tool}`, verdict: verdict.decision, argsHash: contentHash(call.arguments), ...(verdict.decision === "allow" ? {} : { rule: verdict.rule }) });
+			}
 		} })],
 	});
 }

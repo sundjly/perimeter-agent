@@ -35,14 +35,14 @@ spec:
       # 这里，且错误信息离原因很远。这一条要进部署前置条件清单。
       image: CUSTOMER_BUILD_IMAGE
       imagePullPolicy: IfNotPresent
-      # **不能把 pi 作为主进程**：Pod 的 stdin 立即 EOF，pi 随即退出，
+      # **不能把 pi-env serve 作为主进程**：Pod 的 stdin 立即 EOF，daemon 随即退出，
       # restartPolicy: Never 让 Pod 进入 Completed，之后 KubectlBackend 的
       # `kubectl exec` 就无处可 exec 了。主进程只负责让 Pod 活着，
-      # pi 由网关经 exec 拉起（每个会话一次）。
+      # pi-env 由网关经 exec -i 拉起（每个会话一次）。
       command: ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
       workingDir: /workspace
       env:
-        # 会话级配置（models.json + .gitconfig）不走 env，也不走 Secret 卷：
+        # 会话级 git 配置（.gitconfig）不走 env，也不走 Secret 卷：
         # 网关在 Pod Ready 之后用 `kubectl cp` 写进下面的 sandbox-home
         # （见 KubectlBackend.prepare）。选 cp 而不是 Secret 的理由：Secret 要
         # 按会话建、按会话回收，多一套生命周期；而且它会在 K8s API 里留一份
@@ -78,7 +78,7 @@ spec:
         - name: policy
           mountPath: /etc/perimeter
           readOnly: true
-        # 沙箱 HOME。必须可写：readOnlyRootFilesystem 下 pi 要写自身状态，
+        # 沙箱 HOME。必须可写：readOnlyRootFilesystem 下 工具要写临时文件，
         # 网关也要往这里 cp 会话配置。
         # ⚠️ 策略扩展所在的 /opt/perimeter **由镜像提供**（见
         # deploy/sandbox.Dockerfile），不在这里挂 —— ConfigMap 有 1MiB 上限，

@@ -7,7 +7,7 @@ prompt: |
   （query 仍是不带问号的查询串），并让 node --test 继续通过。
 verify:
   - node --test
-  - "node --test 2>&1 | grep -qE '^ℹ pass [1-9]'"
+  - "node --test --test-reporter=spec 2>&1 | grep -qE '^ℹ pass [1-9]'"
   # 判据要精确到调用：注释里提到这个名字不该算数。
   # `test -f` 不能省 —— 文件不存在时 grep 退出 2，取反后反而成了「通过」，
   # 于是删掉 links.js 能同时骗过这条和上面两条

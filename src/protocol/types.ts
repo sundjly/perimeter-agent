@@ -11,7 +11,7 @@ export type ClientEvent =
 	| { type: "session.ready"; sessionId: string; workspace: string; model: string | null }
 	| { type: "session.state"; streaming: boolean; messageCount: number; model: string | null }
 	| { type: "session.snapshot"; view: SessionView }
-	| { type: "session.presence"; participants: Participant[] }
+	| { type: "session.presence"; participants: Participant[]; role?: Role }
 	| { type: "agent.start" }
 	| { type: "agent.end"; willRetry: boolean }
 	| { type: "agent.settled" }
@@ -27,9 +27,9 @@ export type ClientEvent =
 	/** output：累计快照，前端 replace（不是增量） */
 	| { type: "tool.progress"; callId: string; output: string }
 	| { type: "tool.end"; callId: string; ok: boolean; output: string }
-	| { type: "approval.request"; approvalId: string; action: ActionDescriptor; reason: string; expiresAt: number }
+	| { type: "approval.request"; approvalId: string; action: ActionDescriptor; reason: string; expiresAt: number; actor?: string }
 	| { type: "approval.resolved"; approvalId: string; decision: Decision; actor: string }
-	| { type: "policy.denied"; action: ActionDescriptor; rule: string; reason: string }
+	| { type: "policy.denied"; action: ActionDescriptor; rule: string; reason: string; callId?: string }
 	| { type: "audit.entry"; entry: AuditEntryView }
 	/** 累计快照，前端 replace（不是增量，累加会得到天文数字） */
 	| { type: "usage"; usage: Usage }
@@ -84,8 +84,8 @@ export type ErrorCode = "aborted" | "agent_error" | "extension_error" | "command
 
 /** 浏览器 → 网关 */
 export type ClientCommand =
-	| { type: "prompt"; text: string; requestId?: string }
-	| { type: "steer"; text: string; requestId?: string }
+	| { type: "prompt"; text: string; requestId: string }
+	| { type: "steer"; text: string; requestId: string }
 	| { type: "share"; actor: string; role: "editor" | "viewer" }
 	| { type: "unshare"; actor: string }
 	| { type: "abort" }
@@ -130,6 +130,8 @@ export interface AuditEntryView {
 	kind: string;
 	summary: string;
 	verdict?: string;
+	actor?: string;
+	approver?: string;
 }
 
 export type Role = "owner" | "editor" | "viewer";

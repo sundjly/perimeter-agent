@@ -6,7 +6,7 @@ prompt: |
   把它抽成一处，行为保持完全不变（越界、负数、非整数仍抛 RangeError）。
 verify:
   - node --test
-  - "node --test 2>&1 | grep -qE '^ℹ pass [1-9]'"
+  - "node --test --test-reporter=spec 2>&1 | grep -qE '^ℹ pass [1-9]'"
   # 结构判据是 proxy 而非真判据：它数的是 throw 点有几处。
   # 数校验条件本身（`n < 0`）更弱 —— 改个空格写成 `n<0` 就骗过去了；
   # 数 RangeError 至少被测试锁着：三个函数的越界行为都有断言，

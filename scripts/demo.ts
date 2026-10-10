@@ -1,4 +1,4 @@
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,24 +39,10 @@ function waitForPort(proc: { stdout: NodeJS.ReadableStream | null }, what: strin
 	});
 }
 
-// pi 不是 npm 依赖（本仓库只用它的 RPC 模式，不锁版本）。不预检的话，
-// 失败形态是最难排查的那种：banner 与地址照常打印，客户点开链接才收到
-// 「spawn pi ENOENT」—— 演示时看起来一切正常，一开口就死。
-const probe = spawnSync("pi", ["--version"], { encoding: "utf8" });
-if (probe.error || probe.status !== 0) {
-	console.error(
-		"找不到 pi。请先全局安装（实测版本 0.84.2）：\n" +
-			"  npm i -g @earendil-works/pi-coding-agent\n" +
-			"装好后确认 pi 在 PATH 上：pi --version",
-	);
-	process.exit(1);
-}
-
 const TOKEN = process.env.PERIMETER_TOKEN ?? "demo-token";
-// 代理 token 与网关 token 必须不同 —— 演示时这正是最有说服力的一点：
-// 打开沙箱的 models.json，里面那串和浏览器地址栏里的不一样，
-// 说明「连网关的身份」与「访问代理的凭据」是两个域。
+// 模型、git 与浏览器凭据分域；模型 token 只在可信网关。
 const PROXY_TOKEN = process.env.PERIMETER_PROXY_TOKEN ?? "demo-proxy-token";
+const GIT_PROXY_TOKEN = "demo-git-proxy-token";
 const real = process.env.PERIMETER_DEMO_REAL === "1";
 
 // 演示脚本：agent 先改一个源码文件（放行），再试图改 CI（拒绝），最后 push（审批）
@@ -70,16 +56,12 @@ const script = [
 mkdirSync(join(root, "audit-data"), { recursive: true });
 const auditFile = join(root, "audit-data/demo.jsonl");
 const workspaceRoot = mkdtempSync(join(tmpdir(), "perimeter-demo-"));
-const piEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH, LANG: process.env.LANG };
-// 真实模型模式下不接线，pi 需要操作员的 HOME 才能读到常规 provider 配置
-if (real) piEnv.HOME = process.env.HOME;
 
 let wiring:
-	| { proxyToken: string; modelGatewayUrl: string; model: string; gitProxyUrl: string; scmHosts: string[] }
+	| { gitProxyToken: string; proxyToken: string; modelGatewayUrl: string; model: string; gitProxyUrl: string; scmHosts: string[] }
 	| undefined;
 let repoUrl: string | undefined;
 let upstreamRepo: string | undefined;
-let piArgs = process.env.PERIMETER_PI_ARGS?.split(" ").filter(Boolean) ?? [];
 
 if (!real) {
 	// ① mock 模型端点 —— 扮演 Bedrock / Vertex / vLLM 的位置
@@ -138,7 +120,7 @@ if (!real) {
 	const gitProxy = new GitCredentialProxy({
 		port: 0,
 		host: "127.0.0.1",
-		token: PROXY_TOKEN,
+		token: GIT_PROXY_TOKEN,
 		audit: gitAudit,
 		repos: [
 			{
@@ -157,6 +139,7 @@ if (!real) {
 
 	// ⑤ 接线：沙箱只看到两个代理的地址 + 代理 token
 	wiring = {
+		gitProxyToken: GIT_PROXY_TOKEN,
 		proxyToken: PROXY_TOKEN,
 		modelGatewayUrl: `http://127.0.0.1:${modelPort}/v1`,
 		model: "mock-model",
@@ -164,7 +147,6 @@ if (!real) {
 		scmHosts: ["git.internal"],
 	};
 	repoUrl = "https://git.internal/app.git";
-	piArgs = ["--no-session"];
 }
 
 const gw = new Gateway({
@@ -175,8 +157,7 @@ const gw = new Gateway({
 	auditFile,
 	workspaceRoot,
 	webRoot: join(root, "web"),
-	piArgs,
-	piEnv,
+	model: real ? { baseUrl: process.env.PERIMETER_MODEL_GATEWAY_URL ?? "http://127.0.0.1:8080/v1", token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: process.env.PERIMETER_MODEL ?? "default" } : undefined,
 	wiring,
 	repoUrl,
 	approvalTimeoutMs: 120_000,
@@ -185,20 +166,21 @@ const gw = new Gateway({
 
 const port = await gw.listen();
 console.log(`
-演示环境就绪（pi ${probe.stdout.trim()}${real ? "，真实模型" : "，mock 模型，无需凭据"}）
+演示环境就绪（Pi Durable 1.1.0${real ? "，真实模型" : "，mock 模型，无需凭据"}）
 
   打开：http://127.0.0.1:${port}/?token=${TOKEN}
   工作区：${workspaceRoot}
   审计日志：${auditFile}
 ${real ? "" : `
-链路：浏览器 → 网关 → pi（沙箱）→ 模型网关 → mock 模型
+链路：浏览器 / CLI → 网关内 Durable → 模型网关 → mock 模型
                               └→ git 凭据代理 → 上游仓库
 
-会话启动时网关已经经凭据代理 clone 了仓库。三种凭据分处三地：
+会话启动时网关已经经凭据代理 clone 了仓库。凭据分域：
   · 网关 token（${TOKEN}）      —— 浏览器用，沙箱看不到
-  · 代理 token（${PROXY_TOKEN}）—— 沙箱用，只能访问两个代理
+  · 模型代理 token             —— 只在可信网关
+  · git 代理 token              —— 沙箱 HOME，不能访问模型/会话网关
   · 上游 API key 与 git token   —— 只在两个代理进程里，沙箱与浏览器都看不到
-沙箱侧的 models.json 与 .gitconfig 里写的是代理 token，演示时当场打开给客户看。
+沙箱只有 .gitconfig，没有 models.json 或模型 token。
 HOME 在 workspace 之外，agent 的 git commit 带不走它。
 
 审批通过后推送会真的到达上游仓库，可以当场验证：

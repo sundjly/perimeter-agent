@@ -15,14 +15,6 @@ spec:
   # 入站全拒：沙箱不需要被任何人连进来，网关是主动连出去的一侧
   ingress: []
   egress:
-    # 放通 model-gateway.internal（由 config/policy.yaml 的 egress.deny_all_except 生成）
-    - to:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: model-gateway
-      ports:
-        - protocol: TCP
-          port: 8080
     # 放通 git-proxy.internal（由 config/policy.yaml 的 egress.deny_all_except 生成）
     - to:
         - podSelector:

@@ -1,266 +1,61 @@
 import assert from "node:assert/strict";
-import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { after, test } from "node:test";
-import type { PiEvent } from "../src/rpc/types.ts";
-import { PiSession } from "../src/rpc/pi-session.ts";
+import { test } from "node:test";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { fixture } from "./fixtures/durable.ts";
 
-/**
- * 验证 Phase 1（路线 C）确实能拿到钩子级拦截粒度。
- *
- * 策略文档把这条列为 P1·W5 的第一件事：走不通就必须下调 Phase 1 的审计
- * 验收标准（「100% 工具调用有记录、0 例绕过审批门」）。这组测试就是那个
- * 验证的回归形式 —— 用 mock 模型端点驱动真实的模型工具调用，因为
- * tool_call 钩子只由模型工具调用触发，RPC 的 bash 直接命令不经过它。
- */
-
-const REPO = fileURLToPath(new URL("..", import.meta.url));
-const MOCK = join(REPO, "tests/fixtures/mock-model.mjs");
-const EXT = join(REPO, "src/gateway/policy-extension.ts");
-const POLICY = join(REPO, "config/policy.yaml");
-
-const cleanups: (() => void)[] = [];
-after(() => {
-	for (const c of cleanups) c();
-});
-
-interface Harness {
-	session: PiSession;
-	events: PiEvent[];
-	workspace: string;
-	uiRequests: Record<string, unknown>[];
-	waitFor: (pred: () => boolean, ms?: number) => Promise<void>;
-}
-
-async function startMock(script: unknown[]): Promise<{ port: number; proc: ChildProcess }> {
-	const proc = spawn(process.execPath, [MOCK, "0", JSON.stringify(script)], { stdio: ["ignore", "pipe", "inherit"] });
-	cleanups.push(() => proc.kill());
-	const port: number = await new Promise((r) => proc.stdout?.once("data", (d) => r(JSON.parse(d.toString()).port)));
-	return { port, proc };
-}
-
-async function start(script: unknown[], approvalTimeoutMs = 60_000): Promise<Harness> {
-	const { port } = await startMock(script);
-	const home = mkdtempSync(join(tmpdir(), "pihome-"));
-	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
-	writeFileSync(
-		join(home, ".pi", "agent", "models.json"),
-		JSON.stringify({
-			providers: {
-				mock: {
-					baseUrl: `http://127.0.0.1:${port}/v1`,
-					api: "openai-completions",
-					apiKey: "dummy",
-					compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
-					models: [{ id: "mock-model" }],
-				},
-			},
-		}),
-	);
-
-	const workspace = mkdtempSync(join(tmpdir(), "ws-"));
-	const events: PiEvent[] = [];
-	const uiRequests: Record<string, unknown>[] = [];
-	const session = new PiSession({
-		cwd: workspace,
-		args: ["--no-session", "--provider", "mock", "--model", "mock-model", "-e", EXT],
-		env: {
-			...process.env,
-			HOME: home,
-			PERIMETER_POLICY_FILE: POLICY,
-			PERIMETER_APPROVAL_TIMEOUT_MS: String(approvalTimeoutMs),
-			PERIMETER_REPO: "web",
-			PERIMETER_TEAM: "platform",
-		},
-		onEvent: (e) => {
-			events.push(e);
-			if (e.type === "extension_ui_request") uiRequests.push(e as Record<string, unknown>);
-		},
-		onResponse: () => {},
-		onExit: () => {},
+for (const [name, command, allowed] of [
+	["allow：普通命令有判决记录", "echo ok > result.txt", true],
+	["审批超时按拒绝处理", "git push; echo bypass > result.txt", false],
+] as const) test(name, async () => {
+	await fixture([{ tool: "bash", args: { command } }, { text: "done" }], async (host, dir) => {
+		await (await host.submit("执行", "r")).wait(BACKGROUND_CONTEXT);
+		assert.equal(existsSync(join(dir, "workspace/result.txt")), allowed);
+		assert.ok(readFileSync(join(dir, "audit.jsonl"), "utf8").includes('"kind":"policy.verdict"'));
 	});
-	cleanups.push(() => void session.stop());
-
-	const waitFor = async (pred: () => boolean, ms = 15_000) => {
-		const deadline = Date.now() + ms;
-		while (!pred()) {
-			if (Date.now() > deadline) throw new Error("waitFor 超时");
-			await new Promise((r) => setTimeout(r, 20));
-		}
-	};
-	return { session, events, workspace, uiRequests, waitFor };
-}
-
-function dialogs(h: Harness) {
-	return h.uiRequests.filter((r) => r.method === "select");
-}
-
-function audits(h: Harness): Record<string, unknown>[] {
-	return h.uiRequests
-		.filter((r) => r.method === "notify" && String(r.message ?? "").startsWith("@@perimeter-audit@@"))
-		.map((r) => JSON.parse(String(r.message).slice("@@perimeter-audit@@".length)));
-}
-
-function toolEnd(h: Harness): Record<string, unknown> | undefined {
-	return h.events.find((e) => e.type === "tool_execution_end") as Record<string, unknown> | undefined;
-}
-
-test("allow：普通命令照常执行，并留下判决记录", async () => {
-	const h = await start([{ tool: "bash", args: { command: "echo 命中允许分支" } }, { text: "完成" }]);
-	await h.session.request({ type: "prompt", message: "run it" });
-	await h.waitFor(() => toolEnd(h) !== undefined);
-
-	const end = toolEnd(h)!;
-	assert.equal(end.isError, false);
-	assert.match(JSON.stringify(end.result), /命中允许分支/);
-	assert.equal(dialogs(h).length, 0, "allow 不应打扰用户");
-	assert.ok(audits(h).some((a) => a.kind === "hook-armed"), "扩展必须宣告钩子已挂载");
-	assert.equal(audits(h).find((a) => a.kind === "allow")?.kind, "allow");
 });
-
-test("deny：策略拒绝的写入不会落到磁盘上", async () => {
-	const h = await start([
-		{ tool: "write", args: { path: ".github/workflows/evil.yml", content: "on: push" } },
-		{ text: "完成" },
-	]);
-	await h.session.request({ type: "prompt", message: "write it" });
-	await h.waitFor(() => toolEnd(h) !== undefined);
-
-	assert.equal(existsSync(join(h.workspace, ".github/workflows/evil.yml")), false, "被拒绝的写入必须没有实际发生");
-	assert.match(JSON.stringify(toolEnd(h)), /策略拒绝/);
-	assert.equal(dialogs(h).length, 0, "deny 是终局，不问人");
-	const audit = audits(h).find((a) => a.kind === "deny");
-	assert.equal(audit?.rule, "ci-iac-secrets-off-limits");
-});
-
-test("require_approval：拒绝后工具不执行", async () => {
-	const h = await start([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
-	await h.session.request({ type: "prompt", message: "bump deps" });
-	await h.waitFor(() => dialogs(h).length > 0);
-
-	h.session.send({ type: "extension_ui_response", id: dialogs(h)[0]!.id, value: "拒绝" });
-	await h.waitFor(() => toolEnd(h) !== undefined);
-
-	assert.equal(existsSync(join(h.workspace, "package.json")), false);
-	assert.match(JSON.stringify(toolEnd(h)), /未获批准/);
-	const decision = audits(h).find((a) => a.kind === "approval.decision");
-	assert.equal(decision?.approved, false);
-	assert.equal(decision?.timedOut, false);
-});
-
-test("require_approval：批准后工具正常执行", async () => {
-	const h = await start([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
-	await h.session.request({ type: "prompt", message: "bump deps" });
-	await h.waitFor(() => dialogs(h).length > 0);
-
-	h.session.send({ type: "extension_ui_response", id: dialogs(h)[0]!.id, value: "批准" });
-	await h.waitFor(() => toolEnd(h) !== undefined);
-
-	assert.equal(existsSync(join(h.workspace, "package.json")), true);
-	assert.equal(audits(h).find((a) => a.kind === "approval.decision")?.approved, true);
-});
-
-test("审批超时按拒绝处理 —— 无人应答不等于同意", async () => {
-	const h = await start([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }], 1500);
-	await h.session.request({ type: "prompt", message: "bump deps" });
-	await h.waitFor(() => dialogs(h).length > 0);
-	// 刻意不回复
-	await h.waitFor(() => toolEnd(h) !== undefined);
-
-	assert.equal(existsSync(join(h.workspace, "package.json")), false);
-	const decision = audits(h).find((a) => a.kind === "approval.decision");
-	assert.equal(decision?.approved, false);
-	assert.equal(decision?.timedOut, true);
-});
-
-test("审批对话被取消也按拒绝处理", async () => {
-	const h = await start([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
-	await h.session.request({ type: "prompt", message: "bump deps" });
-	await h.waitFor(() => dialogs(h).length > 0);
-
-	h.session.send({ type: "extension_ui_response", id: dialogs(h)[0]!.id, cancelled: true });
-	await h.waitFor(() => toolEnd(h) !== undefined);
-	assert.equal(existsSync(join(h.workspace, "package.json")), false);
-});
-
-test("钩子事件名写错时不会静默放行 —— 这是「0 例绕过」唯一的运行时证据", async () => {
-	// pi 0.84.2 对未知事件名不报错、不发 extension_error，工具照常执行。
-	// 也就是说钩子失效是静默的，只能靠握手信号发现。这条测试锁住这个前提：
-	// 只要没有 hook-armed，网关就该拒绝下发 prompt。
-	const h = await start([{ tool: "bash", args: { command: "echo x" } }, { text: "完成" }]);
-	await h.waitFor(() => audits(h).some((a) => a.kind === "hook-armed"));
-	const armed = audits(h).find((a) => a.kind === "hook-armed")!;
-	assert.equal(typeof armed.rules, "number");
-	assert.ok((armed.rules as number) > 0, "握手要带上实际加载的规则数，空策略同样是危险状态");
-});
-
-test("同一批次里的多个待审批调用被串行 preflight —— 网关的绑定逻辑依赖这个外部行为", async () => {
-	// 绑定本身已改为按 callId 显式关联，不再依赖此不变量；
-	// 但把 pi 的这个行为钉死，将来它变化时能第一时间发现。
-	const h = await start([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
-	await h.session.request({ type: "prompt", message: "改" });
-	await h.waitFor(() => dialogs(h).length > 0);
-	await new Promise((r) => setTimeout(r, 300));
-	assert.equal(dialogs(h).length, 1, "同时挂起的审批对话应只有一个");
-	h.session.send({ type: "extension_ui_response", id: dialogs(h)[0]!.id, value: "拒绝" });
-	await h.waitFor(() => toolEnd(h) !== undefined);
-});
-
-test("前提复核：pi 对未知事件名静默失败 —— 钩子不生效且无任何错误信号", async () => {
-	// 这条不是在测我们的代码，而是在固定 hook-armed 握手存在的理由。
-	// 若哪天 pi 改为对未知事件名报错，这条会失败，届时可以简化握手逻辑。
-	const { port } = await startMock([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
-	const home = mkdtempSync(join(tmpdir(), "pihome-"));
-	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
-	writeFileSync(
-		join(home, ".pi", "agent", "models.json"),
-		JSON.stringify({
-			providers: {
-				mock: {
-					baseUrl: `http://127.0.0.1:${port}/v1`,
-					api: "openai-completions",
-					apiKey: "dummy",
-					compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
-					models: [{ id: "mock-model" }],
-				},
-			},
-		}),
-	);
-	const workspace = mkdtempSync(join(tmpdir(), "ws-"));
-	const events: PiEvent[] = [];
-	const session = new PiSession({
-		cwd: workspace,
-		args: [
-			"--no-session",
-			"--provider",
-			"mock",
-			"--model",
-			"mock-model",
-			"-e",
-			join(REPO, "tests/fixtures/wrong-hook-ext.ts"),
-		],
-		env: { ...process.env, HOME: home },
-		onEvent: (e) => events.push(e),
-		onResponse: () => {},
-		onExit: () => {},
+test("deny：策略拒绝的写入不会落盘", async () => {
+	await fixture([{ tool: "write", args: { path: ".github/workflows/ci.yml", content: "bad" } }, { text: "done" }], async (host, dir) => {
+		await (await host.submit("写", "r")).wait(BACKGROUND_CONTEXT);
+		assert.equal(existsSync(join(dir, "workspace/.github/workflows/ci.yml")), false);
 	});
-	cleanups.push(() => void session.stop());
+});
+for (const decision of ["allow", "deny"] as const) test(`审批 ${decision}：决定之前不执行，批准人留痕`, async () => {
+	await fixture([{ tool: "bash", args: { command: "git push; echo approved > result.txt" } }, { text: "done" }], async (host, dir, _reopen, events) => {
+		const submission = await host.submit("推送", "r");
+		while (!events.some((event) => event.type === "approval.request")) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(existsSync(join(dir, "workspace/result.txt")), false);
+		const request = events.find((event) => event.type === "approval.request")!;
+		if (request.type !== "approval.request") throw new Error("缺少审批");
+		await host.approvals.decide(request.approvalId, decision, "bob");
+		await submission.wait(BACKGROUND_CONTEXT);
+		assert.equal(existsSync(join(dir, "workspace/result.txt")), decision === "allow");
+		assert.ok(readFileSync(join(dir, "audit.jsonl"), "utf8").includes('"approver":"bob"'));
+	}, 2000);
+});
+test("取消挂起审批时工具不执行", async () => {
+	await fixture([{ tool: "bash", args: { command: "git push; touch bypass" } }, { text: "done" }], async (host, dir, _reopen, events) => {
+		const submission = await host.submit("推送", "r");
+		while (!events.some((event) => event.type === "approval.request")) await new Promise((resolve) => setTimeout(resolve, 5));
+		await host.abort();
+		await submission.wait(BACKGROUND_CONTEXT);
+		assert.equal(existsSync(join(dir, "workspace/bypass")), false);
+	}, 2000);
+});
+test("移除扩展拒绝 prompt，守卫不依赖旧握手", async () => {
+	await fixture([], async (host) => {
+		await host.root.configure({ extensions: [] }, BACKGROUND_CONTEXT);
+		await assert.rejects(host.submit("执行", "r"), /策略扩展未选中/);
+	});
+});
 
-	await session.request({ type: "prompt", message: "改" });
-	const deadline = Date.now() + 15_000;
-	while (!events.some((e) => e.type === "tool_execution_end")) {
-		if (Date.now() > deadline) throw new Error("等待工具执行超时");
-		await new Promise((r) => setTimeout(r, 20));
-	}
-
-	// 三条断言合起来说明：注册没生效、pi 不报错、工具照常执行
-	assert.equal(existsSync(join(workspace, "package.json")), true, "钩子没生效，写入照常发生");
-	assert.ok(!events.some((e) => e.type === "extension_error"), "pi 不会为未知事件名发 extension_error");
-	assert.ok(
-		!events.some((e) => e.type === "extension_ui_request"),
-		"没有任何审批对话 —— 静默全量放行正是 hook-armed 握手要防的状态",
-	);
+test("参数校验先于 beforeTool，非法模型调用仍有策略意图审计且不执行", async () => {
+	await fixture([{ tool: "write", args: { path: ".github/workflows/ci.yml" } }, { text: "done" }], async (host, dir) => {
+		await (await host.submit("非法参数", "r")).wait(BACKGROUND_CONTEXT);
+		assert.equal(existsSync(join(dir, "workspace/.github/workflows/ci.yml")), false);
+		const audit = readFileSync(join(dir, "audit.jsonl"), "utf8");
+		assert.ok(audit.includes("工具意图预检 write"));
+		assert.ok(audit.includes('"verdict":"deny"'));
+	});
 });

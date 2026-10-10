@@ -2,24 +2,13 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface SandboxWiring {
-	/**
-	 * 沙箱访问两个代理用的 token。**必填，且必须与网关的共享 token 不同。**
-	 *
-	 * 名字叫 proxyToken 而不是 sessionToken 是为了诚实：模型网关与 git 代理
-	 * 目前都只认一个静态 token（见各自的 #authorized），所以它是**代理域的
-	 * 共享凭据**，不是按会话签发的。做成「每会话不同」需要两个代理都实现
-	 * token 校验体系，那是 Phase 2 的事 —— 在那之前不要用一个看起来能按会话
-	 * 签发的 API 假装已经做到了。
-	 *
-	 * 为什么必须与网关 token 不同：这个值会写进沙箱可读的 models.json，
-	 * agent 一句 cat 就能拿到。如果它同时是网关的 WebSocket 凭据，agent 就能
-	 * 连回网关、以任意 actor 接入自己的会话，然后**批准自己挂起的审批**。
-	 * 那等于把审批门的钥匙交给了被审批的一方。
-	 */
+	/** 模型代理凭据只用于可信网关，从不写入沙箱。两个代理仍用静态 token。 */
 	proxyToken: string;
+	/** 沙箱只持有 git 代理凭据，必须与模型/浏览器 token 分开。 */
+	gitProxyToken?: string;
 	/** 模型网关地址，如 http://model-gateway.internal:8080/v1 */
 	modelGatewayUrl?: string;
-	/** 模型名。沙箱只知道名字，不知道它背后是哪个 provider、用的哪把 key */
+	/** 可信网关模型目录的名字。 */
 	model?: string;
 	/**
 	 * 提交身份。**容器里必须给** —— 沙箱 HOME 是全新空目录、hostname 通常无域，
@@ -43,47 +32,27 @@ export interface SandboxWiring {
 }
 
 export interface SandboxConfig {
-	/** 生成出的 HOME 目录，作为 pi 进程的 HOME */
+	/** 工具执行环境的 HOME，必须在工作区之外。 */
 	home: string;
-	/** 供 pi 使用的 provider/model 参数 */
-	piArgs: string[];
 }
 
-const PROVIDER = "perimeter";
-
 /**
- * 为一个会话生成沙箱侧配置 —— 这是「凭据永不进沙箱」在配置层的落地。
- *
- * 沙箱里能看到的只有：
- * - 一个指向**模型网关**的 baseUrl，apiKey 是代理 token
- * - 一条把上游 SCM 重写到 **git 代理**的 insteadOf 规则，密码是代理 token
- *
- * 真正的模型 key 只在模型网关进程里，真正的 git token 只在 git 代理进程里。
- * 代理 token 拿到别处毫无用处：它只能访问这两个代理，且分别被 egress
- * allowlist 与 repo allowlist 二次约束 —— 前提是它不等于网关 token，
- * 这一条由 Gateway 在构造时断言。
- *
- * **home 必须放在 workspace 之外**：放在里面的话，agent 一句
- * `git add -A && git commit` 就会把含 token 的 .gitconfig 提交进仓库，
- * 再经 git 代理推到真实上游。
+ * 沙箱 HOME 只生成 git 重写配置；删除迁移前的 .pi，避免遗留模型 token。
+ * HOME 在 workspace 外，git add -A 不会把代理凭据带进提交。
  */
 export function writeSandboxConfig(home: string, w: SandboxWiring): SandboxConfig {
+	for (const value of [w.authorName, w.authorEmail]) if (value && /[\x00-\x1f\x7f]/.test(value)) throw new Error("git 作者不能包含控制字符");
 	if (!w.proxyToken) throw new Error("wiring.proxyToken 必填");
-	if (w.gitProxyUrl && !w.modelGatewayUrl) {
-		// HOME 覆盖是无条件生效的：只配 git 不配模型，pi 会指向一个没有
-		// models.json 的空 HOME，任何 provider 都读不到，会话起不来且无解释
-		throw new Error("wiring：配了 gitProxyUrl 就必须同时配 modelGatewayUrl，否则沙箱读不到任何 provider");
-	}
+	if (w.gitProxyUrl && (!w.gitProxyToken || w.gitProxyToken === w.proxyToken)) throw new Error("gitProxyToken 必填且必须与模型 token 不同");
 
 	mkdirSync(home, { recursive: true });
 	rmSync(join(home, ".pi"), { recursive: true, force: true });
-	const piArgs: string[] = [];
 
 	if (w.gitProxyUrl && w.scmHosts?.length) {
 		const proxy = new URL(w.gitProxyUrl);
 		// token 必须编码：含 / @ : % 的 token 会把 URL 解析歪，
 		// 表现为连不上而不是报错。base64 形式的 token 很常见。
-		const cred = `x-session:${encodeURIComponent(w.proxyToken)}`;
+		const cred = `x-session:${encodeURIComponent(w.gitProxyToken!)}`;
 		const sections = w.scmHosts
 			.map((host) => {
 				const rewritten = `${proxy.protocol}//${cred}@${proxy.host}${proxy.pathname.replace(/\/$/, "")}/${host}/`;
@@ -97,5 +66,5 @@ export function writeSandboxConfig(home: string, w: SandboxWiring): SandboxConfi
 		writeFileSync(join(home, ".gitconfig"), `${sections}${user}[credential]\n\thelper =\n`);
 	}
 
-	return { home, piArgs };
+	return { home };
 }

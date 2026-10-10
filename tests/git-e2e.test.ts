@@ -119,7 +119,8 @@ async function startProxy(upstreamPort: number, opts: { allowPush?: boolean } = 
 function sandboxHome(proxyPort: number): string {
 	const home = mkdtempSync(join(tmpdir(), "sbhome-"));
 	writeSandboxConfig(home, {
-		proxyToken: PROXY_TOKEN,
+		proxyToken: "MODEL-TOKEN-only-in-gateway",
+		gitProxyToken: PROXY_TOKEN,
 		modelGatewayUrl: "http://127.0.0.1:1/v1",
 		gitProxyUrl: `http://127.0.0.1:${proxyPort}`,
 		scmHosts: ["git.internal"],

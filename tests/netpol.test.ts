@@ -11,7 +11,7 @@ const OPTS = { namespace: "perimeter", podLabel: { "app.kubernetes.io/name": "pe
 test("生成的策略默认拒绝入站，且只放通 allowlist 内的服务", () => {
 	const yaml = generateNetworkPolicy(POLICY, OPTS);
 	assert.match(yaml, /ingress: \[\]/);
-	assert.match(yaml, /name: model-gateway/);
+	assert.ok(!yaml.includes("name: model-gateway"));
 	assert.match(yaml, /name: git-proxy/);
 	// 没有任何放通公网的规则：外拨由那两个服务代做
 	assert.ok(!yaml.includes("0.0.0.0/0"));

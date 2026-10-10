@@ -10,28 +10,22 @@ version: 1
 # 只读工具不受 deny_paths / require_approval_paths 约束。
 # 反过来说：任何不在这个名单里的工具，只要带 path 参数就按「会改文件」处理 ——
 # pi 新增或改名一个编辑类工具时，路径防线自动覆盖它，而不是静默漏掉。
-# 对应 pi RPC 模式（coding-agent）**registry 注册的全集**：
-# bash edit find grep ls read write。注意 RPC 默认只激活 read/bash/edit/write，
-# ls/grep/find 要靠扩展才激活 —— 列在这里是为了它们被激活时不触发审批疲劳。
-#
-# 只列真实存在的工具：写过 glob、tree、image，而 pi 一个都没有
-# （image.ts 是 read 工具用的 MIME 嗅探辅助，不是工具）。
+# 对应已安装 Pi Durable CodingTools：read/write/edit/bash；只有 read 只读。
 # write/edit 绝不能出现在这里 —— 整份 deny_paths 对它们会静默失效。
 # bash 也不该在这里，但它的失效路径不同：bash 不带 path 参数，
 # deny_paths 对它本来就不生效（见 engine.ts 的类注释）。
 # 这份名单与 pi 的对齐由 tests/tool-alignment.test.ts 守着。
-read_only_tools: [read, ls, grep, find]
+read_only_tools: [read]
 
 # 沙箱 NetworkPolicy 的唯一事实来源（由 deploy/ 的清单生成器消费）。
-# 默认 deny all，只放通两个内部出口。这是四条铁律里唯一的技术边界，
+# 默认 deny all，只放通 git 代理。这是四条铁律里唯一的技术边界，
 # 但它的作用范围要说准确：它杀掉的是「直连任意外部主机」这一类外泄，
 # **不是全部外泄** —— 生成的策略放通了 kube-system 的 53 端口（否则连
-# 这两个名字都解析不了），DNS 隧道仍然可行；而经模型网关的请求体本身
+# 内部名字都解析不了），DNS 隧道仍然可行；网关内模型请求体本身
 # 就是一条合法外泄通道（scanSecrets 是 audit-only，不阻断也不改写）。
 # 另外：这份清单当前只是生成物，尚未在任何真实集群 apply。
 egress:
   deny_all_except:
-    - model-gateway.internal
     - git-proxy.internal
     # 注意：这份名单管的是**沙箱**的出口。网关自身还有两类出站：
     # 配置好的模型上游（受 ModelGateway 的 assertAllowed 约束），

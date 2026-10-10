@@ -5,6 +5,7 @@ export interface ModelGateway {
 	baseUrl: string;
 	token: string;
 	model: string;
+	provider?: string;
 }
 
 export function gatewayModels(config: ModelGateway) {
@@ -12,6 +13,7 @@ export function gatewayModels(config: ModelGateway) {
 	models.setProvider(createProvider({
 		id: "perimeter",
 		baseUrl: config.baseUrl,
+		headers: config.provider ? { "x-perimeter-provider": config.provider } : undefined,
 		auth: { apiKey: { name: "网关", resolve: async () => ({ auth: { apiKey: config.token }, source: "config" }) } },
 		models: [{
 			id: config.model, name: config.model, api: "openai-completions", provider: "perimeter",

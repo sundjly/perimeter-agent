@@ -8,7 +8,7 @@ export function reduce(state, event) {
 	const next = { ...state, messages: state.messages.map((item) => ({ ...item })), tools: state.tools.map((item) => ({ ...item })) };
 	switch (event.type) {
 		case "session.snapshot": return { ...next, ...event.view };
-		case "session.presence": next.participants = event.participants; break;
+		case "session.presence": next.participants = event.participants; if (event.role) next.role = event.role; break;
 		case "session.ready": next.sessionId = event.sessionId; next.model = event.model; break;
 		case "session.state": next.streaming = event.streaming; next.model = event.model; break;
 		case "agent.start": next.streaming = true; break;
@@ -24,7 +24,7 @@ export function reduce(state, event) {
 		case "tool.end": { const tool = next.tools.find((item) => item.callId === event.callId); if (tool) { tool.output = event.output; tool.ok = event.ok; } break; }
 		case "approval.request": next.approvals = [...state.approvals.filter((item) => item.approvalId !== event.approvalId), event]; break;
 		case "approval.resolved": next.approvals = state.approvals.filter((item) => item.approvalId !== event.approvalId); break;
-		case "policy.denied": next.errors = [...state.errors, `策略拒绝（${event.rule}）：${event.reason}`]; break;
+		case "policy.denied": { const tool = next.tools.find((item) => item.callId === event.callId); if (tool) { tool.ok = false; tool.output = `策略拒绝（${event.rule}）：${event.reason}`; } break; }
 		case "audit.entry": next.audit = [...state.audit, event.entry].slice(-100); break;
 		case "usage": next.usage = event.usage; break;
 		case "error": next.errors = [...state.errors, event.message].slice(-100); break;

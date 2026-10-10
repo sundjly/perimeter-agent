@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -45,14 +46,14 @@ function readAllFiles(dir: string, out: { path: string; text: string }[] = []): 
 
 test("沙箱配置里写的是代理 token，不是上游凭据", () => {
 	const home = mkdtempSync(join(tmpdir(), "wire-"));
-	const { piArgs } = writeSandboxConfig(home, {
+	const generated = writeSandboxConfig(home, {
 		proxyToken: PROXY_TOKEN,
 		modelGatewayUrl: "http://model-gateway.internal:8080/v1",
 		model: "claude-sonnet",
 	});
 
 	assert.ok(!readdirSync(home).includes(".pi"));
-	assert.deepEqual(piArgs, []);
+	assert.equal(generated.home, home);
 });
 
 test("git 重写带上主机名 —— 否则两个上游的同名仓库会塌缩成同一条 allowlist", () => {
@@ -61,6 +62,7 @@ test("git 重写带上主机名 —— 否则两个上游的同名仓库会塌�
 		proxyToken: PROXY_TOKEN,
 		modelGatewayUrl: "http://mgw/v1",
 		gitProxyUrl: "http://git-proxy.internal:8080",
+		gitProxyToken: "git-only-token",
 		scmHosts: ["gitlab.internal", "github.com"],
 	});
 
@@ -78,7 +80,8 @@ test("git 重写带上主机名 —— 否则两个上游的同名仓库会塌�
 test("token 做 URL 编码 —— 含 / @ : 的 token 会把 URL 解析歪", () => {
 	const home = mkdtempSync(join(tmpdir(), "wire-"));
 	writeSandboxConfig(home, {
-		proxyToken: "ab/cd+ef=gh",
+		proxyToken: "model-only-token",
+		gitProxyToken: "ab/cd+ef=gh",
 		modelGatewayUrl: "http://mgw/v1",
 		gitProxyUrl: "http://proxy:8080",
 		scmHosts: ["git.internal"],
@@ -93,7 +96,7 @@ test("缺 proxyToken 或只配 git 不配模型，都在生成时就报错", () 
 	assert.throws(() => writeSandboxConfig(home, { proxyToken: "" }), /proxyToken 必填/);
 	assert.throws(
 		() => writeSandboxConfig(home, { proxyToken: "t", gitProxyUrl: "http://p", scmHosts: ["x"] }),
-		/必须同时配 modelGatewayUrl/,
+		/gitProxyToken 必填/,
 	);
 });
 
@@ -149,8 +152,6 @@ test("端到端：请求经模型网关，且沙箱侧任何文件都不含上�
 		auditFile: join(dir, "audit.jsonl"),
 		workspaceRoot,
 		webRoot: join(REPO, "web"),
-		piArgs: ["--no-session"],
-		piEnv: { PATH: process.env.PATH },
 		wiring: { proxyToken: PROXY_TOKEN, modelGatewayUrl: `http://127.0.0.1:${modelPort}/v1`, model: "mock-model" },
 	});
 	cleanups.push(() => gateway.close());
@@ -174,7 +175,7 @@ test("端到端：请求经模型网关，且沙箱侧任何文件都不含上�
 	};
 
 	await waitFor(() => events.some((e) => e.type === "session.ready"));
-	ws.send(JSON.stringify({ type: "prompt", text: "修一下" }));
+	ws.send(JSON.stringify({ type: "prompt", requestId: randomUUID(), text: "修一下" }));
 	await waitFor(() => events.some((e) => e.type === "agent.end" && !e.willRetry));
 
 	// 回答来自上游，说明整条链路通了
@@ -210,8 +211,6 @@ test("沙箱 HOME 在 workspace 之外 —— 否则 git commit 会把 token 带
 		auditFile: join(dir, "audit.jsonl"),
 		workspaceRoot,
 		webRoot: join(REPO, "web"),
-		piArgs: ["--no-session"],
-		piEnv: { PATH: process.env.PATH },
 		wiring: { proxyToken: PROXY_TOKEN, modelGatewayUrl: "http://127.0.0.1:1/v1", model: "m" },
 	});
 	cleanups.push(() => gateway.close());
@@ -225,4 +224,10 @@ test("沙箱 HOME 在 workspace 之外 —— 否则 git commit 会把 token 带
 	const cwdFiles = readAllFiles(join(workspaceRoot, "abc123"));
 	assert.ok(!cwdFiles.some((f) => f.text.includes(PROXY_TOKEN)), "工作区里不该有任何 token —— 它会被 commit 走");
 	assert.ok(!readAllFiles(join(workspaceRoot, ".homes", "abc123")).some((f) => f.text.includes(PROXY_TOKEN)));
+});
+
+test("显式模型配置不能与沙箱 git 代理共用凭据", () => {
+	const dir = mkdtempSync(join(tmpdir(), "credential-domains-"));
+	assert.throws(() => new Gateway({ port: 0, host: "127.0.0.1", token: "browser-only", policyFile: "config/policy.yaml", auditFile: join(dir, "a.jsonl"), workspaceRoot: join(dir, "ws"), webRoot: "web",
+		model: { baseUrl: "http://model/v1", token: "same", model: "model" }, wiring: { proxyToken: "unused-model-alias", gitProxyToken: "same", gitProxyUrl: "http://git", scmHosts: ["git.internal"] } }), /模型 token 不能与 gitProxyToken 相同/);
 });

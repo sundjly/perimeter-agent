@@ -1,10 +1,8 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { AuditLog } from "../audit/log.ts";
+import { AuditLog } from "../audit/log.ts";
 import type { ClientCommand, ClientEvent, SessionView } from "../protocol/types.ts";
-import { newTranslateState, snapshotView, toClientEvent } from "../protocol/translate.ts";
 import { HarnessHost } from "../runtime/harness-host.ts";
 import type { ModelGateway } from "../runtime/models.ts";
 import type { EnvironmentHandle } from "../runtime/execution-env.ts";
@@ -21,7 +19,6 @@ export interface SessionOptions {
 	sandboxHome?: string;
 	repoUrl?: string;
 	cloneTimeoutMs?: number;
-	piBin?: string; piArgs?: string[]; piEnv?: NodeJS.ProcessEnv; backlogSize?: number;
 	send: (event: ClientEvent, seq: number, target?: unknown) => void;
 }
 
@@ -34,8 +31,8 @@ export class Session {
 	#seq = 0;
 	#lastActivity = Date.now();
 	#starting?: Promise<void>;
+	#cleaning?: Promise<void>;
 	#stream?: Awaited<ReturnType<HarnessHost["watch"]>>;
-	#tstate = newTranslateState();
 	#audit: SessionView["audit"] = [];
 	#queued: { cmd: ClientCommand; actor: string }[] = [];
 	constructor(opts: SessionOptions) {
@@ -55,11 +52,17 @@ export class Session {
 	}
 	async #start(): Promise<void> {
 		const opts = this.#opts;
-		opts.audit.append({ kind: "session.start", sessionId: this.sessionId, actor: opts.actor, repo: opts.repo, team: opts.team, summary: "会话开始" });
 		try {
+		for await (const entry of AuditLog.replay(opts.audit.path)) if (entry.sessionId === this.sessionId) {
+			this.#audit.push({ seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, verdict: entry.verdict, actor: entry.actor, approver: entry.approver });
+			if (this.#audit.length > 100) this.#audit.shift();
+		}
+		opts.audit.append({ kind: "session.start", sessionId: this.sessionId, actor: opts.actor, repo: opts.repo, team: opts.team, summary: "会话开始" });
 			const home = opts.sandboxHome ?? join(opts.workspace, "..", ".homes", opts.sessionId);
+			mkdirSync(home, { recursive: true });
+			rmSync(join(home, ".pi"), { recursive: true, force: true });
 			if (opts.wiring) writeSandboxConfig(home, opts.wiring);
-			const ctx = { sessionId: opts.sessionId, workspace: opts.workspace, home, extensionPath: "", policyFile: opts.policyFile, env: {} };
+			const ctx = { sessionId: opts.sessionId, workspace: opts.workspace, home, extensionPath: "", policyFile: opts.policyFile, env: { PERIMETER_REPO: opts.repo, PERIMETER_TEAM: opts.team } };
 			if (this.#backend.kind !== "kubectl") await this.#backend.prepare?.(ctx);
 			if (!this.#alive) return;
 			
@@ -73,24 +76,16 @@ export class Session {
 			}
 			let model = opts.model;
 			if (!model && opts.wiring?.modelGatewayUrl) model = { baseUrl: opts.wiring.modelGatewayUrl, token: opts.wiring.proxyToken, model: opts.wiring.model ?? "default" };
-			if (!model && opts.piEnv?.HOME) {
-				const providers = JSON.parse(readFileSync(join(opts.piEnv.HOME, ".pi/agent/models.json"), "utf8")).providers;
-				const provider = Object.values(providers)[0] as { baseUrl: string; apiKey: string; models: { id: string }[] };
-				model = { baseUrl: provider.baseUrl, token: provider.apiKey, model: provider.models[0]!.id };
-			}
-			if (!model) throw new Error("缺少可信网关模型配置");
+
+			if (!model || !model.token || !model.baseUrl || !model.model) throw new Error("缺少可信网关模型配置");
 			this.#host = await HarnessHost.open({ sessionId: opts.sessionId, file: join(opts.stateDirectory ?? join(opts.workspace, "..", ".state", opts.sessionId), "session.sqlite"),
 				workspace: opts.workspace, repo: opts.repo, team: opts.team, actor: opts.actor, policyFile: opts.policyFile, audit: opts.audit, model,
 				env: this.#env.env, approvalTimeoutMs: opts.approvalTimeoutMs, emit: (event) => this.#emit(event) });
 			if (!this.#alive) { await this.#host.close(); return; }
 			this.#stream = await this.#host.watch();
-			this.#view = snapshotView(this.#stream.snapshot, opts.sessionId);
+			this.#view = this.#stream.snapshot;
 			this.#stream.start(async (events) => {
-				for (const event of events) {
-					if (event.type === "snapshot") this.#emit({ type: "session.snapshot", view: snapshotView(event, opts.sessionId) });
-					else for (const client of toClientEvent(event, this.#tstate)) this.#emit(client);
-				}
-				if (this.#alive) this.#emit({ type: "session.snapshot", view: await this.snapshot() });
+				for (const event of events) this.#emit(event);
 			});
 			this.#emit({ type: "session.ready", sessionId: opts.sessionId, workspace: opts.workspace, model: model.model });
 			this.#emit({ type: "session.snapshot", view: await this.snapshot() });
@@ -121,8 +116,8 @@ export class Session {
 	handle(cmd: ClientCommand, actor = this.#opts.actor, _from?: unknown): void {
 		this.#lastActivity = Date.now();
 		if (!cmd || typeof cmd !== "object" || !["prompt", "steer", "approve", "abort"].includes(cmd.type)) { this.#emit({ type: "error", code: "command_failed", message: "非法命令" }); return; }
-		if ((cmd.type === "prompt" || cmd.type === "steer") && (typeof cmd.text !== "string" || !cmd.text.trim())) { this.#emit({ type: "error", code: "command_failed", message: "消息不能为空" }); return; }
-		if (!this.#alive) return;
+		if ((cmd.type === "prompt" || cmd.type === "steer") && (typeof cmd.text !== "string" || !cmd.text.trim() || typeof cmd.requestId !== "string" || !cmd.requestId || cmd.requestId.length > 256)) { this.#emit({ type: "error", code: "command_failed", message: "消息与 requestId 必须有效" }); return; }
+		if (!this.#alive) { this.#emit({ type: "error", code: "agent_error", message: "会话已关闭，请重新接入" }); return; }
 		if (!this.#host) {
 			if (cmd.type === "abort") this.#queued.length = 0;
 			else if (this.#queued.length < 32) this.#queued.push({ cmd, actor });
@@ -136,21 +131,30 @@ export class Session {
 		else if (cmd.type === "approve") {
 			if (typeof cmd.approvalId !== "string" || !["allow", "deny"].includes(cmd.decision)) throw new Error("非法审批命令");
 			await this.#host!.approvals.decide(cmd.approvalId, cmd.decision, actor);
-		} else if (cmd.type === "prompt" || cmd.type === "steer") await this.#host!.submit(cmd.text, cmd.requestId ?? randomUUID(), cmd.type === "steer" ? "steer" : "followUp", actor);
+		} else if (cmd.type === "prompt" || cmd.type === "steer") await this.#host!.submit(cmd.text, cmd.requestId, cmd.type === "steer" ? "steer" : "followUp", actor);
 	}
 	#emit(event: ClientEvent): void {
+		if (event.type === "session.snapshot") { this.#view = event.view; event.view = { ...event.view, audit: this.#audit }; }
 		if (event.type === "agent.start" && this.#view) this.#view.streaming = true;
 		if (event.type === "agent.settled" && this.#view) this.#view.streaming = false;
 		if (event.type === "audit.entry") { this.#audit.push(event.entry); if (this.#audit.length > 100) this.#audit.shift(); }
 		this.#opts.send(event, ++this.#seq);
 	}
 	publish(event: ClientEvent): void { this.#emit(event); }
-	auditCommand(actor: string, summary: string): void { this.#opts.audit.append({ kind: "prompt", sessionId: this.sessionId, actor, summary: `命令 ${summary}` }); }
-	async snapshotFrame(): Promise<{ seq: number; event: ClientEvent }> {
+	auditCommand(actor: string, summary: string): void {
+		this.#lastActivity = Date.now();
+		const entry = this.#opts.audit.append({ kind: "prompt", sessionId: this.sessionId, actor, summary: `命令 ${summary}` });
+		this.#emit({ type: "audit.entry", entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, actor: entry.actor } });
+	}
+	async snapshotFrame(deliver?: (frame: { seq: number; event: ClientEvent }) => void): Promise<{ seq: number; event: ClientEvent }> {
 		for (;;) {
 			const seq = this.#seq;
 			const view = await this.snapshot();
-			if (seq === this.#seq) return { seq, event: { type: "session.snapshot", view } };
+			if (seq === this.#seq) {
+				const frame = { seq, event: { type: "session.snapshot" as const, view } };
+				deliver?.(frame);
+				return frame;
+			}
 		}
 	}
 	async stop(reason = "会话结束"): Promise<void> {
@@ -160,6 +164,9 @@ export class Session {
 		await this.#cleanup(reason);
 	}
 	async #cleanup(reason: string): Promise<void> {
+		return this.#cleaning ??= this.#dispose(reason);
+	}
+	async #dispose(reason: string): Promise<void> {
 		const errors: unknown[] = [];
 		try { this.#opts.audit.append({ kind: "session.end", sessionId: this.sessionId, actor: this.#opts.actor, summary: reason }); } catch (error) { errors.push(error); }
 		for (const cleanup of [() => this.#stream?.stop(), () => this.#host?.close(), () => this.#env?.close(), () => this.#backend.cleanup?.(this.sessionId)]) {

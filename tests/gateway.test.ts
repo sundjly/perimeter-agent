@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -64,8 +65,7 @@ async function startGateway(script: unknown[], extra: Partial<ConstructorParamet
 		auditFile,
 		workspaceRoot,
 		webRoot: join(REPO, "web"),
-		piArgs: ["--no-session", "--provider", "mock", "--model", "mock-model"],
-		piEnv: { PATH: process.env.PATH, HOME: home },
+		model: { baseUrl: `http://127.0.0.1:${port}/v1`, token: "dummy", model: "mock-model" },
 		approvalTimeoutMs: 30_000,
 		...extra,
 	});
@@ -123,7 +123,7 @@ async function connect(env: Env, query = ""): Promise<Client> {
 		controls,
 		waitFor,
 		find: (type) => events.find((e) => e.type === type) as never,
-		send: (cmd) => ws.send(JSON.stringify(cmd)),
+		send: (cmd) => { if (cmd && typeof cmd === "object" && ["prompt", "steer"].includes((cmd as { type: string }).type)) cmd = { requestId: randomUUID(), ...cmd }; ws.send(JSON.stringify(cmd)); },
 	};
 }
 
@@ -485,4 +485,22 @@ test("多人：viewer 只读、editor 可操作、非成员拒绝，作者留在
 	await viewer.waitFor(() => viewer.events.some((event) => event.type === "session.snapshot" && event.view.messages.some((message) => message.actor === "bob")));
 	const intruder = await connect(env, `&actor=constructor&session=${id}`);
 	await intruder.waitFor(() => intruder.controls.some((control) => control.control === "error"));
+});
+
+test("CLI 已接入时实时审批 ID 可见，可通过行命令决定", async () => {
+	const env = await startGateway([{ tool: "bash", args: { command: "git push; touch bypass" } }, { text: "完成" }]);
+	const owner = await connect(env);
+	await owner.waitFor(() => !!owner.find("session.ready"));
+	const cli = spawn(process.execPath, ["scripts/attach.ts", "--session", owner.find("session.ready")!.sessionId, "--url", env.url, "--token", TOKEN]);
+	let output = "";
+	cli.stdout.on("data", (chunk) => { output += String(chunk); });
+	try {
+		await owner.waitFor(() => output.includes("会话"));
+		owner.send({ type: "prompt", text: "推送" });
+		await owner.waitFor(() => /需要人工审批 [a-f0-9-]{36}/.test(output));
+		const id = /需要人工审批 ([a-f0-9-]{36})/.exec(output)![1]!;
+		cli.stdin.write(`/approve ${id} deny\n`);
+		await owner.waitFor(() => !!owner.find("approval.resolved"));
+		await owner.waitFor(() => !!owner.find("agent.end"));
+	} finally { cli.kill(); }
 });

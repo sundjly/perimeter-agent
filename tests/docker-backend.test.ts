@@ -61,7 +61,7 @@ const ctx = {
 
 test("local 后端直接 spawn pi，扩展与策略走宿主机路径", () => {
 	const l = new LocalBackend({ PATH: "/usr/bin" }).launch(ctx);
-	assert.equal(l.bin, "pi");
+	assert.equal(l.bin, "pi-env");
 	assert.deepEqual(l.argsPrefix, []);
 	assert.equal(l.extensionPath, ctx.extensionPath);
 	assert.equal(l.env.HOME, "/host/home");
@@ -91,7 +91,7 @@ test("docker 后端的五项收紧与 deploy/sandbox.yaml 对应", () => {
 	// -i 是 RPC 的前提：没有它 stdin 立刻关闭，协议根本跑不起来
 	assert.ok(l.argsPrefix.includes("-i"));
 	// 最后两个参数必须是镜像与 pi，pi 自己的参数由 Session 追加在后面
-	assert.deepEqual(l.argsPrefix.slice(-2), [IMAGE, "pi"]);
+	assert.deepEqual(l.argsPrefix.slice(-2), [IMAGE, "pi-env"]);
 });
 
 test("docker 后端只挂工作区、HOME 与扩展所需的三个只读子树", () => {
@@ -100,12 +100,9 @@ test("docker 后端只挂工作区、HOME 与扩展所需的三个只读子树",
 	assert.deepEqual(mounts, [
 		"/host/ws:/workspace",
 		"/host/home:/home/agent",
-		"/repo/src:/opt/perimeter/src:ro",
-		"/repo/config:/opt/perimeter/config:ro",
-		"/repo/node_modules:/opt/perimeter/node_modules:ro",
 	]);
 	// 扩展与策略走容器内路径
-	assert.equal(l.extensionPath, "/opt/perimeter/src/gateway/policy-extension.ts");
+	assert.equal(l.extensionPath, "");
 	assert.equal(l.policyFile, "/opt/perimeter/config/policy.yaml");
 });
 
@@ -140,7 +137,7 @@ test("kubectl 后端生成 exec 命令，`--` 之后才是容器内的命令", (
 	assert.equal(l.bin, "kubectl");
 	// Pod 名带规范化后的 sessionId 片段：客户端可指定的 id 允许大写与下划线，
 	// 而 K8s 的 Pod 名必须符合 DNS-1123
-	assert.deepEqual(l.argsPrefix, ["exec", "-i", `perimeter-${k8sNameFragment("sess-1")}`, "-n", "perimeter", "--", "pi"]);
+	assert.deepEqual(l.argsPrefix, ["exec", "-i", `perimeter-${k8sNameFragment("sess-1")}`, "-n", "perimeter", "--", "pi-env"]);
 });
 
 test("容器名可预测，pi 意外退出后还能找回来清理", () => {
@@ -244,7 +241,6 @@ describe("容器隔离（需要 docker 与 perimeter-sandbox:test 镜像）", { 
 			auditFile: join(dir, "audit.jsonl"),
 			workspaceRoot,
 			webRoot: join(REPO, "web"),
-			piArgs: ["--no-session"],
 			// 容器要经 host.docker.internal 回到宿主机上的模型网关
 			wiring: {
 				proxyToken: "proxy-token",

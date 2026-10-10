@@ -81,8 +81,7 @@ async function optsFor(script: unknown[], approvals: "deny" | "approve" = "deny"
 		repoRoot: REPO,
 		reposRoot: REPOS,
 		runRoot: runRoot(),
-		piArgs: ["--no-session", "--provider", "mock", "--model", "mock-model"],
-		piEnv: { PATH: process.env.PATH, HOME: home },
+		model: { baseUrl: `http://127.0.0.1:${port}/v1`, token: "dummy", model: "mock-model" },
 		// 必须把 piEnv 交给它，否则 pi 读不到 models.json（见 RunOptions.backend）
 		backend: new LocalBackend({ PATH: process.env.PATH, HOME: home }),
 		approvals,

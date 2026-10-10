@@ -61,7 +61,7 @@ export class Approvals {
 			const timer = setTimeout(abort, Math.max(0, timeoutMs));
 			this.#waiters.set(item.id, finish);
 			signal.addEventListener("abort", abort, { once: true });
-			this.#emit({ type: "approval.request", approvalId: item.id, action: item.action, reason, expiresAt: item.expiresAt });
+			this.#emit({ type: "approval.request", approvalId: item.id, action: item.action, reason, expiresAt: item.expiresAt, actor });
 			if (signal.aborted) abort();
 		});
 	}

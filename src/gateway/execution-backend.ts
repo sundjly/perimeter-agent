@@ -33,7 +33,7 @@ export interface Launch {
 	bin: string;
 	/** 排在 pi 自身参数之前的前缀，如 `docker run … image pi` */
 	argsPrefix: string[];
-	/** pi 进程可见的环境变量。容器后端里由 -e 传入，这里返回空 */
+	/** 执行环境可见的环境变量。容器后端里由 -e 传入，这里返回空 */
 	env: NodeJS.ProcessEnv;
 	/** 容器内的工作区路径。策略引擎的路径规则按它来 */
 	cwd: string;
@@ -46,7 +46,7 @@ export interface Launch {
 }
 
 /**
- * 「pi 进程在哪儿跑」的抽象。
+ * 「执行环境在哪儿跑」的抽象。
  *
  * PiSession 早就把 bin 与参数前缀设计成可替换的，这一层把那个口子用起来：
  * - `local`：直接 spawn，**没有任何隔离**。开发与 demo 默认，不是生产形态。
@@ -69,7 +69,7 @@ export interface ExecutionBackend {
 	 *
 	 * local/docker 用不到 —— 它们直接读宿主机目录（bind mount）。
 	 * kubectl 必须实现：Pod 的 HOME 是 emptyDir，创建时为空，
-	 * 网关没法从外部写它，不送进去就没有 models.json，会话起不来。
+	 * 网关没法从外部写它，不送进去就没有 git 代理配置。
 	 */
 	prepare?(ctx: LaunchContext): Promise<void>;
 	/**
@@ -192,11 +192,11 @@ export class LocalBackend implements ExecutionBackend {
 
 	launch(ctx: LaunchContext): Launch {
 		return {
-			bin: "pi",
+			bin: "pi-env",
 			argsPrefix: [],
 			// 只在接线真的生成了 HOME 时才覆盖：没有接线时调用方给的 HOME
-			// 才是 pi 读 models.json 的地方
-			// 策略文件路径由后端决定：扩展在 pi 进程里 readFileSync 它，
+			// 才是工具的 HOME
+			// 策略文件路径由后端决定：扩展在 执行环境里 readFileSync 它，
 			// 传宿主机路径进容器就是 ENOENT
 			env: { ...this.#env, ...ctx.env, PERIMETER_POLICY_FILE: ctx.policyFile, ...(ctx.home ? { HOME: ctx.home } : {}) },
 			cwd: ctx.workspace,
@@ -258,7 +258,7 @@ export interface DockerBackendOptions {
 	user?: string;
 	env?: NodeJS.ProcessEnv;
 	/**
-	 * 仓库根。策略扩展跑在 pi 进程内，而 pi 在容器里 —— 扩展代码必须
+	 * 仓库根。策略扩展跑在 执行环境内，而 pi 在容器里 —— 扩展代码必须
 	 * 进得去，否则整个钩子级拦截失效。只挂它需要的三个子树，**只读**：
 	 * src/（扩展与它 import 的策略引擎、协议层）、config/（策略文件）、
 	 * node_modules/（yaml 依赖）。
@@ -358,14 +358,6 @@ export class DockerBackend implements ExecutionBackend {
 			"-v",
 			`${ctx.workspace}:${workdir}`,
 			...(ctx.home ? ["-v", `${ctx.home}:${home}`] : []),
-			// 策略扩展与它的依赖，只读。没有这三个挂载，容器里就没有
-			// tool_call 钩子 —— 钩子级拦截是产品的核心卖点。
-			"-v",
-			`${this.#opts.repoRoot}/src:${mountRoot}/src:ro`,
-			"-v",
-			`${this.#opts.repoRoot}/config:${mountRoot}/config:ro`,
-			"-v",
-			`${this.#opts.repoRoot}/node_modules:${mountRoot}/node_modules:ro`,
 			// 只读根意味着这些可写目录要显式给。
 			// noexec/nosuid/nodev 与 no-new-privileges 配套；size 不能太大 ——
 			// tmpfs 写入直接算宿主机内存，没有 memory 上限时是一条 DoS 路径。
@@ -395,7 +387,7 @@ export class DockerBackend implements ExecutionBackend {
 		// 同机其他用户 `ps aux` 就能看到。当前这五个变量都不敏感，但
 		// K8s 那侧的等价配置里是有会话 token 的（secretKeyRef），
 		// 这个写法能保证以后有人往里加 token 时不会静默泄漏。
-		// 注意：`docker inspect` 仍会留存值，要彻底避免只能走文件（如 models.json）。
+		// 注意：`docker inspect` 仍会留存值，要彻底避免必须避免把敏感值注入容器。
 		for (const k of Object.keys(containerEnv)) {
 			if (containerEnv[k] !== undefined) args.push("-e", k);
 		}
@@ -407,7 +399,7 @@ export class DockerBackend implements ExecutionBackend {
 		args.push("--pids-limit", String(this.#opts.pidsLimit ?? 512));
 		args.push("--ulimit", "nofile=4096:8192");
 		args.push(...(this.#opts.extraArgs ?? []));
-		args.push(this.#opts.image, "pi");
+		args.push(this.#opts.image, "pi-env");
 
 		return {
 			bin: "docker",
@@ -421,7 +413,7 @@ export class DockerBackend implements ExecutionBackend {
 			env: { ...dockerClientEnv(), ...containerEnv },
 			cwd: ctx.workspace,
 			homeInContainer: home,
-			extensionPath: `${mountRoot}/src/gateway/policy-extension.ts`,
+			extensionPath: "",
 			policyFile: `${mountRoot}/config/policy.yaml`,
 		};
 	}
@@ -545,7 +537,7 @@ export class KubectlBackend implements ExecutionBackend {
 
 	/**
 	 * 把网关生成的沙箱 HOME 送进 Pod。
-	 * 不做这一步，Pod 里的 HOME 是空的 emptyDir，pi 读不到 models.json。
+	 * 不做这一步，Pod 里的 HOME 是空的 emptyDir，git 读不到代理配置。
 	 */
 	/**
 	 * prepare 会执行的两条命令。抽成纯函数是为了可测 —— 直接测 prepare()
@@ -650,7 +642,7 @@ export class KubectlBackend implements ExecutionBackend {
 		if (this.#opts.namespace) args.push("-n", this.#opts.namespace);
 		if (this.#opts.container) args.push("-c", this.#opts.container);
 		// `--` 之后才是要在 Pod 里执行的命令
-		args.push("--", "pi");
+		args.push("--", "pi-env");
 		return {
 			bin: "kubectl",
 			argsPrefix: args,
@@ -661,7 +653,7 @@ export class KubectlBackend implements ExecutionBackend {
 			cwd: ctx.workspace,
 			homeInContainer: CONTAINER_HOME,
 			// 扩展由镜像提供（sandbox.Dockerfile 的 COPY），策略走 configMap
-			extensionPath: "/opt/perimeter/src/gateway/policy-extension.ts",
+			extensionPath: "",
 			policyFile: "/etc/perimeter/policy.yaml",
 		};
 	}

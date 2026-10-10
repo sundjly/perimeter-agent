@@ -61,3 +61,15 @@ test("Durable 审批：先到先得，批准人和超时决定进入审计", asy
 		assert.ok(!records.includes('"approver":"eve"'));
 	});
 });
+
+test("真实 bash 不继承网关或模型环境凭据", async () => {
+	process.env.PERIMETER_TEST_MODEL_SECRET = "gateway-only-secret-negative-guard";
+	try {
+		await fixture([{ tool: "bash", args: { command: "env > environment.txt" } }, { text: "done" }], async (host, dir) => {
+			await (await host.submit("环境", "r")).wait(BACKGROUND_CONTEXT);
+			const output = readFileSync(join(dir, "workspace/environment.txt"), "utf8");
+			assert.ok(!output.includes("gateway-only-secret-negative-guard"));
+			assert.ok(!output.includes("NODE_TEST_CONTEXT"));
+		});
+	} finally { delete process.env.PERIMETER_TEST_MODEL_SECRET; }
+});
