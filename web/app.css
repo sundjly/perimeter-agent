@@ -269,3 +269,10 @@ button.danger {
 	padding: 8px 10px;
 	font-size: 13px;
 }
+
+:root { --ok: #409a62; --deny: #d25a5a; --pending: #b58b2f; --info: #5e84bd; --space: 12px; --font: 14px; }
+.deny { color: var(--deny); border-left: 3px solid var(--deny); padding: var(--space); }
+.pending { border: 1px solid var(--pending); padding: var(--space); white-space: pre-wrap; }
+.tool { margin: var(--space) 0; padding: var(--space); }
+.tool pre { white-space: pre-wrap; }
+.msg { white-space: pre-wrap; }

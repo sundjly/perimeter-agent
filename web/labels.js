@@ -1,0 +1,1 @@
+export const labels = { send: "发送", queue: "排队", steer: "插话", abort: "中止", allow: "批准", deny: "拒绝", pending: "需要人工审批", viewer: "只读", connected: "已连接", disconnected: "连接断开" };

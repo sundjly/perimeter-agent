@@ -18,7 +18,8 @@
     "gen:netpol": "node scripts/gen-netpol.ts",
     "gen:policy-cm": "node scripts/gen-policy-cm.ts",
     "gen:deploy": "npm run gen:netpol && npm run gen:policy-cm",
-    "export:siem": "node scripts/export-siem.ts"
+    "export:siem": "node scripts/export-siem.ts",
+    "attach": "node scripts/attach.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.1.0",

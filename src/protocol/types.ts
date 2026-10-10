@@ -133,8 +133,8 @@ export interface AuditEntryView {
 
 export type Role = "owner" | "editor" | "viewer";
 export interface Participant { actor: string; role: Role; clients: number }
-export interface MessageView { id: string; role: "user" | "assistant"; text: string; thinking: string; actor?: string }
-export interface ToolView { callId: string; action: ActionDescriptor; output: string; ok?: boolean }
+export interface MessageView { id: string; order?: number; role: "user" | "assistant"; text: string; thinking: string; actor?: string }
+export interface ToolView { callId: string; order?: number; action: ActionDescriptor; output: string; ok?: boolean }
 export interface SessionView {
 	sessionId: string; model: string | null; streaming: boolean; messages: MessageView[]; tools: ToolView[];
 	inbox: { id: string; mode: string }[]; approvals: { approvalId: string; action: ActionDescriptor; reason: string; actor?: string; expiresAt: number }[];

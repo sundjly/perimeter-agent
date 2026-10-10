@@ -42,12 +42,14 @@ export function usageView(raw: SnapshotEvent["usage"]): Usage {
 export function snapshotView(snapshot: SnapshotEvent, sessionId: string): SessionView {
 	const messages: SessionView["messages"] = [];
 	const tools: SessionView["tools"] = [];
+	const intents = new Map<string, ActionDescriptor>();
+	for (const entry of snapshot.entries) for (const message of entry.model ?? []) if (message.role === "assistant") for (const block of message.content) if (block.type === "toolCall") intents.set(block.id, forClient(toActionDescriptor(block.name, block.arguments)));
 	for (const entry of snapshot.entries) for (const message of entry.model ?? []) {
-		if (message.role === "user" || message.role === "assistant") messages.push({ id: String(entry.id), role: message.role, text: text(message), thinking: "" });
-		if (message.role === "toolResult") tools.push({ callId: message.toolCallId, action: { tool: message.toolName }, output: text(message), ok: !message.isError });
+		if (message.role === "user" || message.role === "assistant") messages.push({ id: String(entry.id), order: Number(entry.id), role: message.role, text: text(message), thinking: "" });
+		if (message.role === "toolResult") tools.push({ callId: message.toolCallId, order: Number(entry.id), action: intents.get(message.toolCallId) ?? { tool: message.toolName }, output: text(message), ok: !message.isError });
 	}
-	if (snapshot.generation?.message) messages.push({ id: "live", role: "assistant", text: text(snapshot.generation.message), thinking: "" });
-	for (const tool of snapshot.tools) if (!tools.some((item) => item.callId === tool.callId)) tools.push({ callId: tool.callId, action: { tool: tool.name }, output: tool.output ?? "" });
+	if (snapshot.generation?.message) messages.push({ id: "live", order: Number.MAX_SAFE_INTEGER - 1, role: "assistant", text: text(snapshot.generation.message), thinking: "" });
+	for (const tool of snapshot.tools) if (!tools.some((item) => item.callId === tool.callId)) tools.push({ callId: tool.callId, order: Number.MAX_SAFE_INTEGER, action: intents.get(tool.callId) ?? { tool: tool.name }, output: tool.output ?? "" });
 	return { sessionId, model: snapshot.agent.model?.modelId ?? null, streaming: !!snapshot.run, messages, tools,
 		inbox: snapshot.inbox.map((item) => ({ id: String(item.id), mode: item.mode })), approvals: [], participants: [], usage: usageView(snapshot.usage), audit: [], role: "owner" };
 }

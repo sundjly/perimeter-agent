@@ -9,7 +9,7 @@ import { CLIENT_EVENT_TYPES } from "../src/protocol/types.ts";
  * 协议与前端的覆盖差集。
  *
  * `web/` 不在 tsconfig 的 include 里（它是零构建的原生 JS），所以类型系统
- * 完全帮不上忙：`render()` 是手写 switch 且**没有 default 分支**。
+ * 完全帮不上忙：`reduce()` 是手写 switch 且**没有 default 分支**。
  * 往 ClientEvent 加一个事件而忘了前端，表现是浏览器静默丢弃 ——
  * 界面少一块东西，没有任何报错，排查时先怀疑的是网关。
  *
@@ -19,21 +19,21 @@ import { CLIENT_EVENT_TYPES } from "../src/protocol/types.ts";
  * 我第一版正好踩了这个坑，负面验证用的事件名恰好落在正则内，给了假信心。
  *
  * 前端侧仍需文本解析（原生 JS 没有可 import 的清单），但范围收敛到
- * `render()` 函数体内，避免把别处无关的 case 算成已覆盖。
+ * `reduce()` 函数体内，避免把别处无关的 case 算成已覆盖。
  */
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 
 /** 明确不需要前端处理的事件，每条都要写明理由 */
 const EXEMPT: Record<string, string> = {
-	"message.end": "正文由 message.text 的 delta 累积渲染，end 只是边界信号",
+	
 };
 
-/** 只取 render() 函数体内的 case —— 别处的 switch 不算前端对协议的处理 */
+/** 只取 reduce() 函数体内的 case —— 别处的 switch 不算前端对协议的处理 */
 function handledInRender(): string[] {
-	const app = readFileSync(join(REPO, "web/app.js"), "utf8");
-	const start = app.indexOf("function render(");
-	assert.ok(start >= 0, "web/app.js 里找不到 render()，解析假设已失效");
+	const app = readFileSync(join(REPO, "web/view-model.js"), "utf8");
+	const start = app.indexOf("function reduce(");
+	assert.ok(start >= 0, "web/app.js 里找不到 reduce()，解析假设已失效");
 	// 从函数起点做花括号配对，取出函数体
 	const open = app.indexOf("{", start);
 	let depth = 0;
@@ -45,14 +45,14 @@ function handledInRender(): string[] {
 			break;
 		}
 	}
-	assert.ok(end > open, "render() 的花括号没配平");
+	assert.ok(end > open, "reduce() 的花括号没配平");
 	return [...app.slice(open, end).matchAll(/case "([^"]+)"/g)].map((m) => m[1]!);
 }
 
 test("解析假设成立 —— 否则下面几条会静默通过", () => {
 	// 协议侧数量由编译期保证，这里钉住它别在重构中被削掉
 	assert.equal(CLIENT_EVENT_TYPES.length, 21, "事件数变了：确认是有意增删，再改这个数字");
-	assert.ok(handledInRender().length >= 15, `render() 里只解析到 ${handledInRender().length} 个 case`);
+	assert.ok(handledInRender().length >= 15, `reduce() 里只解析到 ${handledInRender().length} 个 case`);
 });
 
 test("每个 ClientEvent 要么被前端处理，要么在豁免清单里", () => {
@@ -75,7 +75,7 @@ test("豁免清单不能过期，理由不能敷衍", () => {
 	}
 });
 
-test("render() 不该处理协议里不存在的事件", () => {
+test("reduce() 不该处理协议里不存在的事件", () => {
 	const types = CLIENT_EVENT_TYPES as readonly string[];
 	const unknown = handledInRender().filter((h) => !types.includes(h));
 	assert.deepEqual(unknown, [], `前端在处理协议里没有的事件（多半是改名后的残留）：${unknown.join(", ")}`);
