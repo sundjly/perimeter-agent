@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -188,6 +188,7 @@ test("端到端：请求经模型网关，且沙箱侧任何文件都不含上�
 
 	// 决定性断言：遍历沙箱能看到的全部文件（HOME + workspace）
 	// 遍历 HOME 与 workspace 两处 —— 沙箱能看到的全部文件
+	writeFileSync(join(workspaceRoot, "sandbox-fixture.txt"), "实际遍历的沙箱文件");
 	const files = readAllFiles(workspaceRoot);
 	assert.ok(files.length > 0, "应当扫到文件，否则这条断言是空转");
 	for (const f of files) {

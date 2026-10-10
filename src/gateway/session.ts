@@ -144,6 +144,8 @@ export class Session {
 		if (event.type === "audit.entry") { this.#audit.push(event.entry); if (this.#audit.length > 100) this.#audit.shift(); }
 		this.#opts.send(event, ++this.#seq);
 	}
+	publish(event: ClientEvent): void { this.#emit(event); }
+	auditCommand(actor: string, summary: string): void { this.#opts.audit.append({ kind: "prompt", sessionId: this.sessionId, actor, summary: `命令 ${summary}` }); }
 	async snapshotFrame(): Promise<{ seq: number; event: ClientEvent }> {
 		for (;;) {
 			const seq = this.#seq;

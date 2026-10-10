@@ -86,6 +86,8 @@ export type ErrorCode = "aborted" | "agent_error" | "extension_error" | "command
 export type ClientCommand =
 	| { type: "prompt"; text: string; requestId?: string }
 	| { type: "steer"; text: string; requestId?: string }
+	| { type: "share"; actor: string; role: "editor" | "viewer" }
+	| { type: "unshare"; actor: string }
 	| { type: "abort" }
 	| { type: "approve"; approvalId: string; decision: Decision }
 	;;

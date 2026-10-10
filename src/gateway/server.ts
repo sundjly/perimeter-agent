@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { type WebSocket, WebSocketServer } from "ws";
 import { AuditLog } from "../audit/log.ts";
-import type { ClientCommand, ClientEvent } from "../protocol/types.ts";
+import type { ClientCommand, ClientEvent, Role } from "../protocol/types.ts";
 import type { ExecutionBackend } from "./execution-backend.ts";
 import type { SandboxWiring } from "./sandbox-config.ts";
 import { Session } from "./session.ts";
@@ -17,6 +17,7 @@ export interface GatewayConfig {
 	policyFile: string;
 	auditFile: string;
 	workspaceRoot: string;
+	stateRoot?: string;
 	webRoot: string;
 	piBin?: string;
 	piArgs?: string[];
@@ -254,12 +255,14 @@ export class Gateway {
 		}
 
 		if (requested) {
-			const ownerFile = join(this.#cfg.workspaceRoot, ".state", requested, "owner.json");
-			if (existsSync(ownerFile) && JSON.parse(readFileSync(ownerFile, "utf8")).actor !== actor) { closeWith(ws, "无权接入该会话"); return; }
+			const ownerFile = join(this.#cfg.stateRoot ?? join(this.#cfg.workspaceRoot, "..", "state"), "sessions", requested, "owner.json");
+			const metaFile = join(this.#cfg.stateRoot ?? join(this.#cfg.workspaceRoot, "..", "state"), "sessions", requested, "meta.json");
+			const permitted = existsSync(metaFile) ? Object.hasOwn(JSON.parse(readFileSync(metaFile, "utf8")).members, actor) : !existsSync(ownerFile) || JSON.parse(readFileSync(ownerFile, "utf8")).actor === actor;
+			if (!permitted) { closeWith(ws, "无权接入该会话"); return; }
 		}
 		const existing = requested ? this.#sessions.get(requested) : undefined;
 		if (existing) {
-			if (this.#owners.get(requested!) !== actor) {
+			if (!roleOf(metas.get(existing)!.data, actor)) {
 				// 会话 id 会出现在 URL、日志与审计里；仅凭知道 id 就能接管
 				// 别人的会话（发 prompt、批准别人挂起的审批）是越权
 				closeWith(ws, "无权接入该会话");
@@ -275,17 +278,21 @@ export class Gateway {
 		}
 
 		const sessionId = requested ?? randomUUID();
-		const ownerDir = join(this.#cfg.workspaceRoot, ".state", sessionId);
+		const ownerDir = join(this.#cfg.stateRoot ?? join(this.#cfg.workspaceRoot, "..", "state"), "sessions", sessionId);
 		mkdirSync(ownerDir, { recursive: true });
 		writeFileSync(join(ownerDir, "owner.json"), JSON.stringify({ actor }));
 		// 策略作用域由服务端决定：客户端自选 repo/team 等于自选适用规则
 		const scope = this.#cfg.resolveScope?.(actor) ?? { repo: "default", team: "default" };
+		const metaFile = join(ownerDir, "meta.json");
+		const metadata: Meta = existsSync(metaFile) ? JSON.parse(readFileSync(metaFile, "utf8")) : { id: sessionId, owner: actor, ...scope, createdAt: new Date().toISOString(), members: { [actor]: "owner" } };
+		writeFileSync(metaFile, JSON.stringify(metadata));
 		const session = new Session({
 			sessionId,
-			actor,
-			repo: scope.repo,
-			team: scope.team,
+			actor: metadata.owner,
+			repo: metadata.repo,
+			team: metadata.team,
 			workspace: join(this.#cfg.workspaceRoot, sessionId),
+			stateDirectory: ownerDir,
 			policyFile: this.#cfg.policyFile,
 			audit: this.#audit,
 			piBin: this.#cfg.piBin,
@@ -304,6 +311,7 @@ export class Gateway {
 			...(this.#cfg.wiring ? { wiring: { ...this.#cfg.wiring, authorEmail: actor } } : {}),
 			send: (ev, seq, target) => broadcast(session, ev, seq, target),
 		});
+		metas.set(session, { file: metaFile, data: metadata });
 		this.#sessions.set(sessionId, session);
 		this.#owners.set(sessionId, actor);
 		attach(ws, session, actor);
@@ -347,6 +355,7 @@ function attach(ws: WebSocket, session: Session, actor: string): void {
 	const conn: Conn = { ws, actor, queue: [], sending: false, overflow: false };
 	set.add(conn);
 	transports.set(session, set);
+	session.publish({ type: "session.presence", participants: participants(session) });
 
 	ws.on("message", (raw) => {
 		let cmd: ClientCommand;
@@ -357,9 +366,29 @@ function attach(ws: WebSocket, session: Session, actor: string): void {
 			return;
 		}
 		// 审批人是实际点下按钮的那条连接，不是会话创建者
+		try {
+		const meta = metas.get(session)!;
+		if (!cmd || typeof cmd !== "object") { session.handle(cmd, actor, conn); return; }
+		session.auditCommand(actor, cmd?.type ?? "invalid");
+		const role = roleOf(meta.data, actor);
+		if (!role || role === "viewer") { ws.send(JSON.stringify({ event: { type: "error", code: "command_failed", message: "无权执行命令" } })); return; }
+		if (cmd.type === "share" || cmd.type === "unshare") {
+			if (role !== "owner" || typeof cmd.actor !== "string" || !cmd.actor || cmd.actor === meta.data.owner || (cmd.type === "share" && !["editor", "viewer"].includes(cmd.role))) {
+				ws.send(JSON.stringify({ event: { type: "error", code: "command_failed", message: "非法共享命令或无权共享" } })); return;
+			}
+			const members = { ...meta.data.members };
+			if (cmd.type === "share") members[cmd.actor] = cmd.role;
+			else delete members[cmd.actor];
+			writeFileSync(meta.file + ".tmp", JSON.stringify({ ...meta.data, members })); renameSync(meta.file + ".tmp", meta.file);
+			meta.data.members = members;
+			for (const client of set) if (!roleOf(meta.data, client.actor)) { set.delete(client); client.ws.close(4003, "共享已撤销"); }
+			session.publish({ type: "session.presence", participants: participants(session) });
+			return;
+		}
 		session.handle(cmd, actor, conn);
+		} catch { ws.send(JSON.stringify({ event: { type: "error", code: "command_failed", message: "命令提交失败" } })); }
 	});
-	ws.on("close", () => set.delete(conn));
+	ws.on("close", () => { set.delete(conn); session.publish({ type: "session.presence", participants: participants(session) }); });
 	// 传输层错误不应连带打死会话：任务在服务端继续跑，用户重连即可续上
 	ws.on("error", () => set.delete(conn));
 
@@ -368,21 +397,31 @@ function attach(ws: WebSocket, session: Session, actor: string): void {
 	// 全部被「seq <= state.seq」的去重逻辑丢掉 —— 断线期间的事件实际补不回来。
 	ws.send(JSON.stringify({ type: "control", control: "attached", lastSeq: session.lastSeq }));
 	conn.overflow = true;
-	void session.snapshotFrame().then((frame) => { conn.overflow = false; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => ws.close());
+	void session.snapshotFrame().then((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => ws.close());
 }
 
 function broadcast(session: Session, event: ClientEvent, seq: number, target?: unknown): void {
-	const payload = JSON.stringify({ seq, event });
 	for (const conn of transports.get(session) ?? []) {
 		if (target && conn !== target) continue;
+		const personalized = event.type === "session.snapshot" ? { ...event, view: { ...event.view, role: metas.get(session)!.data.members[conn.actor], participants: participants(session) } } : event;
+		const payload = JSON.stringify({ seq, event: personalized });
 		if (conn.ws.readyState !== conn.ws.OPEN) continue;
 		if (conn.overflow) { if (event.type === "error" && conn.queue.length < 100) conn.queue.push(payload); continue; }
 		if (conn.queue.length >= 100) {
 			conn.queue.length = 0;
 			conn.overflow = true;
-			void session.snapshotFrame().then((frame) => { conn.overflow = false; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => conn.ws.close());
+			void session.snapshotFrame().then((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => conn.ws.close());
 		} else { conn.queue.push(payload); drain(conn); }
 	}
+}
+
+interface Meta { id: string; owner: string; repo: string; team: string; createdAt: string; members: Record<string, Role> }
+function roleOf(meta: Meta, actor: string): Role | undefined { return Object.hasOwn(meta.members, actor) ? meta.members[actor] : undefined; }
+const metas = new WeakMap<Session, { file: string; data: Meta }>();
+function participants(session: Session) {
+	const counts = new Map<string, number>();
+	for (const conn of transports.get(session) ?? []) counts.set(conn.actor, (counts.get(conn.actor) ?? 0) + 1);
+	return [...counts].map(([actor, clients]) => ({ actor, clients, role: roleOf(metas.get(session)!.data, actor)! }));
 }
 
 function drain(conn: Conn): void {

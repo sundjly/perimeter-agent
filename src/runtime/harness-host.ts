@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Harness, createRegistry, type Conversation, type AgentEventStream, watchEvents } from "@earendil-works/pi-durable";
+import { Harness, LiveDoc, createRegistry, type Conversation, type AgentEventStream, watchEvents } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -10,6 +10,7 @@ import type { AuditLog } from "../audit/log.ts";
 import type { ClientEvent } from "../protocol/types.ts";
 import { PolicyEngine } from "../policy/engine.ts";
 import { snapshotView } from "../protocol/translate.ts";
+import { AuthorsDoc } from "./authors.ts";
 import { Approvals, ApprovalsDoc } from "./approvals.ts";
 import { gatewayModels, type ModelGateway } from "./models.ts";
 import { perimeterExtension } from "./perimeter-extension.ts";
@@ -49,9 +50,16 @@ export class HarnessHost {
 		const registry = createRegistry();
 		registry.install(CodingTools);
 		let approvals: Approvals;
+		let harness: Harness | undefined;
 		const actor = { value: opts.actor };
 		registry.install(perimeterExtension({
-			repo: opts.repo, team: opts.team, actor: () => actor.value,
+			repo: opts.repo, team: opts.team, actor: async (api) => {
+				const live = await api.snapshot(LiveDoc, api.conversationId, BACKGROUND_CONTEXT);
+				const input = live?.run?.inputs.at(-1);
+				const record = input ? await (await harness?.submission(input, BACKGROUND_CONTEXT))?.status(BACKGROUND_CONTEXT) : undefined;
+				const authors = await api.snapshot(AuthorsDoc, api.conversationId, BACKGROUND_CONTEXT);
+				return record?.requestId ? authors?.requests[record.requestId] ?? opts.actor : opts.actor;
+			},
 			policy: PolicyEngine.fromYaml(readFileSync(opts.policyFile, "utf8")),
 			approvals: () => approvals, approvalTimeoutMs: opts.approvalTimeoutMs ?? 120_000, emit: opts.emit,
 			audit: (input) => {
@@ -60,7 +68,6 @@ export class HarnessHost {
 			},
 		}));
 		const storage = await openNodeSqliteStorage(opts.file);
-		let harness: Harness | undefined;
 		try {
 			harness = await Harness.open(storage, {
 				models: gatewayModels(opts.model), registry,
@@ -94,7 +101,9 @@ export class HarnessHost {
 		await this.assertGuard();
 		const entry = this.#opts.audit.append({ kind: "prompt", sessionId: this.#opts.sessionId, actor, summary: `prompt（${text.length} 字符）` });
 		this.#opts.emit({ type: "audit.entry", entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary } });
-		return this.root.submit({ type: "input", content: text, requestId, whenBusy }, BACKGROUND_CONTEXT);
+		const scopedId = JSON.stringify([actor, requestId]);
+		await this.root.commit(async (tx) => { (await tx.doc(AuthorsDoc, this.root.id)).requests[scopedId] ??= actor; }, BACKGROUND_CONTEXT);
+		return this.root.submit({ type: "input", content: text, requestId: scopedId, whenBusy }, BACKGROUND_CONTEXT);
 	}
 
 	async view() {
@@ -103,6 +112,12 @@ export class HarnessHost {
 			const view = snapshotView(stream.snapshot, this.#opts.sessionId);
 			const approvals = await this.harness.snapshot(ApprovalsDoc, this.root.id, BACKGROUND_CONTEXT);
 			view.approvals = (approvals?.items ?? []).filter((item) => item.status === "pending").map((item) => ({ approvalId: item.id, action: item.action, reason: item.reason, actor: item.actor, expiresAt: item.expiresAt }));
+			const authors = await this.harness.snapshot(AuthorsDoc, this.root.id, BACKGROUND_CONTEXT);
+			const submissions = await this.root.commit((tx) => Promise.all(Object.keys(authors?.requests ?? {}).map((requestId) => tx.submissionByRequest(this.root.id, requestId))), BACKGROUND_CONTEXT);
+			for (const record of submissions) if (record && record.entry !== undefined && record.requestId) {
+				const message = view.messages.find((message) => message.id === String(record.entry));
+				if (message) message.actor = authors?.requests[record.requestId];
+			}
 			return view;
 		} finally { await stream.stop(); }
 	}

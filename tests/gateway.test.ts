@@ -463,3 +463,26 @@ test("快照包含挂起审批，同一审批可从重连端决定", async () =>
 	await c.waitFor(() => !!c.find("approval.resolved"));
 	await c.waitFor(() => !!c.find("agent.end"));
 });
+
+test("多人：viewer 只读、editor 可操作、非成员拒绝，作者留在快照", async () => {
+	const env = await startGateway([{ text: "完成" }]);
+	const owner = await connect(env, "&actor=alice");
+	await owner.waitFor(() => !!owner.find("session.ready"));
+	const id = owner.find("session.ready")!.sessionId;
+	owner.send({ type: "share", actor: "bob", role: "viewer" });
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(owner.find("error"), undefined, JSON.stringify(owner.find("error")));
+	const viewer = await connect(env, `&actor=bob&session=${id}`);
+	await viewer.waitFor(() => !!viewer.find("session.snapshot"));
+	assert.equal(viewer.find("session.snapshot")!.view.role, "viewer");
+	viewer.send({ type: "prompt", text: "越权", requestId: "v" });
+	await viewer.waitFor(() => !!viewer.find("error"));
+	viewer.send({ type: "approve", approvalId: "anything", decision: "allow" });
+	await viewer.waitFor(() => viewer.events.filter((event) => event.type === "error").length === 2);
+	owner.send({ type: "share", actor: "bob", role: "editor" });
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	viewer.send({ type: "prompt", text: "正常", requestId: "e" });
+	await viewer.waitFor(() => viewer.events.some((event) => event.type === "session.snapshot" && event.view.messages.some((message) => message.actor === "bob")));
+	const intruder = await connect(env, `&actor=constructor&session=${id}`);
+	await intruder.waitFor(() => intruder.controls.some((control) => control.control === "error"));
+});
