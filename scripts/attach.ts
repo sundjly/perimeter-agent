@@ -23,6 +23,7 @@ ws.on("message", (raw) => {
 	const frame = JSON.parse(String(raw)) as { event?: ClientEvent; message?: string };
 	if (!frame.event) { if (frame.message) console.log(frame.message); return; }
 	state = reduce(state, frame.event);
+	if (frame.event.type === "usage") console.log(`token ${state.usage.total} · 缓存 ${state.usage.cacheHitRate === null ? "—" : (state.usage.cacheHitRate * 100).toFixed(1) + "%"}`);
 	if (frame.event.type === "session.snapshot") {
 		if (attached !== state.sessionId + state.role) { console.log(`会话 ${state.sessionId} · ${state.role}`); attached = state.sessionId + state.role; }
 		for (const message of state.messages) if (message.id !== "live" && shownMessages.get(message.id) !== message.text) {

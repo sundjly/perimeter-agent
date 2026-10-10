@@ -31,11 +31,13 @@ function text(message: { content: unknown }): string {
 }
 
 export function usageView(raw: SnapshotEvent["usage"]): Usage {
-	const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+	const usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null };
 	for (const u of [...Object.values(raw.models), ...Object.values(raw.tools)]) {
 		usage.input += u.input; usage.output += u.output; usage.cacheRead += u.cacheRead; usage.cacheWrite += u.cacheWrite;
 		usage.total += u.totalTokens; usage.cost += u.cost.total;
 	}
+	const denominator = usage.input + usage.cacheRead + usage.cacheWrite;
+	usage.cacheHitRate = denominator === 0 ? null : usage.cacheRead / denominator;
 	return usage;
 }
 

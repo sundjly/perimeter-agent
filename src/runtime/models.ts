@@ -17,7 +17,7 @@ export function gatewayModels(config: ModelGateway) {
 			id: config.model, name: config.model, api: "openai-completions", provider: "perimeter",
 			baseUrl: config.baseUrl, reasoning: false, input: ["text"], contextWindow: 128_000,
 			maxTokens: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			compat: { supportsDeveloperRole: false, supportsStore: false },
+			compat: { supportsDeveloperRole: false, supportsStore: false, sendSessionAffinityHeaders: true, sessionAffinityFormat: "openai" },
 		}],
 		api: { stream, streamSimple },
 	}));

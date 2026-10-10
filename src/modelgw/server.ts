@@ -157,7 +157,7 @@ export class ModelGateway {
 		}
 
 		const team = String(req.headers["x-perimeter-team"] ?? "default");
-		const sessionId = String(req.headers["x-perimeter-session"] ?? "unknown");
+		const sessionId = String(req.headers.session_id ?? req.headers["x-session-affinity"] ?? req.headers["x-perimeter-session"] ?? "unknown");
 		const actor = String(req.headers["x-perimeter-actor"] ?? "unknown");
 		const body = await readBody(req);
 
@@ -194,6 +194,9 @@ export class ModelGateway {
 
 		const target = upstreamUrl(upstream, body);
 		const headers: Record<string, string> = { "content-type": "application/json" };
+		for (const name of ["session_id", "x-session-id", "x-client-request-id", "x-session-affinity"]) {
+			if (typeof req.headers[name] === "string") headers[name] = req.headers[name];
+		}
 		// 凭据只在这里注入 —— 沙箱侧从头到尾看不到它
 		const auth = upstream.auth ?? (upstream.apiKey ? staticAuth(upstream) : null);
 		if (auth) {

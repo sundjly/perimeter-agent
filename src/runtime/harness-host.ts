@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Harness, LiveDoc, createRegistry, type Conversation, type AgentEventStream, watchEvents } from "@earendil-works/pi-durable";
+import { Harness, LiveDoc, createRegistry, type Conversation, type AgentEventStream, type HarnessSettings, watchEvents } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -29,6 +29,8 @@ export interface HostOptions {
 	approvalTimeoutMs?: number;
 	emit: (event: ClientEvent) => void;
 }
+
+export const RUNTIME_SETTINGS: HarnessSettings = { toolExecution: "sequential", compaction: { backgroundTokens: 32768 } };
 
 export class HarnessHost {
 	readonly harness: Harness;
@@ -72,7 +74,7 @@ export class HarnessHost {
 			harness = await Harness.open(storage, {
 				models: gatewayModels(opts.model), registry,
 				env: () => opts.env ?? new NodeExecutionEnv({ cwd: opts.workspace, shellEnv: { PATH: process.env.PATH } }),
-				settings: { toolExecution: "sequential", compaction: { backgroundTokens: 32768 } },
+				settings: RUNTIME_SETTINGS,
 			}, BACKGROUND_CONTEXT);
 			const root = await harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider: "perimeter", modelId: opts.model.model }, cwd: opts.workspace } });
 			approvals = new Approvals(root, opts.emit, (item) => {

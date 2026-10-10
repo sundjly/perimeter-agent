@@ -494,3 +494,15 @@ test("签名覆盖的头集合 ⊆ 实际发出的头集合，且取值相同", 
 	assert.ok(signedHeaders.includes("host"));
 	assert.equal(seen.headers.host, up.host.includes(":") ? up.host : seen.headers.host);
 });
+
+test("缓存亲和头与 cache_control 请求体原样转发，审计使用 sessionId", async () => {
+	const env = await startGateway();
+	const body = { model: "azure/model", prompt_cache_key: "stable", messages: [{ role: "user", content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] }] };
+	const response = await call(env.url, body, { session_id: "stable", "x-session-affinity": "stable" });
+	await response.text();
+	assert.deepEqual(JSON.parse(env.up.seen[0]!.body), body);
+	assert.equal(env.up.seen[0]!.headers.session_id, "stable");
+	const entries = [];
+	for await (const entry of AuditLog.replay(env.auditFile)) entries.push(entry);
+	assert.ok(entries.some((entry) => entry.sessionId === "stable" && entry.kind === "usage"));
+});

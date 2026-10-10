@@ -1,7 +1,7 @@
 /** 自有协议的纯 reducer，两端共用。 */
 export function initialState() {
 	return { sessionId: "", model: null, streaming: false, messages: [], tools: [], inbox: [], approvals: [], participants: [],
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 }, audit: [], role: "viewer", errors: [], phase: "" };
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "viewer", errors: [], phase: "" };
 }
 /** @param {import("./view-model.js").ViewState} state @param {import("../src/protocol/types.ts").ClientEvent} event */
 export function reduce(state, event) {

@@ -105,6 +105,7 @@ export interface Usage {
 	cacheWrite: number;
 	total: number;
 	cost: number;
+	cacheHitRate: number | null;
 }
 
 /** 策略引擎与审计共用的动作描述 —— 与具体执行后端无关 */

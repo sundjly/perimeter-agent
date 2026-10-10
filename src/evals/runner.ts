@@ -88,6 +88,7 @@ export interface TaskResult {
 	durationMs: number;
 	/** 预检或 harness 层面的问题，不是任务失败 */
 	harnessError?: string;
+	cacheHitRate?: number | null;
 }
 
 /** 把快照复制成干净副本。原地跑的话第一次运行就污染第二次 */
@@ -173,6 +174,8 @@ export async function runTask(task: TaskSpec, opts: RunOptions): Promise<TaskRes
 				socket.send(JSON.stringify({ type: "approve", approvalId: e.approvalId, decision }));
 			}
 			if (e.type === "policy.denied") result.denials += 1;
+			if (e.type === "usage") result.cacheHitRate = e.usage.cacheHitRate;
+			if (e.type === "session.snapshot") result.cacheHitRate = e.view.usage.cacheHitRate;
 			// error 是否致命，判据不是 code 而是**agent 起没起来**。
 			// 「No API key found」报的就是 command_failed，而那种会话不会再有
 			// agent.end —— 按 code 放行的话每个任务都白等满超时。
@@ -331,7 +334,7 @@ export function formatReport(r: SuiteReport): string {
 	for (const t of r.tasks) {
 		const mark = !t.counted ? "—" : t.completed ? "✓" : "✗";
 		const budget = t.counted && !t.withinApprovalBudget ? " ⚠超预算" : "";
-		lines.push(`${mark} ${t.id} [${t.type}] ${(t.durationMs / 1000).toFixed(1)}s 审批 ${t.approvals}${budget} 拒绝 ${t.denials}`);
+		lines.push(`${mark} ${t.id} [${t.type}] ${(t.durationMs / 1000).toFixed(1)}s 审批 ${t.approvals}${budget} 拒绝 ${t.denials} 缓存 ${pct(t.cacheHitRate ?? null)}`);
 		// 只取首行：pi 的错误常带多行文档链接，四个任务复述一遍就把报告淹了
 		if (t.harnessError) lines.push(`    ⚠ ${t.harnessError.split("\n")[0]}`);
 		for (const v of t.verify.filter((v) => !v.ok)) lines.push(`    ✗ ${v.command} → ${v.code}`);

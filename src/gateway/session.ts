@@ -113,7 +113,7 @@ export class Session {
 
 	async snapshot(): Promise<SessionView> {
 		if (!this.#host) return this.#view ?? { sessionId: this.sessionId, model: null, streaming: false, messages: [], tools: [], inbox: [], approvals: [], participants: [],
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 }, audit: [], role: "owner" };
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "owner" };
 		this.#view = await this.#host.view();
 		return { ...this.#view, audit: this.#audit };
 	}

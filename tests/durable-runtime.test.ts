@@ -11,33 +11,7 @@ import { ModelGateway } from "../src/modelgw/server.ts";
 import type { ClientEvent } from "../src/protocol/types.ts";
 import { HarnessHost } from "../src/runtime/harness-host.ts";
 
-async function fixture(script: unknown[], run: (host: HarnessHost, dir: string, reopen: () => Promise<HarnessHost>, events: ClientEvent[]) => Promise<void>, timeout = 200) {
-	const dir = mkdtempSync(join(tmpdir(), "durable-"));
-	const mock = spawn(process.execPath, ["tests/fixtures/mock-model.mjs", "0", JSON.stringify(script)]);
-	const [chunk] = await once(mock.stdout!, "data");
-	const port = JSON.parse(String(chunk)).port;
-	const audit = AuditLog.open(join(dir, "audit.jsonl"));
-	const mgw = new ModelGateway({ port: 0, host: "127.0.0.1", token: "model-token", egressAllowlist: ["127.0.0.1"],
-		upstreams: [{ id: "mock", baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "upstream-secret" }], audit });
-	const mp = await mgw.listen();
-	const events: ClientEvent[] = [];
-	const opts = { sessionId: "test", file: join(dir, "state/session.sqlite"), workspace: join(dir, "workspace"), actor: "alice", repo: "default", team: "default",
-		policyFile: "config/policy.yaml", audit, model: { baseUrl: `http://127.0.0.1:${mp}/v1`, token: "model-token", model: "mock-model" }, approvalTimeoutMs: timeout, emit: (event: ClientEvent) => events.push(event) };
-	let host: HarnessHost | undefined;
-	try {
-		host = await HarnessHost.open(opts);
-		await run(host, dir, async () => { await host!.close(); host = await HarnessHost.open(opts); return host; }, events);
-	} finally {
-		try { await host?.close(); } finally {
-			try { await mgw.close(); } finally {
-				try { audit.close(); } finally {
-					mock.kill();
-					rmSync(dir, { recursive: true, force: true });
-				}
-			}
-		}
-	}
-}
+import { fixture } from "./fixtures/durable.ts";
 
 test("Durable：模型经网关，放行、拒绝与超时审批均在执行前生效", async () => {
 	await fixture([

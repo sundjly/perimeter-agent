@@ -11,6 +11,7 @@
  * script 形如 [{ "tool": "bash", "args": {...} }, { "text": "done" }]，
  * 第 N 次请求返回第 N 条。
  */
+import { appendFileSync } from "node:fs";
 import { createServer } from "node:http";
 
 const port = Number(process.argv[2] ?? 0);
@@ -31,6 +32,7 @@ const server = createServer((req, res) => {
 		body += c;
 	});
 	req.on("end", () => {
+		if (process.argv[4]) appendFileSync(process.argv[4], JSON.stringify({ body: JSON.parse(body), sessionId: req.headers.session_id }) + "\n");
 		const step = script[turn] ?? { text: "no more script" };
 		turn += 1;
 		res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
