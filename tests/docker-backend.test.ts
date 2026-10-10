@@ -408,3 +408,16 @@ test("exec 的 argv：进本会话的容器、切到容器内工作区、命令�
 	// 自定义挂载点要跟着走，否则验收会跑在容器的默认 cwd 上
 	assert.equal(new DockerBackend({ image: "i", repoRoot: "/r", workdir: "/src" }).execArgs("s", "x")[2], "/src");
 });
+
+test("Durable docker：常驻执行连接不挂网关代码、不注入模型环境", () => {
+	const plan = new DockerBackend({ image: IMAGE, repoRoot: "/repo", gatewayId: "durable" }).environmentPlan(ctx);
+	assert.deepEqual(plan.command, ["docker", "exec", "-i", "perimeter-durable-sess-1", "pi-env"]);
+	assert.ok(plan.start!.args.includes("-d"));
+	assert.ok(!plan.start!.args.some((arg) => arg.includes("/opt/perimeter/")));
+	assert.deepEqual(plan.start!.args.flatMap((arg, i, args) => arg === "-e" ? [args[i + 1]] : []), ["HOME=/home/agent"]);
+});
+
+test("Durable kubectl：exec -i 拉起单条 pi-env 连接", () => {
+	const plan = new KubectlBackend({ podTemplate: "agent-{session}", namespace: "agents" }).environmentPlan(ctx);
+	assert.deepEqual(plan.command, ["kubectl", "exec", "-i", "agent-sess-1-abe633f3", "-n", "agents", "--", "pi-env"]);
+});

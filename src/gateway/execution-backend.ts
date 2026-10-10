@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { k8sNameFragment, renderPodManifest } from "../deploy/pod-template.ts";
 import { promisify } from "node:util";
 
+import { openEnvironment, type EnvironmentHandle, type EnvironmentPlan } from "../runtime/execution-env.ts";
+
 const exec = promisify(execFile);
 
 /** 容器内的 HOME。必须与 deploy/sandbox.yaml 里 sandbox-home 的 mountPath 一致 */
@@ -57,6 +59,7 @@ export interface Launch {
 export interface ExecutionBackend {
 	readonly kind: "local" | "docker" | "kubectl";
 	launch(ctx: LaunchContext): Launch;
+	environment?(ctx: LaunchContext): Promise<EnvironmentHandle>;
 	/** 会话结束后的清理。local 无需清理；docker 要收容器 */
 	cleanup?(sessionId: string): Promise<void>;
 	/** 启动时回收上次遗留的容器，返回被回收的 id。local/kubectl 无需实现 */
@@ -183,6 +186,10 @@ export class LocalBackend implements ExecutionBackend {
 		this.#env = env;
 	}
 
+	environment(ctx: LaunchContext): Promise<EnvironmentHandle> {
+		return openEnvironment({ cwd: ctx.workspace, home: ctx.home });
+	}
+
 	launch(ctx: LaunchContext): Launch {
 		return {
 			bin: "pi",
@@ -302,6 +309,23 @@ export class DockerBackend implements ExecutionBackend {
 		// 必须可区分到实例。恒为 "default" 的话，reapOrphans 会按 label
 		// 扫掉另一个网关**正在跑**的容器 —— 正是 gatewayId 要防的那件事。
 		this.#gatewayId = opts.gatewayId ?? `${hostname()}-${process.pid}`;
+	}
+
+	environmentPlan(ctx: LaunchContext): EnvironmentPlan {
+		const launch = this.launch({ ...ctx, env: {} });
+		const args = [...launch.argsPrefix];
+		args[args.indexOf("-i")] = "-d";
+		for (let i = args.length - 1; i >= 0; i--) {
+			if (args[i] === "-v" && args[i + 1]?.includes(":/opt/perimeter/")) args.splice(i, 2);
+			if (args[i] === "-e" && !args[i + 1]?.startsWith("HOME=")) args.splice(i, 2);
+		}
+		args.splice(-1, 1, "/bin/sh", "-c", "while :; do sleep 3600; done");
+		return { cwd: this.#opts.workdir ?? "/workspace", command: ["docker", "exec", "-i", containerName(ctx.sessionId, this.#gatewayId), "pi-env"],
+			start: { bin: "docker", args, env: dockerClientEnv() } };
+	}
+
+	environment(ctx: LaunchContext): Promise<EnvironmentHandle> {
+		return openEnvironment(this.environmentPlan(ctx));
 	}
 
 	launch(ctx: LaunchContext): Launch {
@@ -608,6 +632,16 @@ export class KubectlBackend implements ExecutionBackend {
 		// 会在「资源还不存在」上立即失败，而不是等待。
 		await exec("kubectl", waitArgs, { timeout: readyMs + 10_000 });
 		if (ctx.home) await exec("kubectl", cpArgs, { timeout: 60_000 });
+	}
+
+	environmentPlan(ctx: LaunchContext): EnvironmentPlan {
+		const launch = this.launch(ctx);
+		return { cwd: "/workspace", command: [launch.bin, ...launch.argsPrefix.slice(0, -1), "pi-env"] };
+	}
+
+	async environment(ctx: LaunchContext): Promise<EnvironmentHandle> {
+		await this.prepare(ctx);
+		return openEnvironment(this.environmentPlan(ctx));
 	}
 
 	launch(ctx: LaunchContext): Launch {
