@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
-import type { PiEvent } from "../src/protocol/translate.ts";
+import type { PiEvent } from "../src/rpc/types.ts";
 import { PiSession } from "../src/rpc/pi-session.ts";
 
 /**

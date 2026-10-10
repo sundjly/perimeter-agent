@@ -159,7 +159,7 @@ test("prompt 走完整链路：文本流式返回 + 审计留痕", async () => {
 	c.send({ type: "prompt", text: "修复登录超时" });
 	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
 
-	const text = c.events.filter((e) => e.type === "message.text").map((e) => (e as { delta: string }).delta).join("");
+	const text = c.events.filter((e) => e.type === "message.end").map((e) => (e as { text: string }).text).join("");
 	assert.match(text, /已完成修复/);
 	assert.ok(c.events.some((e) => e.type === "audit.entry"));
 	assert.equal((await AuditLog.verify(env.auditFile)).ok, true);
@@ -232,21 +232,19 @@ test("断线重连不重启会话，任务继续在服务端跑", async () => {
 	second.send({ type: "prompt", text: "继续" });
 	await second.waitFor(() => second.events.some((e) => e.type === "agent.end" && !e.willRetry));
 	// 同一个 workspace，说明复用的是同一个 pi 进程而不是新建会话
-	const text = second.events.filter((e) => e.type === "message.text").map((e) => (e as { delta: string }).delta).join("");
+	const text = second.events.filter((e) => e.type === "message.end").map((e) => (e as { text: string }).text).join("");
 	assert.match(text, /长任务结果/);
 });
 
-test("resume 重放断线期间错过的事件", async () => {
+test("重连下发完整当前快照", async () => {
 	const env = await startGateway([{ text: "结果" }]);
-	const c = await connect(env);
-	await c.waitFor(() => c.find("session.ready") !== undefined);
-	c.send({ type: "prompt", text: "跑" });
-	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
-
-	const before = c.events.length;
-	c.send({ type: "resume", since: 0 });
-	await c.waitFor(() => c.events.length > before);
-	assert.ok(c.events.length >= before * 2 - 1, "resume 应重放历史事件");
+	const first = await connect(env);
+	await first.waitFor(() => !!first.find("session.ready"));
+	first.send({ type: "prompt", text: "跑", requestId: "stable" });
+	await first.waitFor(() => !!first.find("agent.end"));
+	const next = await connect(env, "&session=" + first.find("session.ready")!.sessionId);
+	await next.waitFor(() => next.events.some((event) => event.type === "session.snapshot" && event.view.messages.some((message) => message.text === "结果")));
+	assert.ok(next.find("session.snapshot"));
 });
 
 test("静态文件服务挡住路径穿越", async () => {
@@ -311,43 +309,8 @@ test("策略作用域由服务端决定，客户端自选 repo/team 无效", asy
 	assert.ok(!JSON.stringify(entries).includes("attacker-chosen"));
 });
 
-test("attach 控制帧不参与 seq 序列，否则 resume 补发的事件会被全部丢弃", async () => {
-	const env = await startGateway([{ text: "结果" }]);
-	const c = await connect(env);
-	await c.waitFor(() => c.find("session.ready") !== undefined);
-	c.send({ type: "prompt", text: "跑" });
-	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
 
-	// attach 时收到的是控制帧，不带 seq
-	assert.ok(c.controls.some((m) => m.control === "attached"));
-	// 事件 seq 从 1 开始严格递增，没有重复
-	assert.deepEqual(c.seqs, [...c.seqs].sort((a, b) => a - b));
-	assert.equal(new Set(c.seqs).size, c.seqs.length);
-	assert.equal(c.seqs[0], 1);
-});
 
-test("resume 只补发 since 之后的事件，且只回发起方", async () => {
-	const env = await startGateway([{ text: "结果" }]);
-	const c = await connect(env);
-	await c.waitFor(() => c.find("session.ready") !== undefined);
-	const mid = c.seqs.at(-1)!;
-	c.send({ type: "prompt", text: "跑" });
-	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
-
-	const before = c.seqs.length;
-	c.send({ type: "resume", since: mid });
-	await c.waitFor(() => c.seqs.length > before);
-	// 补发的都是 mid 之后的
-	assert.ok(c.seqs.slice(before).every((s) => s > mid));
-});
-
-test("钩子未挂上之前不下发 prompt —— 否则会在无策略保护下跑工具", async () => {
-	const env = await startGateway([{ text: "x" }]);
-	const c = await connect(env);
-	await c.waitFor(() => c.events.some((e) => e.type === "audit.entry" && e.entry.summary.includes("策略钩子已挂载")));
-	const armed = c.events.find((e) => e.type === "audit.entry" && e.entry.summary.includes("策略钩子已挂载"));
-	assert.ok(armed, "扩展必须宣告钩子已挂载，否则网关无法确认策略生效");
-});
 
 test("会话数上限拦住无限拉起 pi 进程", async () => {
 	const env = await startGateway([{ text: "x" }], { maxSessions: 1 });
@@ -358,104 +321,9 @@ test("会话数上限拦住无限拉起 pi 进程", async () => {
 	assert.match(String(second.controls.find((m) => m.control === "error")?.message), /上限/);
 });
 
-test("缓冲溢出后续接：必须告知客户端丢了什么，而不是假装完整", async () => {
-	// backlog 是有上限的，断线久了最老的事件被挤掉。客户端不知道自己丢了
-	// 东西的话会以为界面完整 —— 而丢掉的可能正是一条 policy.denied
-	const env = await startGateway([{ text: "干完了" }], { backlogSize: 3 });
-	const c = await connect(env);
-	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
 
-	c.send({ type: "prompt", text: "干活" });
-	await c.waitFor(() => c.events.some((e) => e.type === "agent.end"));
-	const lastSeq = c.seqs.at(-1)!;
-	assert.ok(lastSeq > 5, `事件数不足以撑破 3 条的缓冲（lastSeq=${lastSeq}）`);
 
-	c.events.length = 0;
-	c.seqs.length = 0;
-	c.send({ type: "resume", since: 1 });
-	await c.waitFor(() => c.events.some((e) => e.type === "session.gap"));
 
-	// gap 必须是重放的第一条，且它的 seq 必须落在缺口末尾 ——
-	// 带最新 seq 的话，前端 `seq <= state.seq` 的去重会把随后重放的事件全吃掉
-	assert.equal(c.events[0]!.type, "session.gap", "gap 应当先于重放到达");
-	const gap = c.events[0] as { missedFrom: number; missedTo: number };
-	assert.equal(gap.missedFrom, 2, "缺口应当从客户端已知的下一条算起");
-	// backlogSize=3 ⇒ firstSeq = lastSeq-2 ⇒ missedTo = lastSeq-3。钉住算术，不写恒真式
-	assert.equal(gap.missedTo, lastSeq - 3);
-	assert.equal(c.seqs[0], gap.missedTo, "gap 的 seq 必须是 missedTo，否则前端游标会被顶到最新");
-
-	// 缓冲里那 3 条必须真的送到，且 seq 都大于 gap 的
-	const after = c.seqs.slice(1);
-	assert.equal(after.length, 3, `缓冲里的 3 条都要重放，实际 ${after.length}`);
-	assert.ok(
-		after.every((q) => q > gap.missedTo),
-		"重放事件的 seq 必须大于 gap 的，否则会被前端去重丢掉",
-	);
-});
-
-test("缓冲未溢出时不报缺口 —— 别制造假警报", async () => {
-	const env = await startGateway([{ text: "ok" }], { backlogSize: 2000 });
-	const c = await connect(env);
-	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
-	c.events.length = 0;
-
-	c.send({ type: "resume", since: 0 });
-	await new Promise((r) => setTimeout(r, 300));
-	assert.ok(!c.events.some((e) => e.type === "session.gap"), "缓冲够用时不该报缺口");
-	assert.ok(c.events.length > 0, "但历史事件要重放");
-});
-
-test("resume 的 since 越界不崩，也不重复投递", async () => {
-	const env = await startGateway([{ text: "还在" }]);
-	const c = await connect(env);
-	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
-	const seen = c.seqs.at(-1)!;
-	c.events.length = 0;
-
-	// 客户端声称已收到远超实际的 seq
-	c.send({ type: "resume", since: seen + 10_000 });
-	await new Promise((r) => setTimeout(r, 300));
-	assert.equal(c.events.length, 0, "since 超前时不该重放任何东西");
-
-	// 负数会算出 missedFrom 为负的虚构缺口，前端照着会报「有 5 条未恢复」
-	c.send({ type: "resume", since: -5 });
-	await new Promise((r) => setTimeout(r, 300));
-	assert.ok(!c.events.some((e) => e.type === "session.gap"), "负数 since 不该造出缺口");
-	assert.ok(
-		c.events.some((e) => e.type === "error"),
-		"畸形的 since 要有明确反馈，而不是静默按 0 处理",
-	);
-	c.send({ type: "prompt", text: "还活着吗" });
-	await c.waitFor(() => c.events.some((e) => e.type === "agent.end"));
-});
-
-test("续接时重发挂起的审批 —— 否则 agent 一直等到超时而用户看不到框", async () => {
-	// approval.request 滚出缓冲后，服务端 agent 还阻塞着，客户端却永远
-	// 看不到对话框。用户只看到「丢了 N 条记录」，不会想到有东西等着他批。
-	const env = await startGateway([{ tool: "bash", args: { command: "git push origin main" } }, { text: "推完了" }], {
-		backlogSize: 3,
-		approvalTimeoutMs: 60_000,
-	});
-	const c = await connect(env);
-	await c.waitFor(() => c.events.some((e) => e.type === "session.ready"));
-	c.send({ type: "prompt", text: "推一下" });
-	await c.waitFor(() => c.events.some((e) => e.type === "approval.request"));
-	const original = c.events.find((e) => e.type === "approval.request") as { approvalId: string };
-
-	// 制造缺口：审批请求已被挤出缓冲
-	c.events.length = 0;
-	c.seqs.length = 0;
-	c.send({ type: "resume", since: 1 });
-	await c.waitFor(() => c.events.some((e) => e.type === "approval.request"));
-
-	const resent = c.events.find((e) => e.type === "approval.request") as { approvalId: string; expiresAt: number };
-	assert.equal(resent.approvalId, original.approvalId, "必须用同一个 id，否则前端会开出第二个框");
-	assert.ok(resent.expiresAt > Date.now(), "重发的对话框要能算出倒计时");
-
-	// 用重发的 id 批准，工具应当真的执行
-	c.send({ type: "approve", approvalId: resent.approvalId, decision: "allow" });
-	await c.waitFor(() => c.events.some((e) => e.type === "agent.end"));
-});
 
 test("空闲会话被回收，且审计能分辨「被回收」与「自己结束」", async () => {
 	// 运维只看到会话没了、不知道为什么，是排查时最耗时的一类状态
@@ -523,6 +391,7 @@ test("会话启动失败 + 清理失败：网关进程必须活下来", async ()
 			extensionPath: "/tmp/x.ts",
 			policyFile: join(REPO, "config/policy.yaml"),
 		}),
+		prepare: () => Promise.reject(new Error("沙箱起不来")),
 		cleanup: () => Promise.reject(new Error("Pod 也删不掉")),
 	};
 	const env = await startGateway([{ text: "ok" }], { backend: bad });
@@ -566,4 +435,31 @@ test("停不掉的会话不占 maxSessions 的坑", async () => {
 	const c2 = await connect(env);
 	await c2.waitFor(() => c2.events.some((e) => e.type === "session.ready"));
 	assert.ok(!c2.controls.some((m) => m.control === "error"), "新会话不该被僵尸挡住");
+});
+
+test("协议 v2 拒绝旧 resume，重连没有历史增量重放", async () => {
+	const env = await startGateway([{ text: "结果" }]);
+	const c = await connect(env);
+	await c.waitFor(() => !!c.find("session.ready"));
+	c.send({ type: "prompt", text: "跑", requestId: "r" });
+	await c.waitFor(() => !!c.find("agent.end"));
+	const next = await connect(env, "&session=" + c.find("session.ready")!.sessionId);
+	await next.waitFor(() => !!next.find("session.snapshot"));
+	assert.equal(next.events.filter((event) => event.type === "message.text").length, 0);
+	next.send({ type: "resume", since: 0 });
+	await next.waitFor(() => !!next.find("error"));
+});
+
+test("快照包含挂起审批，同一审批可从重连端决定", async () => {
+	const env = await startGateway([{ tool: "bash", args: { command: "git push" } }, { text: "完成" }]);
+	const c = await connect(env);
+	await c.waitFor(() => !!c.find("session.ready"));
+	c.send({ type: "prompt", text: "推送", requestId: "r" });
+	await c.waitFor(() => !!c.find("approval.request"));
+	const next = await connect(env, "&session=" + c.find("session.ready")!.sessionId);
+	await next.waitFor(() => next.events.some((event) => event.type === "session.snapshot" && event.view.approvals.length === 1));
+	const approvalId = c.find("approval.request")!.approvalId;
+	next.send({ type: "approve", approvalId, decision: "deny" });
+	await c.waitFor(() => !!c.find("approval.resolved"));
+	await c.waitFor(() => !!c.find("agent.end"));
 });

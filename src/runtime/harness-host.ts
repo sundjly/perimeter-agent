@@ -9,7 +9,8 @@ import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import type { AuditLog } from "../audit/log.ts";
 import type { ClientEvent } from "../protocol/types.ts";
 import { PolicyEngine } from "../policy/engine.ts";
-import { Approvals } from "./approvals.ts";
+import { snapshotView } from "../protocol/translate.ts";
+import { Approvals, ApprovalsDoc } from "./approvals.ts";
 import { gatewayModels, type ModelGateway } from "./models.ts";
 import { perimeterExtension } from "./perimeter-extension.ts";
 
@@ -91,8 +92,19 @@ export class HarnessHost {
 
 	async submit(text: string, requestId: string, whenBusy: "followUp" | "steer" = "followUp", actor = this.#actor) {
 		await this.assertGuard();
-		this.#opts.audit.append({ kind: "prompt", sessionId: this.#opts.sessionId, actor, summary: `prompt（${text.length} 字符）` });
+		const entry = this.#opts.audit.append({ kind: "prompt", sessionId: this.#opts.sessionId, actor, summary: `prompt（${text.length} 字符）` });
+		this.#opts.emit({ type: "audit.entry", entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary } });
 		return this.root.submit({ type: "input", content: text, requestId, whenBusy }, BACKGROUND_CONTEXT);
+	}
+
+	async view() {
+		const stream = await this.watch();
+		try {
+			const view = snapshotView(stream.snapshot, this.#opts.sessionId);
+			const approvals = await this.harness.snapshot(ApprovalsDoc, this.root.id, BACKGROUND_CONTEXT);
+			view.approvals = (approvals?.items ?? []).filter((item) => item.status === "pending").map((item) => ({ approvalId: item.id, action: item.action, reason: item.reason, actor: item.actor, expiresAt: item.expiresAt }));
+			return view;
+		} finally { await stream.stop(); }
 	}
 
 	watch(): Promise<AgentEventStream> { return watchEvents(this.harness, this.root.id, BACKGROUND_CONTEXT); }

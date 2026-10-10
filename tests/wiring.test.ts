@@ -51,10 +51,8 @@ test("沙箱配置里写的是代理 token，不是上游凭据", () => {
 		model: "claude-sonnet",
 	});
 
-	const provider = JSON.parse(readFileSync(join(home, ".pi", "agent", "models.json"), "utf8")).providers.perimeter;
-	assert.equal(provider.baseUrl, "http://model-gateway.internal:8080/v1");
-	assert.equal(provider.apiKey, PROXY_TOKEN);
-	assert.deepEqual(piArgs, ["--provider", "perimeter", "--model", "claude-sonnet"]);
+	assert.ok(!readdirSync(home).includes(".pi"));
+	assert.deepEqual(piArgs, []);
 });
 
 test("git 重写带上主机名 —— 否则两个上游的同名仓库会塌缩成同一条 allowlist", () => {
@@ -180,7 +178,7 @@ test("端到端：请求经模型网关，且沙箱侧任何文件都不含上�
 	await waitFor(() => events.some((e) => e.type === "agent.end" && !e.willRetry));
 
 	// 回答来自上游，说明整条链路通了
-	const text = events.filter((e) => e.type === "message.text").map((e) => (e as { delta: string }).delta).join("");
+	const text = events.filter((e) => e.type === "message.end").map((e) => (e as { text: string }).text).join("");
 	assert.match(text, /已修复/);
 
 	// 模型网关确实在链路上
@@ -197,7 +195,7 @@ test("端到端：请求经模型网关，且沙箱侧任何文件都不含上�
 		assert.ok(!f.text.includes(GATEWAY_TOKEN), `网关 token 泄漏到 ${f.path} —— agent 读到就能批准自己的审批`);
 	}
 	// 而代理 token 确实在（沙箱要用它访问模型网关）
-	assert.ok(files.some((f) => f.text.includes(PROXY_TOKEN)), "沙箱应当持有代理 token");
+	assert.ok(!files.some((f) => f.text.includes(PROXY_TOKEN)), "模型 token 不应进入沙箱");
 });
 
 test("沙箱 HOME 在 workspace 之外 —— 否则 git commit 会把 token 带进仓库", async () => {
@@ -225,5 +223,5 @@ test("沙箱 HOME 在 workspace 之外 —— 否则 git commit 会把 token 带
 	// agent 的 cwd 是 workspaces/abc123；HOME 在 workspaces/.homes/abc123
 	const cwdFiles = readAllFiles(join(workspaceRoot, "abc123"));
 	assert.ok(!cwdFiles.some((f) => f.text.includes(PROXY_TOKEN)), "工作区里不该有任何 token —— 它会被 commit 走");
-	assert.ok(readAllFiles(join(workspaceRoot, ".homes", "abc123")).some((f) => f.text.includes(PROXY_TOKEN)));
+	assert.ok(!readAllFiles(join(workspaceRoot, ".homes", "abc123")).some((f) => f.text.includes(PROXY_TOKEN)));
 });

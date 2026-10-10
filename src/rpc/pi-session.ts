@@ -1,6 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import type { PiCommand, PiEvent, PiResponse } from "../protocol/translate.ts";
+import type { PiCommand, PiEvent, PiResponse } from "./types.ts";
 import { JsonlFramer } from "./framing.ts";
 
 export interface PiSessionOptions {

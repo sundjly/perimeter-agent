@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface SandboxWiring {
@@ -75,33 +75,9 @@ export function writeSandboxConfig(home: string, w: SandboxWiring): SandboxConfi
 		throw new Error("wiring：配了 gitProxyUrl 就必须同时配 modelGatewayUrl，否则沙箱读不到任何 provider");
 	}
 
-	const agentDir = join(home, ".pi", "agent");
-	mkdirSync(agentDir, { recursive: true });
-
+	mkdirSync(home, { recursive: true });
+	rmSync(join(home, ".pi"), { recursive: true, force: true });
 	const piArgs: string[] = [];
-
-	if (w.modelGatewayUrl) {
-		writeFileSync(
-			join(agentDir, "models.json"),
-			`${JSON.stringify(
-				{
-					providers: {
-						[PROVIDER]: {
-							baseUrl: w.modelGatewayUrl,
-							api: "openai-completions",
-							// 沙箱拿到的是代理 token；模型网关据此鉴权，再换成真 key 发往上游
-							apiKey: w.proxyToken,
-							compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
-							models: [{ id: w.model ?? "default" }],
-						},
-					},
-				},
-				null,
-				2,
-			)}\n`,
-		);
-		piArgs.push("--provider", PROVIDER, "--model", w.model ?? "default");
-	}
 
 	if (w.gitProxyUrl && w.scmHosts?.length) {
 		const proxy = new URL(w.gitProxyUrl);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { type WebSocket, WebSocketServer } from "ws";
@@ -66,6 +66,7 @@ const SESSION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 interface Conn {
 	ws: WebSocket;
 	actor: string;
+	queue: string[]; sending: boolean; overflow: boolean;
 }
 
 /**
@@ -184,7 +185,7 @@ export class Gateway {
 		const idleLimit = this.#cfg.idleTimeoutMs ?? 30 * 60_000;
 		for (const [id, session] of [...this.#sessions]) {
 			const idle = session.idleMs > idleLimit;
-			if (session.alive && !idle) continue;
+			if (session.alive && (!idle || session.busy)) continue;
 			// **delete 的返回值就是并发闸**：setInterval 不等上一次跑完，
 			// 上一轮的陈旧快照会在 await 之后重新轮到已被这一轮收走的会话，
 			// 于是同一个容器被 docker rm 两次 —— 第二次必然「no such container」，
@@ -252,6 +253,10 @@ export class Gateway {
 			return;
 		}
 
+		if (requested) {
+			const ownerFile = join(this.#cfg.workspaceRoot, ".state", requested, "owner.json");
+			if (existsSync(ownerFile) && JSON.parse(readFileSync(ownerFile, "utf8")).actor !== actor) { closeWith(ws, "无权接入该会话"); return; }
+		}
 		const existing = requested ? this.#sessions.get(requested) : undefined;
 		if (existing) {
 			if (this.#owners.get(requested!) !== actor) {
@@ -270,6 +275,9 @@ export class Gateway {
 		}
 
 		const sessionId = requested ?? randomUUID();
+		const ownerDir = join(this.#cfg.workspaceRoot, ".state", sessionId);
+		mkdirSync(ownerDir, { recursive: true });
+		writeFileSync(join(ownerDir, "owner.json"), JSON.stringify({ actor }));
 		// 策略作用域由服务端决定：客户端自选 repo/team 等于自选适用规则
 		const scope = this.#cfg.resolveScope?.(actor) ?? { repo: "default", team: "default" };
 		const session = new Session({
@@ -336,7 +344,7 @@ const transports = new WeakMap<Session, Set<Conn>>();
 
 function attach(ws: WebSocket, session: Session, actor: string): void {
 	const set = transports.get(session) ?? new Set<Conn>();
-	const conn: Conn = { ws, actor };
+	const conn: Conn = { ws, actor, queue: [], sending: false, overflow: false };
 	set.add(conn);
 	transports.set(session, set);
 
@@ -359,14 +367,30 @@ function attach(ws: WebSocket, session: Session, actor: string): void {
 	// 它会把前端的 state.seq 直接顶到最新，导致随后 resume 补发的事件
 	// 全部被「seq <= state.seq」的去重逻辑丢掉 —— 断线期间的事件实际补不回来。
 	ws.send(JSON.stringify({ type: "control", control: "attached", lastSeq: session.lastSeq }));
+	conn.overflow = true;
+	void session.snapshotFrame().then((frame) => { conn.overflow = false; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => ws.close());
 }
 
 function broadcast(session: Session, event: ClientEvent, seq: number, target?: unknown): void {
 	const payload = JSON.stringify({ seq, event });
 	for (const conn of transports.get(session) ?? []) {
 		if (target && conn !== target) continue;
-		if (conn.ws.readyState === conn.ws.OPEN) conn.ws.send(payload);
+		if (conn.ws.readyState !== conn.ws.OPEN) continue;
+		if (conn.overflow) { if (event.type === "error" && conn.queue.length < 100) conn.queue.push(payload); continue; }
+		if (conn.queue.length >= 100) {
+			conn.queue.length = 0;
+			conn.overflow = true;
+			void session.snapshotFrame().then((frame) => { conn.overflow = false; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => conn.ws.close());
+		} else { conn.queue.push(payload); drain(conn); }
 	}
+}
+
+function drain(conn: Conn): void {
+	if (conn.sending || conn.ws.readyState !== conn.ws.OPEN) return;
+	const payload = conn.queue.shift();
+	if (!payload) return;
+	conn.sending = true;
+	conn.ws.send(payload, (error) => { conn.sending = false; if (error) conn.ws.close(); else drain(conn); });
 }
 
 function closeWith(ws: WebSocket, message: string): void {

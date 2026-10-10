@@ -24,7 +24,7 @@ export function perimeterExtension(opts: PerimeterOptions) {
 		opts.audit({ kind: "tool.call", actor, callId: call.id, tool: action.tool, path: action.path, command: action.command,
 			summary: `工具调用 ${action.tool}`, argsHash: contentHash(call.arguments) });
 		const verdict = opts.policy.evaluate(action, { repo: opts.repo, team: opts.team });
-		opts.audit({ kind: "policy.verdict", actor, callId: call.id, summary: `策略 ${verdict.decision}`, verdict: verdict.decision,
+		opts.audit({ kind: "policy.verdict", actor, callId: call.id, summary: `策略 ${verdict.decision} ${action.path ?? action.command ?? action.tool}`, verdict: verdict.decision,
 			...(verdict.decision === "allow" ? {} : { rule: verdict.rule }) });
 		if (verdict.decision === "allow") return undefined;
 		if (verdict.decision === "deny") {

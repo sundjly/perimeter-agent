@@ -83,17 +83,9 @@ function render(ev) {
 			setDot(ev.streaming ? "busy" : "on");
 			break;
 
-		case "session.gap": {
-			// 缓冲有上限，断线久了最老的事件已被挤掉。宁可显眼地告诉用户
-			// 少了什么，也不要让界面看起来是完整的 —— 丢掉的可能正是
-			// 一条策略拒绝，或一个还等着批的审批
-			const gap = document.createElement("div");
-			gap.className = "msg gap";
-			gap.textContent = `⚠ 断线期间有 ${ev.missedTo - ev.missedFrom + 1} 条记录未能恢复（#${ev.missedFrom}–#${ev.missedTo}）。完整记录在服务端的审计日志文件里。`;
-			$("stream").append(gap);
-			autoScroll();
+		case "session.snapshot":
+		case "session.presence":
 			break;
-		}
 
 		case "agent.start":
 			setDot("busy");

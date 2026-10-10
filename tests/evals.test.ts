@@ -271,9 +271,10 @@ test("预检跑在沙箱起来之后 —— 否则容器后端上它永远说 OK
 	const opts = await optsFor([{ text: "不动" }]);
 	const spy = {
 		kind: base.kind,
-		launch: (ctx: Parameters<typeof base.launch>[0]) => {
-			order.push("launch");
-			return base.launch(ctx);
+		launch: (ctx: Parameters<typeof base.launch>[0]) => base.launch(ctx),
+		environment: (ctx: Parameters<typeof base.environment>[0]) => {
+			order.push("environment");
+			return base.environment(ctx);
 		},
 		exec: (...args: Parameters<NonNullable<typeof base.exec>>) => {
 			order.push("exec");
@@ -281,7 +282,7 @@ test("预检跑在沙箱起来之后 —— 否则容器后端上它永远说 OK
 		},
 	};
 	await runTask(taskById("range-sum-off-by-one"), { ...opts, backend: spy });
-	assert.equal(order[0], "launch", `第一次 exec 必须在 launch 之后，实际顺序：${order.join(",")}`);
+	assert.equal(order[0], "environment", `第一次 exec 必须在 launch 之后，实际顺序：${order.join(",")}`);
 });
 
 test("验收命令超时算 harness 问题，不算模型没做出来", async () => {

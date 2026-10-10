@@ -51,7 +51,7 @@ function handledInRender(): string[] {
 
 test("解析假设成立 —— 否则下面几条会静默通过", () => {
 	// 协议侧数量由编译期保证，这里钉住它别在重构中被削掉
-	assert.equal(CLIENT_EVENT_TYPES.length, 20, "事件数变了：确认是有意增删，再改这个数字");
+	assert.equal(CLIENT_EVENT_TYPES.length, 21, "事件数变了：确认是有意增删，再改这个数字");
 	assert.ok(handledInRender().length >= 15, `render() 里只解析到 ${handledInRender().length} 个 case`);
 });
 

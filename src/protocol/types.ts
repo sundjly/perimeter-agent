@@ -10,12 +10,8 @@
 export type ClientEvent =
 	| { type: "session.ready"; sessionId: string; workspace: string; model: string | null }
 	| { type: "session.state"; streaming: boolean; messageCount: number; model: string | null }
-	/**
-	 * 续接时发现有事件已滚出服务端缓冲。**必须显式告知** ——
-	 * 客户端不知道自己丢了东西的话，会以为界面是完整的，
-	 * 而丢掉的可能正是那条 policy.denied 或审批请求。
-	 */
-	| { type: "session.gap"; missedFrom: number; missedTo: number }
+	| { type: "session.snapshot"; view: SessionView }
+	| { type: "session.presence"; participants: Participant[] }
 	| { type: "agent.start" }
 	| { type: "agent.end"; willRetry: boolean }
 	| { type: "agent.settled" }
@@ -53,7 +49,8 @@ export type ClientEvent =
 export const CLIENT_EVENT_TYPES = [
 	"session.ready",
 	"session.state",
-	"session.gap",
+	"session.snapshot",
+	"session.presence",
 	"agent.start",
 	"agent.end",
 	"agent.settled",
@@ -87,11 +84,11 @@ export type ErrorCode = "aborted" | "agent_error" | "extension_error" | "command
 
 /** 浏览器 → 网关 */
 export type ClientCommand =
-	| { type: "prompt"; text: string }
-	| { type: "steer"; text: string }
+	| { type: "prompt"; text: string; requestId?: string }
+	| { type: "steer"; text: string; requestId?: string }
 	| { type: "abort" }
 	| { type: "approve"; approvalId: string; decision: Decision }
-	| { type: "resume"; since: number };
+	;;
 
 export type Decision = "allow" | "deny";
 
@@ -130,4 +127,14 @@ export interface AuditEntryView {
 	kind: string;
 	summary: string;
 	verdict?: string;
+}
+
+export type Role = "owner" | "editor" | "viewer";
+export interface Participant { actor: string; role: Role; clients: number }
+export interface MessageView { id: string; role: "user" | "assistant"; text: string; thinking: string; actor?: string }
+export interface ToolView { callId: string; action: ActionDescriptor; output: string; ok?: boolean }
+export interface SessionView {
+	sessionId: string; model: string | null; streaming: boolean; messages: MessageView[]; tools: ToolView[];
+	inbox: { id: string; mode: string }[]; approvals: { approvalId: string; action: ActionDescriptor; reason: string; actor?: string; expiresAt: number }[];
+	participants: Participant[]; usage: Usage; audit: AuditEntryView[]; role: Role;
 }

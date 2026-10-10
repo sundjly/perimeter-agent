@@ -53,6 +53,7 @@ function gatedSession(): { session: Session; release: () => void; events: Client
 	});
 	// 顺序要紧：stop() 会写 session.end，审计必须在那之后才关
 	cleanups.push(async () => {
+		releaseFn?.();
 		await session.stop();
 		audit.close();
 	});

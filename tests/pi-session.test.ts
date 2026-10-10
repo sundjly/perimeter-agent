@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import type { PiEvent, PiResponse } from "../src/protocol/translate.ts";
+import type { PiEvent, PiResponse } from "../src/rpc/types.ts";
 import { PiSession } from "../src/rpc/pi-session.ts";
 
 const FAKE_PI = fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url));
