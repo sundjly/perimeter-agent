@@ -171,3 +171,5 @@ API 与本文假设不符、做了取舍、或推迟的事项，逐条记在这�
 
 - M0：四个 Pi 包精确锁定 1.1.0；发布包仅含 dist，后续以 dist 的源码与类型为准。包 engines 声明 Node ≥22.19.0；实际用 Node 22.18.0 直接导入四包及 node:sqlite 成功，当前环境 Node 24.21.0 同样成功。尚不把导入成功当作完整运行时兼容性证明。
 - M0 基线已有一条失败：本地 pi-mono 新增 powershell，旧 RPC fixture 过期；更新清单期望，未修改策略豁免。依赖守卫负面验证：额外包名与 ^1.1.0 均使断言失败。
+- M1：新增 SQLite HarnessHost、网关模型目录、进程内 perimeter 扩展与审批 doc；零凭据仍用 mock-model 经模型网关，已有真实工具放行/拒绝/超时、持久 transcript/幂等和移除守卫负面测试。旧网关在 M3 切换前暂保留，旧 RPC 测试在 M7 清理。
+- API 差异：Context 取消字段为 abortSignal；HookApi 只有读与 memo，审批通过 root.commit 写 doc。ToolCall 无 parent 字段，不按 parent 豁免任何调用；实际 CodingTools 仅 read/write/edit/bash，不提供 nested-call 入口。内置 unsafe 工具在执行意图落盘后恢复得到 interrupted，执行阶段不重跑 beforeTool；审批等待在意图之前，重启旧 pending 标 expired 后重新请求。保持 unsafe 默认，不升级重放安全性。
