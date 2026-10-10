@@ -11,22 +11,23 @@ export type ClientEvent =
 	| { type: "session.ready"; sessionId: string; workspace: string; model: string | null }
 	| { type: "session.state"; streaming: boolean; messageCount: number; model: string | null }
 	| { type: "session.snapshot"; view: SessionView }
+	| { type: "inbox.update"; items: { id: string; mode: string }[] }
 	| { type: "session.presence"; participants: Participant[]; role?: Role }
 	| { type: "agent.start" }
 	| { type: "agent.end"; willRetry: boolean }
 	| { type: "agent.settled" }
 	/** 长时间静默期的解释（重试 / 上下文压缩），否则界面会无理由卡住几十秒 */
 	| { type: "agent.status"; phase: AgentPhase; detail: string }
-	| { type: "message.start"; messageId: string; role: "user" | "assistant" }
+	| { type: "message.start"; messageId: string; role: "user" | "assistant"; actor?: string; order?: number }
 	/** delta：增量，前端 append */
 	| { type: "message.text"; messageId: string; delta: string }
 	/** delta：增量，前端 append */
 	| { type: "message.thinking"; messageId: string; delta: string }
-	| { type: "message.end"; messageId: string; text: string }
+	| { type: "message.end"; messageId: string; text: string; thinking?: string; entryId?: string; order?: number }
 	| { type: "tool.start"; callId: string; action: ActionDescriptor; summary: string }
 	/** output：累计快照，前端 replace（不是增量） */
 	| { type: "tool.progress"; callId: string; output: string }
-	| { type: "tool.end"; callId: string; ok: boolean; output: string }
+	| { type: "tool.end"; callId: string; ok: boolean; output: string; action?: ActionDescriptor; order?: number }
 	| { type: "approval.request"; approvalId: string; action: ActionDescriptor; reason: string; expiresAt: number; actor?: string }
 	| { type: "approval.resolved"; approvalId: string; decision: Decision; actor: string }
 	| { type: "policy.denied"; action: ActionDescriptor; rule: string; reason: string; callId?: string }
@@ -51,6 +52,7 @@ export const CLIENT_EVENT_TYPES = [
 	"session.state",
 	"session.snapshot",
 	"session.presence",
+	"inbox.update",
 	"agent.start",
 	"agent.end",
 	"agent.settled",

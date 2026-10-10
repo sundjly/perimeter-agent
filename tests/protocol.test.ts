@@ -28,3 +28,20 @@ test("当前快照包含自有模型与空状态，零 durable doc 下发", () =
 	assert.equal(view.streaming, false);
 	assert.ok(!JSON.stringify(view).includes("pi."));
 });
+
+test("durable 初始内容、块替换与文本增量无需快照也完整", () => {
+	const state = newTranslateState();
+	const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	const events = toClientEvent({ type: "message_update", usage, changes: [
+		{ type: "text_start", contentIndex: 0, block: { type: "text", text: "开始" } },
+		{ type: "text_delta", contentIndex: 0, delta: "继续" },
+	] }, state);
+	assert.deepEqual(events, [
+		{ type: "message.text", messageId: "live", delta: "开始" },
+		{ type: "message.text", messageId: "live", delta: "继续" },
+	]);
+	assert.deepEqual(toClientEvent({ type: "message_update", usage, changes: [
+		{ type: "block", contentIndex: 0, block: { type: "text", text: "修正" } },
+	] }, state), [{ type: "message.end", messageId: "live", text: "修正", thinking: "" }]);
+});

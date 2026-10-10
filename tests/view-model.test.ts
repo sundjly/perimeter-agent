@@ -27,3 +27,25 @@ test("已接入的 editor 降级 viewer 时，presence 立即更新自己的角�
 	assert.equal(viewer.role, "viewer");
 	assert.equal(editor.role, "editor");
 });
+
+test("attach 已有 entry 时，晚到的增量合并最终 ID，不重复 transcript", () => {
+	const snapshot = { ...initialState(), messages: [
+		{ id: "2", order: 2, role: "user" as const, text: "输入", thinking: "", actor: "alice" },
+		{ id: "3", order: 3, role: "assistant" as const, text: "结果", thinking: "" },
+	] };
+	let state = reduce(initialState(), { type: "session.snapshot", view: snapshot });
+	state = reduce(state, { type: "message.start", messageId: "user-live", role: "user", actor: "alice" });
+	state = reduce(state, { type: "message.end", messageId: "user-live", entryId: "2", order: 2, text: "输入", thinking: "" });
+	state = reduce(state, { type: "message.start", messageId: "live", role: "assistant" });
+	state = reduce(state, { type: "message.end", messageId: "live", entryId: "3", order: 3, text: "结果", thinking: "" });
+	assert.deepEqual(state.messages, snapshot.messages);
+});
+
+test("审批期间 attach 的工具卡在执行开始后保留累计输出且不重复", () => {
+	const tool = { callId: "c", order: Number.MAX_SAFE_INTEGER, action: { tool: "bash" }, output: "已有输出" };
+	const snapshot = { ...initialState(), tools: [tool] };
+	const state = reduce(reduce(initialState(), { type: "session.snapshot", view: snapshot }), {
+		type: "tool.start", callId: "c", action: tool.action, summary: "bash",
+	});
+	assert.deepEqual(state.tools, [tool]);
+});

@@ -275,7 +275,9 @@ export class Gateway {
 		// 策略作用域由服务端决定：客户端自选 repo/team 等于自选适用规则
 		const scope = this.#cfg.resolveScope?.(actor) ?? { repo: "default", team: "default" };
 		const metaFile = join(ownerDir, "meta.json");
-		const metadata: Meta = existsSync(metaFile) ? JSON.parse(readFileSync(metaFile, "utf8")) : { id: sessionId, owner: actor, ...scope, createdAt: new Date().toISOString(), members: { [actor]: "owner" } };
+		const metadata: Meta = existsSync(metaFile) ? JSON.parse(readFileSync(metaFile, "utf8")) : {
+			id: sessionId, owner: actor, ...scope, createdAt: new Date().toISOString(), members: { [actor]: "owner" },
+		};
 		if (!existsSync(metaFile)) { writeFileSync(metaFile + ".tmp", JSON.stringify(metadata)); renameSync(metaFile + ".tmp", metaFile); }
 		const session = new Session({
 			sessionId,
@@ -340,7 +342,7 @@ const transports = new WeakMap<Session, Set<Conn>>();
 
 function attach(ws: WebSocket, session: Session, actor: string): void {
 	const set = transports.get(session) ?? new Set<Conn>();
-	const conn: Conn = { ws, actor, queue: [], sending: false, overflow: false };
+	const conn: Conn = { ws, actor, queue: [], sending: false, overflow: true };
 	set.add(conn);
 	transports.set(session, set);
 	session.publish({ type: "session.presence", participants: participants(session) });
@@ -383,21 +385,41 @@ function attach(ws: WebSocket, session: Session, actor: string): void {
 	// 它会把前端的 state.seq 直接顶到最新，导致随后 resume 补发的事件
 	// 全部被「seq <= state.seq」的去重逻辑丢掉 —— 断线期间的事件实际补不回来。
 	ws.send(JSON.stringify({ type: "control", control: "attached", lastSeq: session.lastSeq }));
-	conn.overflow = true;
-	void session.snapshotFrame((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => ws.close());
+	void session.start().then(() => session.snapshotFrame((frame) => {
+		conn.overflow = false;
+		if (frame.event.type === "session.snapshot") frame.event.view = {
+			...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session),
+		};
+		conn.queue.push(JSON.stringify(frame));
+		drain(conn);
+	})).catch(() => { conn.overflow = false; drain(conn); });
 }
 
 function broadcast(session: Session, event: ClientEvent, seq: number, target?: unknown): void {
 	for (const conn of transports.get(session) ?? []) {
 		if (target && conn !== target) continue;
-		const personalized = event.type === "session.snapshot" ? { ...event, view: { ...event.view, role: roleOf(metas.get(session)!.data, conn.actor), participants: participants(session) } } : event.type === "session.presence" ? { ...event, role: roleOf(metas.get(session)!.data, conn.actor) } : event;
+		const personalized = event.type === "session.snapshot" ? {
+			...event, view: { ...event.view, role: roleOf(metas.get(session)!.data, conn.actor), participants: participants(session) },
+		} : event.type === "session.presence" ? { ...event, role: roleOf(metas.get(session)!.data, conn.actor) } : event;
 		const payload = JSON.stringify({ seq, event: personalized });
 		if (conn.ws.readyState !== conn.ws.OPEN) continue;
-		if (conn.overflow) { if (event.type === "error" && conn.queue.length < 100) conn.queue.push(payload); continue; }
+		if (conn.overflow) {
+			if ((event.type === "error" || event.type === "session.ready") && conn.queue.length < 100) {
+				conn.queue.push(payload); drain(conn);
+			}
+			continue;
+		}
 		if (conn.queue.length >= 100) {
 			conn.queue.length = 0;
 			conn.overflow = true;
-			void session.snapshotFrame((frame) => { conn.overflow = false; if (frame.event.type === "session.snapshot") frame.event.view = { ...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session) }; conn.queue.push(JSON.stringify(frame)); drain(conn); }).catch(() => conn.ws.close());
+			void session.snapshotFrame((frame) => {
+				conn.overflow = false;
+				if (frame.event.type === "session.snapshot") frame.event.view = {
+					...frame.event.view, role: roleOf(metas.get(session)!.data, conn.actor)!, participants: participants(session),
+				};
+				conn.queue.push(JSON.stringify(frame));
+				drain(conn);
+			}).catch(() => conn.ws.close());
 		} else { conn.queue.push(payload); drain(conn); }
 	}
 }
@@ -441,7 +463,10 @@ if (process.argv[1] && import.meta.filename === process.argv[1]) {
 		auditFile: process.env.PERIMETER_AUDIT_FILE ?? join(root, "audit-data/audit.jsonl"),
 		workspaceRoot: process.env.PERIMETER_WORKSPACES ?? join(root, "workspaces"),
 		webRoot: join(root, "web"),
-		model: { baseUrl: process.env.PERIMETER_MODEL_GATEWAY_URL ?? "http://127.0.0.1:8080/v1", token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: process.env.PERIMETER_MODEL ?? "default" },
+		model: {
+			baseUrl: process.env.PERIMETER_MODEL_GATEWAY_URL ?? "http://127.0.0.1:8080/v1",
+			token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: process.env.PERIMETER_MODEL ?? "default",
+		},
 	});
 	const port = await gw.listen();
 	console.log(`网关已启动 http://127.0.0.1:${port}/?token=${token}`);

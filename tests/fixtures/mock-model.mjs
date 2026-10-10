@@ -31,7 +31,7 @@ const server = createServer((req, res) => {
 	req.on("data", (c) => {
 		body += c;
 	});
-	req.on("end", () => {
+	req.on("end", async () => {
 		if (process.argv[4]) appendFileSync(process.argv[4], JSON.stringify({ body: JSON.parse(body), sessionId: req.headers.session_id }) + "\n");
 		const step = script[turn] ?? { text: "no more script" };
 		turn += 1;
@@ -70,13 +70,16 @@ const server = createServer((req, res) => {
 				usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
 			});
 		} else {
+			for (const chunk of step.chunks ?? [step.text ?? ""]) {
 			sse(res, {
 				id: `chatcmpl-${turn}`,
 				object: "chat.completion.chunk",
 				created: Math.floor(Date.now() / 1000),
 				model: "mock-model",
-				choices: [{ index: 0, delta: { role: "assistant", content: step.text ?? "" }, finish_reason: null }],
+				choices: [{ index: 0, delta: { role: "assistant", content: chunk }, finish_reason: null }],
 			});
+			if (step.delayMs) await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+			}
 			sse(res, {
 				id: `chatcmpl-${turn}`,
 				object: "chat.completion.chunk",

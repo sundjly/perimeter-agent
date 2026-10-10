@@ -73,3 +73,25 @@ test("真实 bash 不继承网关或模型环境凭据", async () => {
 		});
 	} finally { delete process.env.PERIMETER_TEST_MODEL_SECRET; }
 });
+
+test("Durable 增量 transcript 与持久快照一致，不用逐批快照兜底", async () => {
+	await fixture([
+		{ tool: "bash", args: { command: "printf durable" } },
+		{ chunks: ["甲", "乙", "丙"], delayMs: 150 },
+	], async (host, _dir, _reopen, events) => {
+		const { initialState, reduce } = await import("../web/view-model.js");
+		const stream = await host.watch();
+		try {
+			stream.start(async (batch) => { events.push(...batch); });
+			await (await host.submit("测试", "stream")).wait(BACKGROUND_CONTEXT);
+			const deadline = Date.now() + 2000;
+			while (!events.some((event) => event.type === "agent.settled")) {
+				assert.ok(Date.now() < deadline, "运行结束的增量必须发布");
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			const state = events.reduce(reduce, reduce(initialState(), { type: "session.snapshot", view: stream.snapshot }));
+			assert.equal(events.filter((event) => event.type === "session.snapshot").length, 0);
+			assert.deepEqual({ ...state, audit: [] }, { ...initialState(), ...await host.view() });
+		} finally { await stream.stop(); }
+	});
+});

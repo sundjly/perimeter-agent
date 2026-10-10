@@ -12,6 +12,9 @@ import { type ExecutionBackend, LocalBackend } from "../src/gateway/execution-ba
 import { Gateway } from "../src/gateway/server.ts";
 import type { ClientEvent } from "../src/protocol/types.ts";
 
+import { HarnessHost } from "../src/runtime/harness-host.ts";
+import { initialState, reduce } from "../web/view-model.js";
+
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const MOCK = join(REPO, "tests/fixtures/mock-model.mjs");
 const TOKEN = "test-token";
@@ -458,10 +461,16 @@ test("快照包含挂起审批，同一审批可从重连端决定", async () =>
 	await c.waitFor(() => !!c.find("approval.request"));
 	const next = await connect(env, "&session=" + c.find("session.ready")!.sessionId);
 	await next.waitFor(() => next.events.some((event) => event.type === "session.snapshot" && event.view.approvals.length === 1));
+	assert.deepEqual(c.events.reduce(reduce, initialState()).approvals, next.find("session.snapshot")!.view.approvals);
 	const approvalId = c.find("approval.request")!.approvalId;
 	next.send({ type: "approve", approvalId, decision: "deny" });
 	await c.waitFor(() => !!c.find("approval.resolved"));
 	await c.waitFor(() => !!c.find("agent.end"));
+	const fresh = await connect(env, "&session=" + c.find("session.ready")!.sessionId);
+	await fresh.waitFor(() => !!fresh.find("session.snapshot"));
+	await c.waitFor(() => c.events.some((event) => event.type === "session.presence" && event.participants[0]?.clients === 3));
+	assert.deepEqual(c.events.reduce(reduce, initialState()), fresh.events.reduce(reduce, initialState()));
+	assert.equal(c.events.filter((event) => event.type === "session.snapshot").length, 1);
 });
 
 test("多人：viewer 只读、editor 可操作、非成员拒绝，作者留在快照", async () => {
@@ -482,7 +491,7 @@ test("多人：viewer 只读、editor 可操作、非成员拒绝，作者留在
 	owner.send({ type: "share", actor: "bob", role: "editor" });
 	await new Promise((resolve) => setTimeout(resolve, 30));
 	viewer.send({ type: "prompt", text: "正常", requestId: "e" });
-	await viewer.waitFor(() => viewer.events.some((event) => event.type === "session.snapshot" && event.view.messages.some((message) => message.actor === "bob")));
+	await viewer.waitFor(() => viewer.events.some((event) => event.type === "message.start" && event.actor === "bob"));
 	const intruder = await connect(env, `&actor=constructor&session=${id}`);
 	await intruder.waitFor(() => intruder.controls.some((control) => control.control === "error"));
 });
@@ -503,4 +512,62 @@ test("CLI 已接入时实时审批 ID 可见，可通过行命令决定", async 
 		await owner.waitFor(() => !!owner.find("approval.resolved"));
 		await owner.waitFor(() => !!owner.find("agent.end"));
 	} finally { cli.kill(); }
+});
+
+test("流式增量收敛：每个 attachment 只收到 attach 快照", async () => {
+	const env = await startGateway([
+		{ tool: "bash", args: { command: "printf durable" } },
+		{ chunks: ["第一段", "第二段", "第三段"], delayMs: 180 },
+	]);
+	const client = await connect(env, "&actor=alice");
+	await client.waitFor(() => !!client.find("session.snapshot"));
+	client.send({ type: "prompt", text: "执行工具并流式回答" });
+	await client.waitFor(() => !!client.find("agent.settled"));
+	assert.equal(client.events.filter((event) => event.type === "session.snapshot").length, 1);
+	assert.ok(client.events.filter((event) => event.type === "message.text" && event.messageId === "live" && event.delta).length >= 3);
+	assert.ok(client.find("tool.start"));
+	assert.ok(client.find("tool.end"));
+	const user = client.events.find((event) => event.type === "message.start" && event.role === "user");
+	assert.equal(user?.type === "message.start" ? user.actor : undefined, "alice");
+	const id = client.find("session.snapshot")!.view.sessionId;
+	const attached = await connect(env, `&actor=alice&session=${id}`);
+	await attached.waitFor(() => !!attached.find("session.snapshot"));
+	await client.waitFor(() => client.events.some((event) => event.type === "session.presence" && event.participants[0]?.clients === 2));
+	assert.deepEqual(client.events.reduce(reduce, initialState()), attached.events.reduce(reduce, initialState()));
+	assert.equal(client.events.filter((event) => event.type === "session.snapshot").length, 1);
+});
+
+test("流式中途 attach：后续增量与结束后快照收敛", async () => {
+	const env = await startGateway([{ chunks: ["开头", "中间", "末尾"], delayMs: 250 }]);
+	const first = await connect(env);
+	await first.waitFor(() => !!first.find("session.snapshot"));
+	first.send({ type: "prompt", text: "流式回答" });
+	await first.waitFor(() => first.events.some((event) => event.type === "message.text" && event.delta === "开头"));
+	const query = "&session=" + first.find("session.snapshot")!.view.sessionId;
+	const middle = await connect(env, query);
+	await middle.waitFor(() => !!middle.find("session.snapshot"));
+	assert.ok(middle.find("session.snapshot")!.view.streaming);
+	await middle.waitFor(() => !!middle.find("agent.settled"));
+	const fresh = await connect(env, query);
+	await fresh.waitFor(() => !!fresh.find("session.snapshot"));
+	await middle.waitFor(() => middle.events.some((event) => event.type === "session.presence" && event.participants[0]?.clients === 3));
+	assert.deepEqual(middle.events.reduce(reduce, initialState()), fresh.events.reduce(reduce, initialState()));
+	assert.equal(middle.events.filter((event) => event.type === "session.snapshot").length, 1);
+});
+
+test("Hub attach 只快照已发布状态，不读取领先增量的 durable view", async () => {
+	const original = HarnessHost.prototype.view;
+	let reads = 0;
+	HarnessHost.prototype.view = async function () { reads++; return original.call(this); };
+	try {
+		const env = await startGateway([{ chunks: ["开头", "中间", "结束"], delayMs: 180 }]);
+		const client = await connect(env);
+		await client.waitFor(() => !!client.find("session.snapshot"));
+		client.send({ type: "prompt", text: "持续输出" });
+		await client.waitFor(() => client.events.some((event) => event.type === "message.text" && event.delta === "开头"));
+		const attached = await connect(env, "&session=" + client.find("session.snapshot")!.view.sessionId);
+		await attached.waitFor(() => !!attached.find("session.snapshot"));
+		await attached.waitFor(() => !!attached.find("agent.settled"));
+		assert.equal(reads, 0, "attach 不能越过已发布状态，读到未发送的 durable commit");
+	} finally { HarnessHost.prototype.view = original; }
 });

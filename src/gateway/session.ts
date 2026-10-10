@@ -1,3 +1,4 @@
+import { initialState, reduce, type ViewState } from "../../web/view-model.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -45,7 +46,7 @@ export class Session {
 	get alive(): boolean { return this.#alive; }
 	get idleMs(): number { return Date.now() - this.#lastActivity; }
 	get busy(): boolean { return this.#view?.streaming ?? false; }
-	#view?: SessionView;
+	#view?: ViewState;
 
 	start(): Promise<void> {
 		return this.#starting ??= this.#start();
@@ -62,7 +63,10 @@ export class Session {
 			mkdirSync(home, { recursive: true });
 			rmSync(join(home, ".pi"), { recursive: true, force: true });
 			if (opts.wiring) writeSandboxConfig(home, opts.wiring);
-			const ctx = { sessionId: opts.sessionId, workspace: opts.workspace, home, extensionPath: "", policyFile: opts.policyFile, env: { PERIMETER_REPO: opts.repo, PERIMETER_TEAM: opts.team } };
+			const ctx = {
+				sessionId: opts.sessionId, workspace: opts.workspace, home, extensionPath: "", policyFile: opts.policyFile,
+				env: { PERIMETER_REPO: opts.repo, PERIMETER_TEAM: opts.team },
+			};
 			if (this.#backend.kind !== "kubectl") await this.#backend.prepare?.(ctx);
 			if (!this.#alive) return;
 			
@@ -83,12 +87,12 @@ export class Session {
 				env: this.#env.env, approvalTimeoutMs: opts.approvalTimeoutMs, emit: (event) => this.#emit(event) });
 			if (!this.#alive) { await this.#host.close(); return; }
 			this.#stream = await this.#host.watch();
-			this.#view = this.#stream.snapshot;
+			this.#view = reduce(initialState(), { type: "session.snapshot", view: this.#stream.snapshot });
 			this.#stream.start(async (events) => {
 				for (const event of events) this.#emit(event);
 			});
 			this.#emit({ type: "session.ready", sessionId: opts.sessionId, workspace: opts.workspace, model: model.model });
-			this.#emit({ type: "session.snapshot", view: await this.snapshot() });
+			this.#emit({ type: "session.snapshot", view: this.snapshot() });
 			this.#opts.audit.append({ kind: "session.start", sessionId: this.sessionId, actor: opts.actor, repo: opts.repo, team: opts.team, summary: "会话就绪，策略扩展已确认" });
 			for (const item of this.#queued.splice(0)) this.handle(item.cmd, item.actor);
 		} catch (error) {
@@ -106,17 +110,23 @@ export class Session {
 		this.#opts.audit.append({ kind: "repo.clone", sessionId: this.sessionId, actor: this.#opts.actor, summary: "clone 完成" });
 	}
 
-	async snapshot(): Promise<SessionView> {
+	snapshot(): SessionView {
 		if (!this.#host) return this.#view ?? { sessionId: this.sessionId, model: null, streaming: false, messages: [], tools: [], inbox: [], approvals: [], participants: [],
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "owner" };
-		this.#view = await this.#host.view();
-		return { ...this.#view, audit: this.#audit };
+		// 只快照已发布的状态，避免 durable commit 领先事件回调而重放旧 delta。
+		const { errors: _errors, phase: _phase, ...view } = this.#view!;
+		return { ...view, audit: [...this.#audit] };
 	}
 
 	handle(cmd: ClientCommand, actor = this.#opts.actor, _from?: unknown): void {
 		this.#lastActivity = Date.now();
-		if (!cmd || typeof cmd !== "object" || !["prompt", "steer", "approve", "abort"].includes(cmd.type)) { this.#emit({ type: "error", code: "command_failed", message: "非法命令" }); return; }
-		if ((cmd.type === "prompt" || cmd.type === "steer") && (typeof cmd.text !== "string" || !cmd.text.trim() || typeof cmd.requestId !== "string" || !cmd.requestId || cmd.requestId.length > 256)) { this.#emit({ type: "error", code: "command_failed", message: "消息与 requestId 必须有效" }); return; }
+		if (!cmd || typeof cmd !== "object" || !["prompt", "steer", "approve", "abort"].includes(cmd.type)) {
+			this.#emit({ type: "error", code: "command_failed", message: "非法命令" }); return;
+		}
+		if ((cmd.type === "prompt" || cmd.type === "steer") && (typeof cmd.text !== "string" || !cmd.text.trim()
+			|| typeof cmd.requestId !== "string" || !cmd.requestId || cmd.requestId.length > 256)) {
+			this.#emit({ type: "error", code: "command_failed", message: "消息与 requestId 必须有效" }); return;
+		}
 		if (!this.#alive) { this.#emit({ type: "error", code: "agent_error", message: "会话已关闭，请重新接入" }); return; }
 		if (!this.#host) {
 			if (cmd.type === "abort") this.#queued.length = 0;
@@ -134,9 +144,8 @@ export class Session {
 		} else if (cmd.type === "prompt" || cmd.type === "steer") await this.#host!.submit(cmd.text, cmd.requestId, cmd.type === "steer" ? "steer" : "followUp", actor);
 	}
 	#emit(event: ClientEvent): void {
-		if (event.type === "session.snapshot") { this.#view = event.view; event.view = { ...event.view, audit: this.#audit }; }
-		if (event.type === "agent.start" && this.#view) this.#view.streaming = true;
-		if (event.type === "agent.settled" && this.#view) this.#view.streaming = false;
+		if (this.#view) this.#view = reduce(this.#view, event);
+		if (event.type === "session.snapshot") event.view = { ...event.view, audit: [...this.#audit] };
 		if (event.type === "audit.entry") { this.#audit.push(event.entry); if (this.#audit.length > 100) this.#audit.shift(); }
 		this.#opts.send(event, ++this.#seq);
 	}

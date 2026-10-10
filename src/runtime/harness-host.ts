@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Harness, LiveDoc, createRegistry, type Conversation, type HarnessSettings, type Storage, watchEvents } from "@earendil-works/pi-durable";
+import { Harness, LiveDoc, createRegistry, type Conversation, type HarnessSettings, type Storage, type SnapshotEvent, watchEvents } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { localEnvironment } from "./execution-env.ts";
@@ -75,7 +75,10 @@ export class HarnessHost {
 			approvals: () => approvals, approvalTimeoutMs: opts.approvalTimeoutMs ?? 120_000, emit: opts.emit,
 			audit: (input) => {
 				const entry = opts.audit.append({ ...input, sessionId: opts.sessionId, repo: opts.repo, team: opts.team });
-				opts.emit({ type: "audit.entry", entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, verdict: entry.verdict, actor: entry.actor, approver: entry.approver } });
+				opts.emit({ type: "audit.entry", entry: {
+					seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary,
+					verdict: entry.verdict, actor: entry.actor, approver: entry.approver,
+				} });
 			},
 		}));
 		const storage = await openNodeSqliteStorage(opts.file);
@@ -89,8 +92,14 @@ export class HarnessHost {
 			const agent = await root.agent(BACKGROUND_CONTEXT);
 			if (agent.model?.modelId !== opts.model.model) await root.configure({ model: { provider: "perimeter", modelId: opts.model.model } }, BACKGROUND_CONTEXT);
 			approvals = new Approvals(root, opts.emit, (item) => {
-				const entry = opts.audit.append({ kind: "approval.decision", sessionId: opts.sessionId, actor: item.actor, approver: item.approver, callId: item.callId, rule: item.rule, verdict: item.status === "allow" ? "allow" : "deny", summary: `审批 ${item.status}` });
-				opts.emit({ type: "audit.entry", entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, verdict: entry.verdict, actor: entry.actor, approver: entry.approver } });
+				const entry = opts.audit.append({
+					kind: "approval.decision", sessionId: opts.sessionId, actor: item.actor, approver: item.approver,
+					callId: item.callId, rule: item.rule, verdict: item.status === "allow" ? "allow" : "deny", summary: `审批 ${item.status}`,
+				});
+				opts.emit({ type: "audit.entry", entry: {
+					seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary,
+					verdict: entry.verdict, actor: entry.actor, approver: entry.approver,
+				} });
 			});
 			await approvals.expirePending();
 			const host = new HarnessHost(harness, root, approvals, opts, actor, storage);
@@ -106,7 +115,8 @@ export class HarnessHost {
 
 	async assertGuard(): Promise<void> {
 		const agent = await this.root.agent(BACKGROUND_CONTEXT);
-		if (!agent.extensions.some((extension) => extension.name === "perimeter" && extension.hooks?.some((hook) => hook.task === "pi.tool" && typeof (hook.handlers as Partial<{ beforeTool: unknown }>).beforeTool === "function"))) {
+		if (!agent.extensions.some((extension) => extension.name === "perimeter" && extension.hooks?.some((hook) =>
+			hook.task === "pi.tool" && typeof (hook.handlers as Partial<{ beforeTool: unknown }>).beforeTool === "function"))) {
 			throw new Error("策略扩展未选中，拒绝运行");
 		}
 	}
@@ -122,32 +132,56 @@ export class HarnessHost {
 
 	async view() {
 		const stream = await watchEvents(this.harness, this.root.id, BACKGROUND_CONTEXT);
-		try {
-			const view = snapshotView(stream.snapshot, this.#opts.sessionId);
-			const approvals = await this.harness.snapshot(ApprovalsDoc, this.root.id, BACKGROUND_CONTEXT);
-			view.approvals = (approvals?.items ?? []).filter((item) => item.status === "pending").map((item) => ({ approvalId: item.id, action: item.action, reason: item.reason, actor: item.actor, expiresAt: item.expiresAt }));
-			const authors = await this.harness.snapshot(AuthorsDoc, this.root.id, BACKGROUND_CONTEXT);
-			let submissions = await this.#storage.scanSubmissions({ conversationId: this.root.id }, 1000, undefined, BACKGROUND_CONTEXT);
-			for (;;) {
-				for (const record of submissions.items) if (record.entry !== undefined && record.requestId) {
-					const message = view.messages.find((message) => message.id === String(record.entry));
-					if (message) message.actor = authors?.requests[record.requestId];
-				}
-				if (!submissions.next) break;
-				submissions = await this.#storage.scanSubmissions({ conversationId: this.root.id }, 1000, submissions.next, BACKGROUND_CONTEXT);
+		try { return await this.#view(stream.snapshot); } finally { await stream.stop(); }
+	}
+
+	async #view(snapshot: SnapshotEvent) {
+		const view = snapshotView(snapshot, this.#opts.sessionId);
+		const approvals = await this.harness.snapshot(ApprovalsDoc, this.root.id, BACKGROUND_CONTEXT);
+		view.approvals = (approvals?.items ?? []).filter((item) => item.status === "pending").map((item) => ({
+			approvalId: item.id, action: item.action, reason: item.reason, actor: item.actor, expiresAt: item.expiresAt,
+		}));
+		const authors = await this.harness.snapshot(AuthorsDoc, this.root.id, BACKGROUND_CONTEXT);
+		const messages = new Map(view.messages.map((message) => [message.id, message]));
+		let submissions = await this.#storage.scanSubmissions({ conversationId: this.root.id }, 1000, undefined, BACKGROUND_CONTEXT);
+		for (;;) {
+			for (const record of submissions.items) if (record.entry !== undefined && record.requestId) {
+				const message = messages.get(String(record.entry));
+				if (message) message.actor = authors?.requests[record.requestId];
 			}
-			return view;
-		} finally { await stream.stop(); }
+			if (!submissions.next) break;
+			submissions = await this.#storage.scanSubmissions({ conversationId: this.root.id }, 1000, submissions.next, BACKGROUND_CONTEXT);
+		}
+		return view;
 	}
 
 	async watch(): Promise<RuntimeStream> {
 		const stream = await watchEvents(this.harness, this.root.id, BACKGROUND_CONTEXT);
-		const state = newTranslateState();
+		let state = newTranslateState(stream.snapshot);
 		return {
-			snapshot: await this.view(),
+			snapshot: await this.#view(stream.snapshot),
 			start: (listener) => stream.start(async (events) => {
-				const converted = events.flatMap((event) => toClientEvent(event, state));
-				converted.push({ type: "session.snapshot", view: await this.view() });
+				const authors = events.some((event) => event.type === "submission")
+					? await this.harness.snapshot(AuthorsDoc, this.root.id, BACKGROUND_CONTEXT) : undefined;
+				const actors = new Map(events.flatMap((event) => event.type === "submission" && event.record.entry !== undefined && event.record.requestId
+					? [[String(event.record.entry), authors?.requests[event.record.requestId]] as const] : []));
+				const converted: ClientEvent[] = [];
+				for (let i = 0; i < events.length; i++) {
+					const event = events[i]!;
+					// durable 自身的队列溢出才用快照恢复。
+					if (event.type === "snapshot") {
+						state = newTranslateState(event);
+						converted.push({ type: "session.snapshot", view: await this.#view(event) });
+						continue;
+					}
+					const batch = toClientEvent(event, state);
+					if (event.type === "message_start" && event.message.role === "user") {
+						const end = events.slice(i + 1).find((item) => item.type === "message_end");
+						const start = batch[0];
+						if (start?.type === "message.start" && end?.type === "message_end") start.actor = actors.get(String(end.entry.id));
+					}
+					converted.push(...batch);
+				}
 				await listener(converted);
 			}),
 			stop: () => stream.stop(),
