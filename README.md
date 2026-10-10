@@ -70,7 +70,7 @@ deploy/           K8s 清单
 evals/            任务规格（tasks/）与仓库快照（repos/）
 ```
 
-技术栈刻意保持最小：TypeScript 直接由 Node 运行（类型剥离，无构建步骤），运行时依赖只有 `ws` 与 `yaml`，测试用 `node:test`。
+技术栈刻意保持最小：TypeScript 直接由 Node 运行（类型剥离，无构建步骤），运行时依赖白名单现增加精确锁定的 Pi Durable / pi-ai / chord / pi-env 1.1.0，用于可信网关内的持久运行时与远程工具环境；测试用 `node:test`。
 
 ## Golden task suite
 

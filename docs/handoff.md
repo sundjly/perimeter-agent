@@ -115,7 +115,7 @@ Phase 2 迁路线 A。
   （双向穷尽性检查会在编译期拦，`tests/protocol-coverage.test.ts` 拦前端那半）
 - 改 `deploy/sandbox.yaml` 的五项安全约束 → 同步 `DockerBackend`
   （只读根、非 root、丢弃 capability、禁止提权、独占工作区）
-- 加运行时依赖 → **先想清楚**。运行时依赖只有 `ws` 与 `yaml`，这是硬约束，有测试守着
+- 加运行时依赖 → **先想清楚**。运行时依赖白名单增加精确锁定的 Pi Durable / pi-ai / chord / pi-env 1.1.0：agent 循环迁入可信网关，远程沙箱只执行工具；新增依赖仍有测试守卫
 - 改 `src/audit/log.ts` 的字段 → 检查 `src/audit/siem.ts` 的白名单
   （SIEM 导出按白名单挑字段，不是把 AuditEntry 铺开——否则以后往审计里加
   一个字段就悄悄多导出一份东西）

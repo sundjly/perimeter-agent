@@ -110,11 +110,11 @@ test("schema 校验的能力边界 —— 别把它当成部署会成功的证�
 	assert.equal(validate({ apiVersion: "v1", kind: "Pod", metadata: { name: "x" } }), true);
 });
 
-test("运行时依赖只能是 ws 与 yaml —— 这条硬约束此前没有守卫", () => {
-	// 沙箱镜像走 npm ci --omit=dev，dependencies 里多一个包就多一份
-	// 进沙箱的攻击面。声明在 README 里，但没有任何自动化断言。
+test("运行时依赖白名单：Pi Durable 仅在可信网关运行", () => {
+	// 重构允许四个锁定的 Pi 包；新增依赖仍需显式更新白名单。
 	const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8"));
-	assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["ws", "yaml"]);
+	assert.deepEqual(Object.keys(pkg.dependencies).sort(), ["@earendil-works/chord", "@earendil-works/pi-ai", "@earendil-works/pi-durable", "@earendil-works/pi-env", "ws", "yaml"]);
+	for (const name of Object.keys(pkg.dependencies).filter((name) => name.startsWith("@earendil-works/"))) assert.equal(pkg.dependencies[name], "1.1.0");
 });
 
 test("configmap schema 有判别力 —— 否则下面那条是空转", () => {
