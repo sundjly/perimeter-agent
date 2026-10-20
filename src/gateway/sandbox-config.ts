@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface SandboxWiring {
@@ -47,24 +47,38 @@ export function writeSandboxConfig(home: string, w: SandboxWiring): SandboxConfi
 
 	mkdirSync(home, { recursive: true });
 	rmSync(join(home, ".pi"), { recursive: true, force: true });
-
-	if (w.gitProxyUrl && w.scmHosts?.length) {
-		const proxy = new URL(w.gitProxyUrl);
-		// token 必须编码：含 / @ : % 的 token 会把 URL 解析歪，
-		// 表现为连不上而不是报错。base64 形式的 token 很常见。
-		const cred = `x-session:${encodeURIComponent(w.gitProxyToken!)}`;
-		const sections = w.scmHosts
-			.map((host) => {
-				const rewritten = `${proxy.protocol}//${cred}@${proxy.host}${proxy.pathname.replace(/\/$/, "")}/${host}/`;
-				// 同时覆盖 https 与 ssh 形式，否则 agent 换个协议就绕过了代理
-				return `[url "${rewritten}"]\n\tinsteadOf = https://${host}/\n\tinsteadOf = git@${host}:\n`;
-			})
-			.join("");
-		// 关掉凭据 helper：沙箱里不该有任何本地凭据存储，
-		// 也不该在代理返回 401 时去别处找凭据
-		const user = `[user]\n\tname = ${w.authorName ?? "perimeter-agent"}\n\temail = ${w.authorEmail ?? "agent@perimeter.local"}\n`;
-		writeFileSync(join(home, ".gitconfig"), `${sections}${user}[credential]\n\thelper =\n`);
-	}
-
+	writeGitCredentialConfig(home, w);
 	return { home };
+}
+
+/**
+ * 仅写 .gitconfig（0600 tmp+rename）。R-Q50-3：grant 续签投递复用本函数 —— 不重写
+ * 整个 HOME（不碰运行中会话的 .pi 状态）；同目录原子 rename 对目录 bind mount 可见，
+ * 客户端每次新 git 进程打开即读到新凭据。
+ */
+export function writeGitCredentialConfig(home: string, w: SandboxWiring): void {
+	if (!w.gitProxyUrl || !w.scmHosts?.length) return;
+	if (!w.gitProxyToken) throw new Error("gitProxyToken 必填");
+	mkdirSync(home, { recursive: true });
+	const proxy = new URL(w.gitProxyUrl);
+	// token 必须编码：含 / @ : % 的 token 会把 URL 解析歪，
+	// 表现为连不上而不是报错。base64 形式的 token 很常见。
+	const cred = `x-session:${encodeURIComponent(w.gitProxyToken)}`;
+	const sections = w.scmHosts
+		.map((host) => {
+			const rewritten = `${proxy.protocol}//${cred}@${proxy.host}${proxy.pathname.replace(/\/$/, "")}/${host}/`;
+			// 同时覆盖 https 与 ssh 形式，否则 agent 换个协议就绕过了代理
+			return `[url "${rewritten}"]\n\tinsteadOf = https://${host}/\n\tinsteadOf = git@${host}:\n`;
+		})
+		.join("");
+	// 关掉凭据 helper：沙箱里不该有任何本地凭据存储，
+	// 也不该在代理返回 401 时去别处找凭据
+	const user = `[user]\n\tname = ${w.authorName ?? "perimeter-agent"}\n\temail = ${w.authorEmail ?? "agent@perimeter.local"}\n`;
+	// R-Q50-3：git 凭据文件含活 grant 串 —— 0600 tmp+rename 原子替换（非覆盖写）。
+	const gitconfigPath = join(home, ".gitconfig");
+	const tmp = `${gitconfigPath}.tmp.${process.pid}.${Date.now()}`;
+	writeFileSync(tmp, `${sections}${user}[credential]\n\thelper =\n`, { mode: 0o600 });
+	try { chmodSync(tmp, 0o600); } catch {}
+	renameSync(tmp, gitconfigPath);
+	try { chmodSync(gitconfigPath, 0o600); } catch {}
 }

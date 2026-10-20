@@ -9,6 +9,8 @@ import { promisify } from "node:util";
 import { AuditLog } from "../src/audit/log.ts";
 import { writeSandboxConfig } from "../src/gateway/sandbox-config.ts";
 import { GitCredentialProxy } from "../src/gitproxy/server.ts";
+import { signGrant } from "../src/gitproxy/grants.ts";
+import { randomBytes } from "node:crypto";
 
 /**
  * Week 3 的验收标准：**沙箱内 git clone + git push 成功，
@@ -24,7 +26,32 @@ import { GitCredentialProxy } from "../src/gitproxy/server.ts";
 const GIT_SERVER = fileURLToPath(new URL("./fixtures/git-http-server.mjs", import.meta.url));
 const UPSTREAM_TOKEN = "glpat-upstream-token-only-in-proxy";
 const UPSTREAM_AUTH = `Basic ${Buffer.from(`x-access-token:${UPSTREAM_TOKEN}`).toString("base64")}`;
-const PROXY_TOKEN = "sandbox-proxy-token";
+// B2：PROXY_TOKEN 由真签发器按 grant 维度取代（共享静态 token 已废除）。
+// startProxy 返回 issue()——每个用例按需签发 read/write grant。
+const MASTER_KEY = randomBytes(32);
+const INTERNAL_TOKEN = "internal-test-token-0123456789abcdef";
+const SESSION = "sess-e2e";
+const PRINCIPAL = "principal-e2e";
+const TENANT = "tenant-e2e";
+function makeE2eIssuer() {
+	const snapshot = {
+		epoch: "epoch-e2e-1",
+		activeSessions: { [SESSION]: { principal: PRINCIPAL, tenant: TENANT, repo: "git.internal/app.git", aclVersion: 1 } },
+		revokedJtis: [] as string[],
+	};
+	const registryFetchImpl = (async () => new Response(JSON.stringify(snapshot), { status: 200 })) as unknown as typeof fetch;
+	return {
+		issue(opts: { write?: boolean; repo?: string } = {}): string {
+			return signGrant({
+				v: 1, tenant: TENANT, principal: PRINCIPAL, session: SESSION,
+				repo: opts.repo ?? "git.internal/app.git",
+				caps: { read: true, write: opts.write ?? false, writeRefs: opts.write ? ["refs/heads/*"] : [] },
+				exp: Date.now() + 600_000, jti: `jti-${Math.random().toString(36).slice(2)}`, epoch: snapshot.epoch,
+			} as never, MASTER_KEY, Date.now());
+		},
+		registryFetchImpl,
+	};
+}
 
 const exec = promisify(execFile);
 
@@ -95,10 +122,14 @@ async function startProxy(upstreamPort: number, opts: { allowPush?: boolean } = 
 	const auditFile = join(dir, "audit.jsonl");
 	const audit = AuditLog.open(auditFile);
 	cleanups.push(() => audit.close());
+	const iss = makeE2eIssuer();
 	const proxy = new GitCredentialProxy({
 		port: 0,
 		host: "127.0.0.1",
-		token: PROXY_TOKEN,
+		mode: "production",
+		masterKey: MASTER_KEY,
+		registry: { url: "http://127.0.0.1:1/internal/git/registry", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+		registryFetchImpl: iss.registryFetchImpl,
 		audit,
 		repos: [
 			{
@@ -112,15 +143,16 @@ async function startProxy(upstreamPort: number, opts: { allowPush?: boolean } = 
 		],
 	});
 	cleanups.push(() => proxy.close());
-	return { auditFile, port: await proxy.listen() };
+	const issue = (o: { write?: boolean } = {}): string => iss.issue({ write: o.write ?? (opts.allowPush ?? true) });
+	return { auditFile, port: await proxy.listen(), issue };
 }
 
 /** 按网关的方式生成沙箱侧配置，返回 HOME */
-function sandboxHome(proxyPort: number): string {
+function sandboxHome(proxyPort: number, issue: (o: { write?: boolean }) => string): string {
 	const home = mkdtempSync(join(tmpdir(), "sbhome-"));
 	writeSandboxConfig(home, {
 		proxyToken: "MODEL-TOKEN-only-in-gateway",
-		gitProxyToken: PROXY_TOKEN,
+		gitProxyToken: issue({ write: true }),
 		modelGatewayUrl: "http://127.0.0.1:1/v1",
 		gitProxyUrl: `http://127.0.0.1:${proxyPort}`,
 		scmHosts: ["git.internal"],
@@ -135,8 +167,8 @@ async function auditEntries(file: string) {
 }
 
 test("Week 3 验收：沙箱内 clone 成功，凭据由代理注入", async () => {
-	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
-	const home = sandboxHome(port);
+	const { port, issue } = await startProxy(await startUpstreamServer(await makeUpstream()));
+	const home = sandboxHome(port, issue);
 	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
 
 	// agent 用的是**上游的真实地址**，insteadOf 在背后把它重写到代理
@@ -147,8 +179,8 @@ test("Week 3 验收：沙箱内 clone 成功，凭据由代理注入", async () 
 
 test("Week 3 验收：沙箱内 push 成功，改动真的到了上游", async () => {
 	const upstreamRoot = await makeUpstream();
-	const { port, auditFile } = await startProxy(await startUpstreamServer(upstreamRoot));
-	const home = sandboxHome(port);
+	const { port, auditFile, issue } = await startProxy(await startUpstreamServer(upstreamRoot));
+	const home = sandboxHome(port, issue);
 	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
 
 	await git(["clone", "-q", "https://git.internal/app.git", "repo"], ws, home);
@@ -169,8 +201,8 @@ test("Week 3 验收：沙箱内 push 成功，改动真的到了上游", async (
 });
 
 test("Week 3 验收：沙箱侧看不到任何 git 凭据（全树遍历）", async () => {
-	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
-	const home = sandboxHome(port);
+	const { port, issue } = await startProxy(await startUpstreamServer(await makeUpstream()));
+	const home = sandboxHome(port, issue);
 	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
 	await git(["clone", "-q", "https://git.internal/app.git", "repo"], ws, home);
 	const repo = join(ws, "repo");
@@ -186,18 +218,18 @@ test("Week 3 验收：沙箱侧看不到任何 git 凭据（全树遍历）", as
 		assert.ok(!f.text.includes(UPSTREAM_TOKEN), `上游 git 凭据泄漏到 ${f.path}`);
 		// 这一条才是真会失效的：代理 token 一旦落进 workspace，
 		// agent 一句 git add -A 就把它推到上游去了
-		assert.ok(!f.text.includes(PROXY_TOKEN), `代理 token 落进了 workspace：${f.path} —— 会被 commit 推走`);
+		assert.ok(!/x-session:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/.test(f.text), `git grant 串落进了 workspace：${f.path} —— 会被 commit 推走`);
 	}
 
 	// 代理 token 只在 workspace 之外的 HOME 里
-	assert.ok(readAllFiles(home).some((f) => f.text.includes(PROXY_TOKEN)), "沙箱要用代理 token 访问代理");
+	assert.ok(readAllFiles(home).some((f) => f.text.includes("x-session:")), "沙箱要用 grant 串访问代理（.gitconfig insteadOf）");
 	// .git/config 里存的是原始上游地址，重写只发生在传输层
 	assert.match(readFileSync(join(repo, ".git", "config"), "utf8"), /https:\/\/git\.internal\/app\.git/);
 });
 
 test("沙箱 gitconfig 带提交身份 —— 容器里 hostname 无域时 git 会拒绝提交", async () => {
-	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
-	const home = sandboxHome(port);
+	const { port, issue } = await startProxy(await startUpstreamServer(await makeUpstream()));
+	const home = sandboxHome(port, issue);
 	const cfg = readFileSync(join(home, ".gitconfig"), "utf8");
 	assert.match(cfg, /\[user\]/);
 	assert.match(cfg, /email = /);
@@ -213,8 +245,8 @@ test("沙箱 gitconfig 带提交身份 —— 容器里 hostname 无域时 git �
 
 test("只读仓库：clone 允许，push 被代理拒绝且不到达上游", async () => {
 	const upstreamRoot = await makeUpstream();
-	const { port, auditFile } = await startProxy(await startUpstreamServer(upstreamRoot), { allowPush: false });
-	const home = sandboxHome(port);
+	const { port, auditFile, issue } = await startProxy(await startUpstreamServer(upstreamRoot), { allowPush: false });
+	const home = sandboxHome(port, issue);
 	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
 
 	await git(["clone", "-q", "https://git.internal/app.git", "repo"], ws, home);
@@ -232,8 +264,8 @@ test("只读仓库：clone 允许，push 被代理拒绝且不到达上游", asy
 });
 
 test("allowlist 之外的仓库：clone 直接失败", async () => {
-	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
-	const home = sandboxHome(port);
+	const { port, issue } = await startProxy(await startUpstreamServer(await makeUpstream()));
+	const home = sandboxHome(port, issue);
 	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
 
 	// 代理只放行 git.internal/app.git
@@ -242,8 +274,8 @@ test("allowlist 之外的仓库：clone 直接失败", async () => {
 });
 
 test("工作区已有仓库时跳过 clone —— 否则网关重启后同名会话再也起不来", async () => {
-	const { port } = await startProxy(await startUpstreamServer(await makeUpstream()));
-	const home = sandboxHome(port);
+	const { port, issue } = await startProxy(await startUpstreamServer(await makeUpstream()));
+	const home = sandboxHome(port, issue);
 	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
 
 	// 第一次：正常 clone 到工作区根

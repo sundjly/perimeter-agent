@@ -4,8 +4,10 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { randomBytes } from "node:crypto";
 import { AuditLog } from "../src/audit/log.ts";
 import { GitCredentialProxy } from "../src/gitproxy/server.ts";
+import { signGrant } from "../src/gitproxy/grants.ts";
 
 /**
  * 覆盖策略说明（诚实标注，别让测试名许诺它没验证的东西）：
@@ -25,7 +27,55 @@ import { GitCredentialProxy } from "../src/gitproxy/server.ts";
 
 const UPSTREAM_TOKEN = "glpat-real-upstream-token";
 const UPSTREAM_AUTH = `Basic ${Buffer.from(`x-access-token:${UPSTREAM_TOKEN}`).toString("base64")}`;
-const SESSION_TOKEN = "sandbox-session-token";
+// B2：共享静态会话 token 已废除。测试用真签发器（HMAC masterKey + registry 假快照注入）
+// 按 grant 维度发凭证；负控语义不变，只换凭证来源（合同 §7 迁移要求）。
+const MASTER_KEY = randomBytes(32);
+const INTERNAL_TOKEN = "internal-test-token-0123456789abcdef";
+const SESSION = "sess-test";
+const PRINCIPAL = "principal-test";
+const TENANT = "tenant-test";
+
+interface GrantOpts {
+	repo?: string;
+	read?: boolean;
+	write?: boolean;
+	writeRefs?: string[];
+	exp?: number;
+	jti?: string;
+	session?: string;
+	principal?: string;
+	tenant?: string;
+}
+
+function makeIssuer() {
+	const snapshot = {
+		epoch: "epoch-test-1",
+		activeSessions: {
+			[SESSION]: { principal: PRINCIPAL, tenant: TENANT, repo: "app.git", aclVersion: 1 },
+		} as Record<string, { principal: string; tenant: string; repo: string; aclVersion: number }>,
+		revokedJtis: [] as string[],
+	};
+	const registryFetchImpl = (async () => new Response(JSON.stringify(snapshot), { status: 200 })) as unknown as typeof fetch;
+	return {
+		snapshot,
+		registryFetchImpl,
+		issue(opts: GrantOpts = {}): string {
+			const repo = opts.repo ?? "app.git";
+			return signGrant(
+				{
+					v: 1, tenant: opts.tenant ?? TENANT, principal: opts.principal ?? PRINCIPAL,
+					session: opts.session ?? SESSION, repo,
+					caps: { read: opts.read ?? true, write: opts.write ?? false, writeRefs: opts.writeRefs ?? (opts.write ? ["refs/heads/*"] : []) },
+					exp: opts.exp ?? Date.now() + 600_000,
+					jti: opts.jti ?? `jti-${Math.random().toString(36).slice(2)}`,
+					epoch: snapshot.epoch,
+				} as never,
+				MASTER_KEY, Date.now(),
+			);
+		},
+	};
+}
+type Issuer = ReturnType<typeof makeIssuer>;
 
 const cleanups: (() => Promise<void> | void)[] = [];
 after(async () => {
@@ -50,14 +100,18 @@ async function startRecordingUpstream(): Promise<{ port: number; seen: { method:
 	return { port: (srv.address() as { port: number }).port, seen };
 }
 
-async function startProxy(upstreamPort: number, allowPush?: boolean) {
+async function startProxy(upstreamPort: number, allowPush?: boolean, issuer?: Issuer) {
+	const iss = issuer ?? makeIssuer();
 	const auditFile = join(mkdtempSync(join(tmpdir(), "gp-")), "audit.jsonl");
 	const audit = AuditLog.open(auditFile);
 	cleanups.push(() => audit.close());
 	const proxy = new GitCredentialProxy({
 		port: 0,
 		host: "127.0.0.1",
-		token: SESSION_TOKEN,
+		mode: "production",
+		masterKey: MASTER_KEY,
+		registry: { url: "http://127.0.0.1:1/internal/git/registry", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+		registryFetchImpl: iss.registryFetchImpl,
 		audit,
 		repos: [
 			{
@@ -70,7 +124,12 @@ async function startProxy(upstreamPort: number, allowPush?: boolean) {
 		],
 	});
 	cleanups.push(() => proxy.close());
-	return { auditFile, base: `http://127.0.0.1:${await proxy.listen()}` };
+	const base = `http://127.0.0.1:${await proxy.listen()}`;
+	const issue = (o: GrantOpts = {}) => iss.issue({ write: allowPush ?? false, ...o });
+	// 便捷读 grant（最常用形态）
+	const readGrant = (): string => issue({ read: true, write: false });
+	const writeGrant = (): string => issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
+	return { auditFile, base, issue, readGrant, writeGrant, iss };
 }
 
 async function auditEntries(file: string) {
@@ -82,7 +141,7 @@ async function auditEntries(file: string) {
 function post(base: string, path: string, body: string, headers: Record<string, string> = {}) {
 	return fetch(`${base}${path}`, {
 		method: "POST",
-		headers: { authorization: `Bearer ${SESSION_TOKEN}`, "content-type": "application/x-git-upload-pack-request", ...headers },
+		headers: { "content-type": "application/x-git-upload-pack-request", ...headers },
 		body,
 		signal: AbortSignal.timeout(10_000),
 	});
@@ -92,9 +151,10 @@ function post(base: string, path: string, body: string, headers: Record<string, 
 
 test("git 客户端的 Basic 认证握手：会话 token 通过，上游凭据被替换", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
-	// git 把 URL 里的 user:pass 编成 Basic 送给代理
-	const sandboxAuth = `Basic ${Buffer.from(`x-session:${SESSION_TOKEN}`).toString("base64")}`;
+	const { base, issue } = await startProxy(up.port);
+	// git 把 URL 里的 user:pass 编成 Basic 送给代理（x-session:<grant> 形态不变）
+	const grant = issue({ read: true });
+	const sandboxAuth = `Basic ${Buffer.from(`x-session:${grant}`).toString("base64")}`;
 	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: sandboxAuth } });
 	assert.equal(res.status, 200);
 	assert.equal(up.seen[0]?.auth, UPSTREAM_AUTH, "上游看到的是注入的凭据，不是沙箱送来的会话 token");
@@ -102,19 +162,21 @@ test("git 客户端的 Basic 认证握手：会话 token 通过，上游凭据�
 
 test("沙箱侧从头到尾没有上游 git 凭据 —— 铁律 2 的形态", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
-	const sandboxUrl = `http://x-session:${SESSION_TOKEN}@${new URL(base).host}/app.git`;
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
+	const sandboxUrl = `http://x-session:${grant}@${new URL(base).host}/app.git`;
 	await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, {
-		headers: { authorization: `Basic ${Buffer.from(`x-session:${SESSION_TOKEN}`).toString("base64")}` },
+		headers: { authorization: `Basic ${Buffer.from(`x-session:${grant}`).toString("base64")}` },
 	});
 	// 沙箱能看到的全部：remote URL
 	assert.ok(!sandboxUrl.includes(UPSTREAM_TOKEN), "上游 git 凭据绝不能出现在沙箱侧");
-	assert.ok(sandboxUrl.includes(SESSION_TOKEN), "沙箱手里只有会话 token —— 拿到别处无用");
+	assert.ok(sandboxUrl.includes(grant), "沙箱手里只有本会话 grant —— 拿到别处无用（scope 锁 repo）");
 });
 
 test("没有会话 token 时，git 客户端拿到 401 挑战而不是静默失败", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
 	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`);
 	assert.equal(res.status, 401);
 	assert.match(res.headers.get("www-authenticate") ?? "", /Basic/);
@@ -124,7 +186,8 @@ test("没有会话 token 时，git 客户端拿到 401 挑战而不是静默失�
 
 test("POST 请求体完整转发，且带上注入的凭据", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
 	const body = "0032want 1111111111111111111111111111111111111111\n0000";
 
 	const res = await post(base, "/app.git/git-upload-pack", body);
@@ -136,16 +199,127 @@ test("POST 请求体完整转发，且带上注入的凭据", async () => {
 	assert.equal(seen.auth, UPSTREAM_AUTH, "凭据由代理注入");
 });
 
-test("推送走 git-receive-pack，被单独识别并留痕", async () => {
+function pktCmd(oldSha: string, newSha: string, refname: string): string {
+	const payload = `${oldSha} ${newSha} ${refname}\n`;
+	return Math.round((payload.length + 4)).toString(16).padStart(4, "0") + payload + "0000";
+}
+
+test("推送走 git-receive-pack，被单独识别并留痕（合法命令区，writeRefs 内）", async () => {
 	const up = await startRecordingUpstream();
 	// 推送必须显式授权 —— 默认是只读的
-	const { base, auditFile } = await startProxy(up.port, true);
+	const { base, auditFile, issue } = await startProxy(up.port, true);
+	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
 
-	await post(base, "/app.git/git-receive-pack", "0000", { "content-type": "application/x-git-receive-pack-request" });
+	const body = pktCmd("0".repeat(40), "1".repeat(40), "refs/heads/main");
+	await post(base, "/app.git/git-receive-pack", body, { "content-type": "application/x-git-receive-pack-request" });
 
 	const push = (await auditEntries(auditFile)).find((e) => e.kind === "git.push" && e.verdict === "allow");
 	assert.ok(push, "推送必须留痕");
 	assert.match(push!.summary, /推送到 app\.git/);
+});
+
+test("R49-N4：read-only grant 打 receive-pack → caps 层 403（先于命令区解析），上游零写入", async () => {
+	const up = await startRecordingUpstream();
+	const { base, issue } = await startProxy(up.port, true); // 部署面允许 push
+	const grant = issue({ read: true, write: false }); // 凭证面无写
+	const res = await post(base, "/app.git/git-receive-pack", "0000", {
+		authorization: `Bearer ${grant}`,
+		"content-type": "application/x-git-receive-pack-request",
+	});
+	assert.equal(res.status, 403);
+	assert.equal(up.seen.length, 0);
+});
+
+test("R49-N11：payload/签名篡改 → 403（HMAC 失败），上游零写入", async () => {
+	const up = await startRecordingUpstream();
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
+	const tampered = grant.slice(0, -2) + (grant.endsWith("AA") ? "BB" : "AA");
+	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, {
+		headers: { authorization: `Bearer ${tampered}` },
+	});
+	assert.equal(res.status, 403);
+	assert.equal(up.seen.length, 0);
+});
+
+test("R49-B2：content-type 与端点不一致 → 400 fail-closed（先于 body），上游零写入", async () => {
+	const up = await startRecordingUpstream();
+	const { base, issue } = await startProxy(up.port, true);
+	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
+	const res = await post(base, "/app.git/git-upload-pack", "0032want x\n0000", {
+		authorization: `Bearer ${grant}`,
+		"content-type": "application/x-git-receive-pack-request", // upload-pack 端点配 receive ctype
+	});
+	assert.equal(res.status, 400);
+	assert.equal(up.seen.length, 0);
+});
+
+test("R49-N3：receive-pack 越域 ref（writeRefs 之外）→ 403，上游零写入", async () => {
+	const up = await startRecordingUpstream();
+	const { base, issue } = await startProxy(up.port, true);
+	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/feature/*"] });
+	const body = pktCmd("0".repeat(40), "2".repeat(40), "refs/heads/outside");
+	const res = await post(base, "/app.git/git-receive-pack", body, {
+		authorization: `Bearer ${grant}`,
+		"content-type": "application/x-git-receive-pack-request",
+	});
+	assert.equal(res.status, 403);
+	assert.equal(up.seen.length, 0, "越域推送不得到达上游");
+});
+
+test("R49-N14：命令区超过 64KiB → 413，上游零写入", async () => {
+	const up = await startRecordingUpstream();
+	const { base, issue } = await startProxy(up.port, true);
+	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
+	const big = pktCmd("0".repeat(40), "3".repeat(40), "refs/heads/main") + "0061" + "x".repeat(93) + "\n0000";
+	const flood = big.repeat(800); // ≫64KiB
+	const res = await post(base, "/app.git/git-receive-pack", flood, {
+		authorization: `Bearer ${grant}`,
+		"content-type": "application/x-git-receive-pack-request",
+	});
+	assert.equal([403, 413].includes(res.status), true, `超限/畸形命令区必须拒（实际 ${res.status}）`);
+	assert.equal(up.seen.length, 0);
+});
+
+test("R49-A7：production 构造期 fail-closed（legacy token / 缺 registry）", () => {
+	const up = 1;
+	assert.throws(() => new GitCredentialProxy({
+		port: 0, host: "127.0.0.1", mode: "production", masterKey: MASTER_KEY,
+		legacySessionToken: "legacy",
+		registry: { url: "http://x", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+		repos: [{ name: "app.git", upstream: `http://127.0.0.1:${up}/app.git` }],
+	}), /legacySessionToken/);
+	assert.throws(() => new GitCredentialProxy({
+		port: 0, host: "127.0.0.1", mode: "production", masterKey: MASTER_KEY,
+		repos: [{ name: "app.git", upstream: `http://127.0.0.1:${up}/app.git` }],
+	}), /registry/);
+});
+
+test("R49-N15/B7：上游 302 → redirect:error → 502 + deny，跳转目标零请求", async () => {
+	const redirector = createServer((_req, res) => {
+		res.writeHead(302, { location: "http://127.0.0.1:1/evil" });
+		res.end();
+	});
+	await new Promise<void>((r) => redirector.listen(0, "127.0.0.1", r));
+	cleanups.push(() => new Promise<void>((r) => redirector.close(() => r())));
+	const redirectPort = (redirector.address() as { port: number }).port;
+	const auditFile = join(mkdtempSync(join(tmpdir(), "gp-")), "audit.jsonl");
+	const audit = AuditLog.open(auditFile);
+	cleanups.push(() => audit.close());
+	const iss = makeIssuer();
+	const proxy = new GitCredentialProxy({
+		port: 0, host: "127.0.0.1", mode: "production", masterKey: MASTER_KEY,
+		registry: { url: "http://127.0.0.1:1/internal/git/registry", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+		registryFetchImpl: iss.registryFetchImpl,
+		audit,
+		repos: [{ name: "app.git", upstream: `http://127.0.0.1:${redirectPort}/app.git`, token: UPSTREAM_TOKEN }],
+	});
+	cleanups.push(() => proxy.close());
+	const base = `http://127.0.0.1:${await proxy.listen()}`;
+	const grant = iss.issue({ read: true });
+	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${grant}` } });
+	assert.equal(res.status, 502);
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("重定向")));
 });
 
 test("审计里不得出现上游凭据，连上游地址里内嵌的也要剥掉", async () => {
@@ -153,10 +327,14 @@ test("审计里不得出现上游凭据，连上游地址里内嵌的也要剥�
 	const auditFile = join(mkdtempSync(join(tmpdir(), "gp-")), "audit.jsonl");
 	const audit = AuditLog.open(auditFile);
 	cleanups.push(() => audit.close());
+	const iss = makeIssuer();
 	const proxy = new GitCredentialProxy({
 		port: 0,
 		host: "127.0.0.1",
-		token: SESSION_TOKEN,
+		mode: "production",
+		masterKey: MASTER_KEY,
+		registry: { url: "http://127.0.0.1:1/internal/git/registry", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+		registryFetchImpl: iss.registryFetchImpl,
 		audit,
 		repos: [
 			{
@@ -178,7 +356,8 @@ test("审计里不得出现上游凭据，连上游地址里内嵌的也要剥�
 
 test("只读仓库拒绝推送，拒绝也留痕", async () => {
 	const up = await startRecordingUpstream();
-	const { base, auditFile } = await startProxy(up.port, false);
+	const { base, auditFile, issue } = await startProxy(up.port, false);
+	const grant = issue({ read: true });
 
 	const res = await post(base, "/app.git/git-receive-pack", "0000");
 	assert.equal(res.status, 403);
@@ -188,9 +367,10 @@ test("只读仓库拒绝推送，拒绝也留痕", async () => {
 
 test("info/refs 上的推送探测同样受 allowPush 约束", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port, false);
+	const { base, issue } = await startProxy(up.port, false);
+	const grant = issue({ read: true });
 	const res = await fetch(`${base}/app.git/info/refs?service=git-receive-pack`, {
-		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+		headers: { authorization: `Bearer ${grant}` },
 	});
 	assert.equal(res.status, 403);
 });
@@ -199,10 +379,11 @@ test("info/refs 上的推送探测同样受 allowPush 约束", async () => {
 
 test("allowlist 之外的仓库被拒 —— 代理握着组织级 token，不限仓就等于把它借出去", async () => {
 	const up = await startRecordingUpstream();
-	const { base, auditFile } = await startProxy(up.port);
+	const { base, auditFile, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
 
 	const res = await fetch(`${base}/other-team-secret.git/info/refs?service=git-upload-pack`, {
-		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+		headers: { authorization: `Bearer ${grant}` },
 	});
 	assert.equal(res.status, 403);
 	assert.equal(up.seen.length, 0);
@@ -211,8 +392,9 @@ test("allowlist 之外的仓库被拒 —— 代理握着组织级 token，不�
 
 test("非 git 端点与健康检查", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
-	const res = await fetch(`${base}/app.git/../../etc/passwd`, { headers: { authorization: `Bearer ${SESSION_TOKEN}` } });
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
+	const res = await fetch(`${base}/app.git/../../etc/passwd`, { headers: { authorization: `Bearer ${grant}` } });
 	assert.equal(res.status, 404);
 	assert.equal((await fetch(`${base}/healthz`)).status, 200);
 });
@@ -221,10 +403,14 @@ test("上游不可达时返回 502 而不是挂死", async () => {
 	const auditFile = join(mkdtempSync(join(tmpdir(), "gp-")), "audit.jsonl");
 	const audit = AuditLog.open(auditFile);
 	cleanups.push(() => audit.close());
+	const iss = makeIssuer();
 	const proxy = new GitCredentialProxy({
 		port: 0,
 		host: "127.0.0.1",
-		token: SESSION_TOKEN,
+		mode: "production",
+		masterKey: MASTER_KEY,
+		registry: { url: "http://127.0.0.1:1/internal/git/registry", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+		registryFetchImpl: iss.registryFetchImpl,
 		audit,
 		repos: [{ name: "app.git", upstream: "http://127.0.0.1:1/app.git" }],
 		fetchImpl: (() => Promise.reject(new Error("ECONNREFUSED"))) as unknown as typeof fetch,
@@ -237,7 +423,8 @@ test("上游不可达时返回 502 而不是挂死", async () => {
 
 test("默认只读：不传 allowPush 时推送被拒", async () => {
 	const up = await startRecordingUpstream();
-	const { base, auditFile } = await startProxy(up.port); // 刻意不传
+	const { base, auditFile, issue } = await startProxy(up.port);
+	const grant = issue({ read: true }); // 刻意不传
 
 	const res = await post(base, "/app.git/git-receive-pack", "0000");
 	assert.equal(res.status, 403, "未显式授权就该拒绝");
@@ -247,9 +434,10 @@ test("默认只读：不传 allowPush 时推送被拒", async () => {
 
 test("默认只读不影响 clone —— 只读仓库照样能拉", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
 	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, {
-		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+		headers: { authorization: `Bearer ${grant}` },
 	});
 	assert.equal(res.status, 200);
 	assert.equal(up.seen.length, 1);
@@ -259,9 +447,10 @@ test("只有 service 参数被透传给上游 —— 沙箱不能往上游塞任
 	// 全量透传会让沙箱覆盖 upstream URL 里已有的同名参数
 	// （GitLab 支持 ?private_token=），也给上游多开一个无谓的输入面
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
 	await fetch(`${base}/app.git/info/refs?service=git-upload-pack&private_token=attacker&x=1`, {
-		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+		headers: { authorization: `Bearer ${grant}` },
 	});
 	const seen = up.seen.at(-1)!;
 	assert.match(seen.url, /service=git-upload-pack/);
@@ -276,9 +465,10 @@ test("重复 service 参数：代理判定与转发给上游的必须一致", as
 	// 「代理认为不是推送」与「上游按推送处理」同时成立，
 	// 正是只读仓库最不该出现的状态。
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port); // 默认只读
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true }); // 默认只读
 	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack&service=git-receive-pack`, {
-		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+		headers: { authorization: `Bearer ${grant}` },
 	});
 
 	if (res.status === 200) {
@@ -293,11 +483,12 @@ test("重复 service 参数：代理判定与转发给上游的必须一致", as
 
 test("端点与方法的对应被强制 —— 不替沙箱把 PUT/DELETE 递给上游", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
 	for (const method of ["PUT", "DELETE", "PATCH"]) {
 		const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, {
 			method,
-			headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+			headers: { authorization: `Bearer ${grant}` },
 		});
 		assert.equal(res.status, 405, `${method} 应当被拒`);
 	}
@@ -306,9 +497,10 @@ test("端点与方法的对应被强制 —— 不替沙箱把 PUT/DELETE 递给
 
 test("service 值的大小写变体不透传 —— 判定与转发不能各看各的字符串", async () => {
 	const up = await startRecordingUpstream();
-	const { base } = await startProxy(up.port);
+	const { base, issue } = await startProxy(up.port);
+	const grant = issue({ read: true });
 	await fetch(`${base}/app.git/info/refs?service=GIT-RECEIVE-PACK`, {
-		headers: { authorization: `Bearer ${SESSION_TOKEN}` },
+		headers: { authorization: `Bearer ${grant}` },
 	});
 	if (up.seen.length > 0) {
 		assert.ok(!/service=/i.test(up.seen.at(-1)!.url), "不认识的 service 值不该原样递给上游");

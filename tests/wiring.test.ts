@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -107,6 +107,7 @@ test("代理 token 等于网关 token 时拒绝启动 —— 否则等于把审�
 	assert.throws(
 		() =>
 			new Gateway({
+				mode: "demo",
 				port: 0,
 				host: "127.0.0.1",
 				token: "same-token",
@@ -145,6 +146,7 @@ test("端到端：请求经模型网关，且沙箱侧任何文件都不含上�
 
 	const workspaceRoot = join(dir, "workspaces");
 	const gateway = new Gateway({
+		mode: "demo",
 		port: 0,
 		host: "127.0.0.1",
 		token: GATEWAY_TOKEN,
@@ -204,6 +206,7 @@ test("沙箱 HOME 在 workspace 之外 —— 否则 git commit 会把 token 带
 	const dir = mkdtempSync(join(tmpdir(), "wire-home-"));
 	const workspaceRoot = join(dir, "workspaces");
 	const gateway = new Gateway({
+		mode: "demo",
 		port: 0,
 		host: "127.0.0.1",
 		token: GATEWAY_TOKEN,
@@ -228,6 +231,25 @@ test("沙箱 HOME 在 workspace 之外 —— 否则 git commit 会把 token 带
 
 test("显式模型配置不能与沙箱 git 代理共用凭据", () => {
 	const dir = mkdtempSync(join(tmpdir(), "credential-domains-"));
-	assert.throws(() => new Gateway({ port: 0, host: "127.0.0.1", token: "browser-only", policyFile: "config/policy.yaml", auditFile: join(dir, "a.jsonl"), workspaceRoot: join(dir, "ws"), webRoot: "web",
+	assert.throws(() => new Gateway({ mode: "demo", port: 0, host: "127.0.0.1", token: "browser-only", policyFile: "config/policy.yaml", auditFile: join(dir, "a.jsonl"), workspaceRoot: join(dir, "ws"), webRoot: "web",
 		model: { baseUrl: "http://model/v1", token: "same", model: "model" }, wiring: { proxyToken: "unused-model-alias", gitProxyToken: "same", gitProxyUrl: "http://git", scmHosts: ["git.internal"] } }), /模型 token 不能与 gitProxyToken 相同/);
+});
+
+test("B2：gitGrant masterKey/internalToken 与既有凭据域互异（构造期 fail-fast；R51 H1 真实 ctor 同缝）", async () => {
+	// 纯度口径（R50 观察如实）：Gateway 构造含真实 reaper/renew timer 与 audit FS ——
+	// 本用例是构造级非 pure；纯逻辑断言在 tests/credential-domains.test.ts（同缝模块）。
+	const dir = mkdtempSync(join(tmpdir(), "grant-domains-"));
+	const base = { mode: "demo" as const, port: 0, host: "127.0.0.1", token: "browser-only", policyFile: "config/policy.yaml", auditFile: join(dir, "a.jsonl"), workspaceRoot: join(dir, "ws"), webRoot: "web", model: { baseUrl: "http://model/v1", token: "model-only", model: "model" }, wiring: { proxyToken: "unused-model-alias", gitProxyToken: "git-proxy-only", gitProxyUrl: "http://git", scmHosts: ["git.internal"] } };
+	// masterKey 等于网关 token → 抛
+	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: "browser-only", internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } }), /凭据域必须分开/);
+	// masterKey 等于 internalToken → 抛
+	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: "same-key-0123456789abcdef", internalToken: "same-key-0123456789abcdef", writeRefs: ["refs/heads/*"] } }), /internalToken/);
+	// masterKey 过短 → 抛（H1：强度与互异同门）
+	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: "short", internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } }), /强度不足/);
+	// R-Q50-5：hex/字符串形态差不藏碰撞（masterKey 原字节恰为 internalToken 的 UTF-8 字节）
+	const collide = Buffer.from("internal-only-0123456789", "utf8");
+	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: collide, internalToken: collide.toString("hex"), writeRefs: ["refs/heads/*"] } }), /凭据域碰撞/);
+	// 合法互异配置真正不抛/进入生产接线（H1 正控：不再恒抛）
+	const gw = new Gateway({ ...base, gitGrants: { masterKey: randomBytes(32), internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } });
+	await gw.close();
 });
