@@ -8,6 +8,7 @@ import { AuditLog } from "../src/audit/log.ts";
 import {
 	GRANT_MAX_TTL_MS,
 	MASTER_KEY_MIN_BYTES,
+	GrantError,
 	refGlobMatch,
 	signGrant,
 	isValidRefname,
@@ -32,7 +33,7 @@ function claims(over: Partial<Parameters<typeof signGrant>[0]> = {}): Parameters
 	return {
 		v: 1, tenant: "t1", principal: "p1", session: "s1", repo: "git.internal/app.git",
 		caps: { read: true, write: false, writeRefs: [] },
-		exp: NOW + 60_000, jti: "jti-1", epoch: "epoch-1", ...over,
+		exp: NOW + 60_000, jti: "jti-1", epoch: "epoch-1", aclVersion: 1, ...over,
 	};
 }
 
@@ -108,7 +109,7 @@ test("grant 验证失败 reason 全部固定类别（不透传客户端可控原
 	// 非法 writeRefs 在 signGrant 即同步抛错，无法先签后验。
 	assert.throws(
 		() => signGrant(claims({ caps: { read: true, write: true, writeRefs: ["not-a-ref!!longpayload..."] } }), MASTER, NOW),
-		(e) => e instanceof Error && e.message === "caps.writeRefs 非法（固定类别，不透传原文）" && !e.message.includes("not-a-ref"),
+		(e) => e instanceof GrantError && e.reason === "caps.writeRefs 非法（固定类别，不透传原文）" && !e.message.includes("not-a-ref"),
 	);
 });
 

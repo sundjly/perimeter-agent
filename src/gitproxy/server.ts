@@ -12,7 +12,7 @@ import {
 	type GrantClaims,
 } from "./grants.ts";
 import { CMD_BAND_MAX_BYTES as HEADER_BAND_MAX_BYTES, PktHeaderScanner, createIdentityForward, parsePktCommands } from "./receive-pack.ts";
-import { DeadlineReadGate, armDeadlineTimer, disarmDeadlineTimer } from "./bounded-reader.ts";
+import { DeadlineError, DeadlineReadGate, armDeadlineTimer, disarmDeadlineTimer } from "./bounded-reader.ts";
 import { ByteBudget } from "./byte-budget.ts";
 
 export interface RepoMapping {
@@ -651,6 +651,7 @@ export class GitCredentialProxy {
 		}
 		// R59-v2/F3：响应收尾尾部不再无条件 dispose（由 end/error/close/无body/fetch
 		// catch/revalidate 各自触发；dispose 幂等）
+	}
 
 	/** 授权后慢路径的 fetch 前重验（H6）：快照新鲜度 + exp + epoch + jti + 登记 + acl */
 	#revalidateBeforeFetch(claims: GrantClaims): string | null {
@@ -715,7 +716,7 @@ export class GitCredentialProxy {
 		const identity = encoding === "identity";
 		// R59-②：onLifetimeFire 由调用方注入（AbortController.abort——fire 时真正 abort 外层 fetch）
 		// R55-D：零窗 `>=` 拒（不可启动 read）；header 10s 可配有限；全 body 寿命/字节硬上限
-		if (requestStartMono + this.#limits.receiveHeaderDeadlineMs <= this.#mono()) {
+		if (requestStartMono + this.#limits.headerDeadlineMs <= this.#mono()) {
 			deny(408, "拒绝：receive 请求窗口已耗尽（零窗拒绝）");
 			return null;
 		}
@@ -751,14 +752,14 @@ export class GitCredentialProxy {
 						if (pumpDead) { await rawReader.cancel().catch(() => {}); return; }
 						if (done) { gunzip!.end(); return; } // 正常 EOF：不 destroy，尾部读尽
 						counters.compressedBytes += value.length;
-						if (!scannerDone && counters.compressedBytes > this.#limits.receiveHeaderCompressedCapBytes) {
+						if (!scannerDone && counters.compressedBytes > this.#limits.headerCompressedCapBytes) {
 							pumpDead = true;
 							counters.fail("拒绝：receive-pack header 压缩侧超限");
 							gunzip!.destroy();
 							await rawReader.cancel().catch(() => {});
 							return;
 						}
-						if (counters.compressedBytes > this.#limits.receiveMaxRawBodyBytes) {
+						if (counters.compressedBytes > this.#limits.maxRawBodyBytes) {
 							pumpDead = true;
 							counters.fail("拒绝：receive body 超过原始字节上限");
 							gunzip!.destroy();
@@ -815,8 +816,8 @@ export class GitCredentialProxy {
 
 		// 阶段一：header 定位（owned 截止能唤醒 pending read；header 段=min(header, body) 双锚）
 		let sawEnd = false;
-		const headerBudgetDeadline = requestStartMono + this.#limits.receiveHeaderDeadlineMs;
-		const bodyBudgetDeadline = requestStartMono + this.#limits.receiveBodyDeadlineMs;
+		const headerBudgetDeadline = requestStartMono + this.#limits.headerDeadlineMs;
+		const bodyBudgetDeadline = requestStartMono + this.#limits.bodyDeadlineMs;
 		// R59-③：同一纯计数实现覆盖 header+同 chunk tail+续 PACK；identity 时 raw==decoded
 		// 同轨即时检查（gzip 的 raw 由泵独立累计，见下）。
 		// R57-D/H：唯一原请求绝对 body deadline 的全寿命 timer——upstream 不 pull/backpressure
@@ -831,7 +832,7 @@ export class GitCredentialProxy {
 		const bodyLifetimeTimer = this.#deadlineArm(bodyBudgetDeadline, countersAbort);
 		const headerDeadline = Math.min(headerBudgetDeadline, bodyBudgetDeadline); // R58-3：header 段取 min（最早预算）
 		// F1：唯一 ByteBudget 实例（arm 前构造；header 循环/seed/转发段共用同一计数缝）
-		const budget = new ByteBudget(this.#limits.receiveMaxDecodedBytes, identity ? this.#limits.receiveMaxRawBodyBytes : Number.MAX_SAFE_INTEGER);
+		const budget = new ByteBudget(this.#limits.maxDecodedBytes, identity ? this.#limits.maxRawBodyBytes : Number.MAX_SAFE_INTEGER);
 		for (;;) {
 			if (scanner.state$.phase === "done") { scannerDone = true; sawEnd = true; break; }
 			if (scanner.state$.phase === "error") {

@@ -353,6 +353,8 @@ export class Gateway {
 		this.#revocationsFile = join(this.#stateRoot, "revocations.json");
 		this.#sessionsFile = join(this.#stateRoot, "browser-sessions.json");
 		this.#gitGrantFile = join(this.#stateRoot, "git-grants-registry.json");
+		// R65：#audit 赋值前移到首次使用之前（构造期 git grants 恢复/renew hook 的固定审计此前会命中未初始化字段）
+		this.#audit = AuditLog.open(cfg.auditFile);
 		if (cfg.gitGrants) {
 			// 重启恢复（H7：R50“无 registry load”为误报，load 真实存在）。安全语义校正：
 			// epoch 每次网关重启新 → 恢复的旧 entry 也只因 epoch 不符而拒；文件损坏/形状错
@@ -407,7 +409,6 @@ export class Gateway {
 		// R-Q50-3：活会话 grant 续签调度（配置 renewIntervalMs 才启用；可注入 timer）
 		this.#startGitGrantRenewTimer();
 
-		this.#audit = AuditLog.open(cfg.auditFile);
 		try {
 			this.#loadRevocations();
 			this.#loadSessions();
@@ -679,7 +680,7 @@ export class Gateway {
 		// slot/close-during-arm 不补写/配对 clear）；hook 非法时固定审计（不 spin）。
 		const outcome = this.#renewTimer.arm(delay, this.#renewFireOnce, {
 			setTimeoutImpl: g.timerImpl ?? ((fn: () => void, ms: number) => setTimeout(fn, ms)),
-			clearTimeoutImpl: g.clearTimerImpl ?? ((t: unknown) => clearTimeout(t as NodeJS.Timeout)),
+			clearTimeoutImpl: (t: unknown): void => { (g.clearTimerImpl ?? ((x: NodeJS.Timeout) => clearTimeout(x)))(t as NodeJS.Timeout); },
 			closed: (): boolean => this.#closed,
 		});
 		if (outcome === "failed-illegal-hook") {

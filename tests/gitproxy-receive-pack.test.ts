@@ -120,7 +120,7 @@ test("parser：null/throw 防线——非首条 NUL、无效 UTF-8、重复 ref�
 // ── R-Q52-1 转发等价（生产同缝 createIdentityForward；gzip 解码后同函数）──
 
 /** 模拟 src.read()：按给定 wire chunks 顺序逐块返回（可任意切分）；记录 cancel */
-function chunkReader(chunks: Uint8Array[]): { read: () => Promise<{ done: boolean; value?: Uint8Array }>; cancel: () => Promise<void>; canceled: () => boolean } {
+function chunkReader(chunks: Uint8Array[]): { read: () => Promise<{ done: boolean; value?: Uint8Array }>; cancel: () => Promise<void>; canceled: boolean } {
 	let i = 0;
 	let canceled = false;
 	return {

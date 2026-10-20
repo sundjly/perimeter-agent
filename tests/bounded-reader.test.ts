@@ -47,7 +47,7 @@ function hangingReader(): { read: () => Promise<{ done: boolean; value?: Uint8Ar
 			}
 			return { done: true, value: undefined };
 		},
-		settle: (v) => resolvePending(v ?? { done: false, value: new Uint8Array([1]) }),
+		settle: (v) => resolvePending({ done: false, value: v ?? new Uint8Array([1]) }),
 	};
 }
 
