@@ -45,6 +45,7 @@ interface GrantOpts {
 	session?: string;
 	principal?: string;
 	tenant?: string;
+	aclVersion?: number;
 }
 
 function makeIssuer() {
@@ -68,7 +69,7 @@ function makeIssuer() {
 					caps: { read: opts.read ?? true, write: opts.write ?? false, writeRefs: opts.writeRefs ?? (opts.write ? ["refs/heads/*"] : []) },
 					exp: opts.exp ?? Date.now() + 600_000,
 					jti: opts.jti ?? `jti-${Math.random().toString(36).slice(2)}`,
-					epoch: snapshot.epoch,
+					epoch: snapshot.epoch, aclVersion: opts.aclVersion ?? 1,
 				} as never,
 				MASTER_KEY, Date.now(),
 			);
@@ -190,7 +191,7 @@ test("POST 请求体完整转发，且带上注入的凭据", async () => {
 	const grant = issue({ read: true });
 	const body = "0032want 1111111111111111111111111111111111111111\n0000";
 
-	const res = await post(base, "/app.git/git-upload-pack", body);
+	const res = await post(base, "/app.git/git-upload-pack", body, { authorization: `Bearer ${grant}` });
 	assert.equal(res.status, 200);
 
 	const seen = up.seen[0]!;
@@ -211,7 +212,7 @@ test("推送走 git-receive-pack，被单独识别并留痕（合法命令区，
 	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
 
 	const body = pktCmd("0".repeat(40), "1".repeat(40), "refs/heads/main");
-	await post(base, "/app.git/git-receive-pack", body, { "content-type": "application/x-git-receive-pack-request" });
+	await post(base, "/app.git/git-receive-pack", body, { authorization: `Bearer ${grant}`, "content-type": "application/x-git-receive-pack-request" });
 
 	const push = (await auditEntries(auditFile)).find((e) => e.kind === "git.push" && e.verdict === "allow");
 	assert.ok(push, "推送必须留痕");
@@ -271,8 +272,11 @@ test("R49-N14：命令区超过 64KiB → 413，上游零写入", async () => {
 	const up = await startRecordingUpstream();
 	const { base, issue } = await startProxy(up.port, true);
 	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
-	const big = pktCmd("0".repeat(40), "3".repeat(40), "refs/heads/main") + "0061" + "x".repeat(93) + "\n0000";
-	const flood = big.repeat(800); // ≫64KiB
+	// R68-C：命令 pkt 线须在 flush 前累计 >64KiB——原构造每个 pktCmd 自带尾随 0000，
+	// 首个 flush 即收束命令区，其余重复体沦为 PACK 数据 → 误 200。改为 N 条无 flush
+	// 命令线 + 单次收尾 flush（单线 103B，700 条 ≈70KiB ≫ 64KiB 上限）。
+	const cmdLine = "0067" + "0".repeat(40) + " " + "3".repeat(40) + " refs/heads/main\n";
+	const flood = cmdLine.repeat(700) + "0000";
 	const res = await post(base, "/app.git/git-receive-pack", flood, {
 		authorization: `Bearer ${grant}`,
 		"content-type": "application/x-git-receive-pack-request",
@@ -319,7 +323,9 @@ test("R49-N15/B7：上游 302 → redirect:error → 502 + deny，跳转目标�
 	const grant = iss.issue({ read: true });
 	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${grant}` } });
 	assert.equal(res.status, 502);
-	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("重定向")));
+	// R68-D：真实 fetch + redirect:error 下，302 呈现为 fetch rejection → 固定类别 502 deny
+	//（不透传 302 细节）；「重定向」summary 仅在注入 fetchImpl 直返 3xx 的生产分支可达。
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("上游 fetch 失败")));
 });
 
 test("审计里不得出现上游凭据，连上游地址里内嵌的也要剥掉", async () => {
@@ -359,7 +365,9 @@ test("只读仓库拒绝推送，拒绝也留痕", async () => {
 	const { base, auditFile, issue } = await startProxy(up.port, false);
 	const grant = issue({ read: true });
 
-	const res = await post(base, "/app.git/git-receive-pack", "0000");
+	// R68-v2：合法形态 push 请求（端点×content-type 三方一致是 caps/allowPush 前置，
+	// 默认 upload-pack content-type 会被先行 400 拦截——同 #6 惯例）
+	const res = await post(base, "/app.git/git-receive-pack", "0000", { authorization: `Bearer ${grant}`, "content-type": "application/x-git-receive-pack-request" });
 	assert.equal(res.status, 403);
 	assert.equal(up.seen.length, 0, "被拒的推送不该到达上游");
 	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("未显式授权推送")));
@@ -417,7 +425,8 @@ test("上游不可达时返回 502 而不是挂死", async () => {
 	});
 	cleanups.push(() => proxy.close());
 	const base = `http://127.0.0.1:${await proxy.listen()}`;
-	const res = await post(base, "/app.git/git-upload-pack", "0000");
+	const grant = iss.issue({ read: true }); // R67：带有效 grant 过授权面，才能到达上游 fetch（不可达 → 502 而非 401）
+	const res = await post(base, "/app.git/git-upload-pack", "0000", { authorization: `Basic ${Buffer.from(`x-session:${grant}`).toString("base64")}` });
 	assert.equal(res.status, 502);
 });
 
@@ -426,7 +435,8 @@ test("默认只读：不传 allowPush 时推送被拒", async () => {
 	const { base, auditFile, issue } = await startProxy(up.port);
 	const grant = issue({ read: true }); // 刻意不传
 
-	const res = await post(base, "/app.git/git-receive-pack", "0000");
+	// R68-v2：同 #14——显式 receive-pack content-type 才能到达 caps/allowPush 层（否则先行 400）
+	const res = await post(base, "/app.git/git-receive-pack", "0000", { authorization: `Bearer ${grant}`, "content-type": "application/x-git-receive-pack-request" });
 	assert.equal(res.status, 403, "未显式授权就该拒绝");
 	assert.equal(up.seen.length, 0, "被拒的推送不该到达上游");
 	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny"));
@@ -475,8 +485,9 @@ test("重复 service 参数：代理判定与转发给上游的必须一致", as
 		// 放行了就必须是按 upload-pack 放行的，上游不能收到 receive-pack
 		assert.ok(!up.seen.at(-1)!.url.includes("git-receive-pack"), "代理判定非推送，却把 receive-pack 递给了上游");
 	} else {
-		// 或者干脆按推送拒绝，同样是自洽的
-		assert.equal(res.status, 403);
+		// 或者干脆 fail-closed 拒绝（B2 设计定案：重复 service 参数 → 400 固定类别），
+		// 上游零接触是硬性要求
+		assert.equal(res.status, 400);
 		assert.equal(up.seen.length, 0);
 	}
 });

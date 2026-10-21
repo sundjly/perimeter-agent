@@ -239,16 +239,32 @@ test("B2：gitGrant masterKey/internalToken 与既有凭据域互异（构造期
 	// 纯度口径（R50 观察如实）：Gateway 构造含真实 reaper/renew timer 与 audit FS ——
 	// 本用例是构造级非 pure；纯逻辑断言在 tests/credential-domains.test.ts（同缝模块）。
 	const dir = mkdtempSync(join(tmpdir(), "grant-domains-"));
-	const base = { mode: "demo" as const, port: 0, host: "127.0.0.1", token: "browser-only", policyFile: "config/policy.yaml", auditFile: join(dir, "a.jsonl"), workspaceRoot: join(dir, "ws"), webRoot: "web", model: { baseUrl: "http://model/v1", token: "model-only", model: "model" }, wiring: { proxyToken: "unused-model-alias", gitProxyToken: "git-proxy-only", gitProxyUrl: "http://git", scmHosts: ["git.internal"] } };
-	// masterKey 等于网关 token → 抛
-	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: "browser-only", internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } }), /凭据域必须分开/);
+	// R67：互异分支的 masterKey/token 同值需 ≥32B（构造期强度门 H1 先于互异检查：
+	// 12B "browser-only" 在互异前即抛「强度不足」）；各互异/形态碰撞分支数据同步补足 ≥32B，语义不变。
+	const gwToken = "browser-only-0123456789abcdef0123456789";
+	const base = { mode: "demo" as const, port: 0, host: "127.0.0.1", token: gwToken, policyFile: "config/policy.yaml", auditFile: join(dir, "a.jsonl"), workspaceRoot: join(dir, "ws"), webRoot: "web", model: { baseUrl: "http://model/v1", token: "model-only", model: "model" }, wiring: { proxyToken: "unused-model-alias", gitProxyToken: "git-proxy-only", gitProxyUrl: "http://git", scmHosts: ["git.internal"] } };
+	// R68-A：意外构造成功必须先 close 再 fail——否则 reaper/renew timer 残留挂死整个文件。
+	async function expectCtorThrow(cfg: ConstructorParameters<typeof Gateway>[0], re: RegExp): Promise<void> {
+		let g: Gateway | null = null;
+		let err: unknown;
+		try { g = new Gateway(cfg); } catch (e) { err = e; }
+		if (g !== null) { try { await g.close(); } catch { /* 意外实例收尾失败不掩盖主断言 */ } }
+		assert.ok(
+			err instanceof Error && re.test(err.message),
+			`构造期必须抛 ${re}，实际：${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	// masterKey 等于网关 token → 抛（R67 已证：该分支真实生效）
+	await expectCtorThrow({ ...base, gitGrants: { masterKey: gwToken, internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } }, /凭据域必须分开/);
 	// masterKey 等于 internalToken → 抛
-	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: "same-key-0123456789abcdef", internalToken: "same-key-0123456789abcdef", writeRefs: ["refs/heads/*"] } }), /internalToken/);
+	await expectCtorThrow({ ...base, gitGrants: { masterKey: "internal-collide-0123456789abcdef0123456789", internalToken: "internal-collide-0123456789abcdef0123456789", writeRefs: ["refs/heads/*"] } }, /internalToken/);
 	// masterKey 过短 → 抛（H1：强度与互异同门）
-	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: "short", internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } }), /强度不足/);
-	// R-Q50-5：hex/字符串形态差不藏碰撞（masterKey 原字节恰为 internalToken 的 UTF-8 字节）
-	const collide = Buffer.from("internal-only-0123456789", "utf8");
-	assert.throws(() => new Gateway({ ...base, gitGrants: { masterKey: collide, internalToken: collide.toString("hex"), writeRefs: ["refs/heads/*"] } }), /凭据域碰撞/);
+	await expectCtorThrow({ ...base, gitGrants: { masterKey: "short", internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } }, /强度不足/);
+	// R-Q50-5：同字节跨形态（masterKey Buffer 原字节恰为 internalToken 字符串的 UTF-8 字节）不藏碰撞。
+	// R68-A 勘误：原 .toString("hex") 是「不同字节」（hex 文本 ≠ 原字节），byte 级比较下
+	// 本就不构成碰撞，断言恒失败——改为等值字符串形态（这才是 R-Q50-5 的同字节不同形态）。
+	const collide = Buffer.from("hex-collide-0123456789abcdef0123456789", "utf8");
+	await expectCtorThrow({ ...base, gitGrants: { masterKey: collide, internalToken: collide.toString("utf8"), writeRefs: ["refs/heads/*"] } }, /凭据域碰撞/);
 	// 合法互异配置真正不抛/进入生产接线（H1 正控：不再恒抛）
 	const gw = new Gateway({ ...base, gitGrants: { masterKey: randomBytes(32), internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } });
 	await gw.close();

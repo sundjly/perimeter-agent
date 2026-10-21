@@ -575,7 +575,7 @@ export class GitCredentialProxy {
 					if (typeof ce === "string") headers["content-encoding"] = ce;
 				}
 			} else {
-				body = Readable.toWeb(req) as ReadableStream;
+				body = this.#requestBodyStream(req); // R68-B：不再裸 toWeb（收束后 enqueue 打崩进程）
 				if (typeof req.headers["content-encoding"] === "string") headers["content-encoding"] = req.headers["content-encoding"];
 			}
 		}
@@ -682,6 +682,30 @@ export class GitCredentialProxy {
 		return null;
 	}
 
+	/** R68-B（真实 N18）：可控请求体流——裸 toWeb(req) 的适配器在 fetch 失败/取消后
+	 * controller 已 closed，而 req 残余 'data' 仍 onData→enqueue → 未捕获
+	 * "Invalid state: Controller is already closed" 打崩代理进程。此处：enqueue 一律包
+	 * try（已收束即 pause 止流；不 destroy——拒绝响应还需同一 socket 送达）；
+	 * pull/cancel 用 pause/resume 维持背压与消费方收束后的止流。 */
+	#requestBodyStream(req: IncomingMessage): ReadableStream<Uint8Array> {
+		return new ReadableStream<Uint8Array>({
+			start: (controller) => {
+				req.on("data", (chunk: Buffer) => {
+					if ((controller.desiredSize ?? 1) <= 0) req.pause();
+					try {
+						controller.enqueue(new Uint8Array(chunk));
+					} catch {
+						req.pause(); // 已收束（fetch 失败/取消）：止流即收束
+					}
+				});
+				req.once("end", () => { try { controller.close(); } catch { /* 已收束 */ } });
+				req.once("error", (e) => { try { controller.error(e); } catch { /* 已收束 */ } });
+			},
+			pull: () => { req.resume(); },
+			cancel: () => { req.pause(); },
+		});
+	}
+
 	/**
 	 * B6：receive-pack 命令区预校验（上游写之前，全部 fail-closed）。R51 重写：
 	 * - identity：PktHeaderScanner（真实 pkt cursor，不滑动回退）跨 chunk 定位 flush；
@@ -725,7 +749,7 @@ export class GitCredentialProxy {
 		// R55-D/H：header 阶段 DeadlineReadGate（owned 截止能唤醒 pending read）；全程
 		// compressed ≤128MiB / decoded ≤512MiB / 全 body ≤120s（可配有限硬上限）；
 		// header 阶段压缩侧另限 8MiB、命令区 64KiB 独立保留。
-		const webBody = Readable.toWeb(req) as ReadableStream<Uint8Array>;
+		const webBody = this.#requestBodyStream(req); // R68-B：同缝替换（prepare 的 cancel 路径同样不再打崩）
 		const rawReader = webBody.getReader();
 		let src: ReadableStreamDefaultReader<Uint8Array>;
 		let gunzip: Transform | null = null;

@@ -41,12 +41,12 @@ function makeE2eIssuer() {
 	};
 	const registryFetchImpl = (async () => new Response(JSON.stringify(snapshot), { status: 200 })) as unknown as typeof fetch;
 	return {
-		issue(opts: { write?: boolean; repo?: string } = {}): string {
+		issue(opts: { write?: boolean; repo?: string; aclVersion?: number } = {}): string {
 			return signGrant({
 				v: 1, tenant: TENANT, principal: PRINCIPAL, session: SESSION,
 				repo: opts.repo ?? "git.internal/app.git",
 				caps: { read: true, write: opts.write ?? false, writeRefs: opts.write ? ["refs/heads/*"] : [] },
-				exp: Date.now() + 600_000, jti: `jti-${Math.random().toString(36).slice(2)}`, epoch: snapshot.epoch,
+				exp: Date.now() + 600_000, jti: `jti-${Math.random().toString(36).slice(2)}`, epoch: snapshot.epoch, aclVersion: opts.aclVersion ?? 1,
 			} as never, MASTER_KEY, Date.now());
 		},
 		registryFetchImpl,
