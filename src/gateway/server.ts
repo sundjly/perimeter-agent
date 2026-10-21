@@ -5,7 +5,7 @@ import { linkBrowserSid, peekSessionsForBrowserSid, takeSessionsForBrowserSid } 
 import { computeNextRenewDelayMs, computeGrantExpiry, decideRenew } from "./renew-policy.ts";
 import { OwnedRenewTimer } from "./owned-renew-timer.ts";
 import { applyRotation, mergeIssueIntoEntry, planRotation, retireUndeliveredNew, rollbackRotation } from "./grant-rotation.ts";
-import { createReadStream, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync, renameSync, chmodSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
 import { type ChildProcess, spawn } from "node:child_process";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { Duplex } from "node:stream";
@@ -20,6 +20,7 @@ import type { ModelGateway } from "../runtime/models.ts";
 import { type Authenticator, BrowserSessions, JwtAuthenticator, type Principal, RemoteJwks, scopeFromGroups } from "./auth.ts";
 import { DEFAULT_LIMITS, type Limits, Outbox, RateLimiter, hostAllowed, originAllowed, validateLimits } from "./transport.ts";
 import { Session } from "./session.ts";
+import { acquireGatewayLock, type HeldLock, lockStillHeld, releaseGatewayLock } from "./state-lock.ts";
 
 export interface OidcConfig {
 	issuer: string;
@@ -230,6 +231,12 @@ export class Gateway {
 	#reaper: NodeJS.Timeout;
 	/** close 之后审计 fd 已关，在途的 reap 不能再写 */
 	#closed = false;
+	/** S3a：stateRoot 独占锁（构造期取得，close 时释放） */
+	#lock: HeldLock;
+	/** S3a：有序关闭进行中 —— readiness 立即翻红、拒新升级与新任务 */
+	#draining = false;
+	/** S3a：shutdown 幂等入口（重入共享同一次关闭） */
+	#shutdownPromise?: Promise<void>;
 	#webRoot: string;
 	#limits: Limits;
 	#conns = new Set<Conn>();
@@ -350,11 +357,19 @@ export class Gateway {
 		this.#stateRoot = resolve(cfg.stateRoot ?? (cfg.workspaceRoot + ".state"));
 		mkdirSync(this.#stateRoot, { recursive: true, mode: 0o700 });
 		try { chmodSync(this.#stateRoot, 0o700); } catch {}
+		// S3a：stateRoot 单实例独占锁（handoff §3.3）。先于一切可泄漏资源取得：
+		// 此点之后任何构造失败都必须释放锁与已打开资源，第二实例的失败不留端口/定时器/审计。
+		this.#lock = acquireGatewayLock(this.#stateRoot);
+		try {
+			// R65：#audit 赋值前移到首次使用之前（构造期 git grants 恢复/renew hook 的固定审计此前会命中未初始化字段）
+			this.#audit = AuditLog.open(cfg.auditFile);
+		} catch (err) {
+			releaseGatewayLock(this.#lock);
+			throw err;
+		}
 		this.#revocationsFile = join(this.#stateRoot, "revocations.json");
 		this.#sessionsFile = join(this.#stateRoot, "browser-sessions.json");
 		this.#gitGrantFile = join(this.#stateRoot, "git-grants-registry.json");
-		// R65：#audit 赋值前移到首次使用之前（构造期 git grants 恢复/renew hook 的固定审计此前会命中未初始化字段）
-		this.#audit = AuditLog.open(cfg.auditFile);
 		if (cfg.gitGrants) {
 			// 重启恢复（H7：R50“无 registry load”为误报，load 真实存在）。安全语义校正：
 			// epoch 每次网关重启新 → 恢复的旧 entry 也只因 epoch 不符而拒；文件损坏/形状错
@@ -403,7 +418,12 @@ export class Gateway {
 				this.#gitGrantRevoked.clear();
 				try { this.#audit.append({ kind: "error", sessionId: "system", actor: "system", summary: "git grants 登记文件解析失败：整批丢弃，从空登记 fail-closed 开始" }); } catch { /* 同上 */ }
 			}
-			this.#saveGitGrantRegistry();
+			try { this.#saveGitGrantRegistry(); } catch (err) {
+				// 构造失败不留资源：审计 fd 已打开、锁已持有，先收掉再抛
+				this.#audit.close();
+				releaseGatewayLock(this.#lock);
+				throw err;
+			}
 		}
 		this.#pkceSecret = randomBytes(32);
 		// R-Q50-3：活会话 grant 续签调度（配置 renewIntervalMs 才启用；可注入 timer）
@@ -422,9 +442,17 @@ export class Gateway {
 			this.#stopGitGrantRenewTimer();
 			try { wss?.close(); } catch { /* 未创建不遮原错误 */ }
 			this.#audit.close();
+			releaseGatewayLock(this.#lock); // S3a：构造失败不留锁
 			throw err;
 		}
-		mkdirSync(cfg.workspaceRoot, { recursive: true });
+		try {
+			mkdirSync(cfg.workspaceRoot, { recursive: true });
+		} catch (err) {
+			// 同上：构造失败不留锁与已打开的审计 fd
+			this.#audit.close();
+			releaseGatewayLock(this.#lock);
+			throw err;
+		}
 
 		// 任何异常都不能冲出事件回调：未捕获异常会打崩整个网关
 		this.#http.on("request", (req, res) => {
@@ -822,6 +850,48 @@ export class Gateway {
 		return Date.now();
 	}
 
+	/**
+	 * S3a 有序关闭（handoff §3.3）：readiness 立即翻红 → 拒绝新升级与新 prompt/steer
+	 * → 限时 drain（超时对仍在运行的任务写「未确定操作」审计，随后由 close 内
+	 * session.stop 的 host.abort 收束）→ 复用 close() 逐项关 Harness/执行连接/沙箱、
+	 * HTTP/WS、审计，最后释放 stateRoot 独占锁。任一项清理失败不中断其余项（close 语义）。
+	 * 幂等：重复调用共享同一次关闭。drain 期间 abort/approve 仍被允许（操作安全取舍，见 ask）。
+	 */
+	shutdown(opts: { drainMs?: number } = {}): Promise<void> {
+		this.#shutdownPromise ??= this.#shutdown(Math.max(0, opts.drainMs ?? 30_000));
+		return this.#shutdownPromise;
+	}
+
+	async #shutdown(drainMs: number): Promise<void> {
+		this.#draining = true; // /readyz 立即 503；升级与新任务在各自的门被拒
+		clearInterval(this.#reaper); // drain 期间停止空闲回收并发；close 再清一次（幂等）
+		const deadline = Date.now() + drainMs;
+		while (Date.now() < deadline && this.#anyBusy()) {
+			await new Promise((r) => setTimeout(r, Math.min(100, Math.max(1, deadline - Date.now()))));
+		}
+		if (this.#anyBusy()) {
+			// drain 超时：逐个留下「未确定操作」审计后交给 close 收束（stop → host.abort）
+			for (const [id, s] of this.#sessions) {
+				if (!s.busy || !s.alive) continue;
+				this.#tryAudit({
+					kind: "error",
+					sessionId: id,
+					actor: this.#owners.get(id) ?? "system",
+					summary: "关闭时未确定操作：drain 超时，运行中任务将被中止（固定类别）",
+					verdict: "deny",
+				});
+			}
+		}
+		await this.close();
+	}
+
+	#anyBusy(): boolean {
+		for (const s of this.#sessions.values()) {
+			if (s.alive && s.busy) return true;
+		}
+		return false;
+	}
+
 	async close(): Promise<void> {
 		// R59-⑥：close 前**最后重试** pending logout 持久化（browser+git 独立尝试；
 		// 任一失败保留 unknown 且计入 close 非成功——不吞不装 durable）。
@@ -862,6 +932,8 @@ export class Gateway {
 		this.#http.closeAllConnections();
 		await new Promise<void>((r) => this.#http.close(() => r()));
 		this.#audit.close();
+		// S3a：最后释放 stateRoot 独占锁（只删自己 nonce 的锁）
+		releaseGatewayLock(this.#lock);
 		// H3：grant 持久化失败在全部 finalizers 之后抛出（非零收敛；内存撤销已生效，
 		// 磁盘可能残留旧登记 —— 重启后 epoch 新 + 旧 jti 恢复 entry 仍拒，fail-closed）
 		if (grantSaveErr !== null) throw grantSaveErr;
@@ -958,6 +1030,7 @@ export class Gateway {
 			revoked: this.#revoked,
 			isAuthorized: (a, meta) => this.#isAuthorized(a, identity.principal, meta),
 			isPrincipalId: this.#cfg.auth?.isPrincipalId?.bind(this.#cfg.auth),
+			gatewayDraining: () => this.#draining || this.#closed,
 		};
 
 		if (requested !== null && !SESSION_ID.test(requested)) {
@@ -1145,6 +1218,15 @@ export class Gateway {
 		let url: URL;
 		try { url = new URL(req.url ?? "/", "http://localhost"); } catch { res.writeHead(400).end("bad request"); return; }
 		if (!this.#hostOk(req)) { res.writeHead(421).end("misdirected request"); return; }
+		// S3a：liveness 与 readiness 分离（handoff §3.3）。与既有静态路由同一入口规则：
+		// Host 校验必须过；无鉴权、不读 Cookie、不返回任何会话数据，响应只有固定类别短文本。
+		if (url.pathname === "/livez" || url.pathname === "/readyz") {
+			if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405, { allow: "GET, HEAD" }).end("method not allowed"); return; }
+			if (url.pathname === "/livez") { res.writeHead(200, { "cache-control": "no-store" }).end("ok"); return; }
+			const ok = this.#isReady();
+			res.writeHead(ok ? 200 : 503, { "cache-control": "no-store" }).end(ok ? "ok" : "not ready");
+			return;
+		}
 		// B2：签发方 internal registry 端点（仅内网受信消费）。internalToken 只收
 		// Authorization header（production 拒任何 query 形态）。
 		if (url.pathname === "/internal/git/registry") {
@@ -1166,6 +1248,25 @@ export class Gateway {
 		if (this.#cfg.mode === "production" && url.pathname.startsWith("/auth/")) { await this.#authRoute(req, res, url); return; }
 		if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405, { allow: "GET, HEAD" }).end("method not allowed"); return; }
 		this.#serveStatic(req, res, url);
+	}
+
+	/** S3a：readiness 判定。只返回布尔；失败细节不进响应（固定类别短文本，不泄露路径/配置/错误原文） */
+	#isReady(): boolean {
+		if (this.#draining || this.#closed) return false;
+		if (!lockStillHeld(this.#lock)) return false; // 锁仍由本实例持有
+		// 策略可加载的前提：配置在位（策略本体由会话启动时经 runtime 加载，网关层只验在位）
+		if (!existsSync(this.#cfg.policyFile)) return false;
+		// stateRoot 可写：探针走 tmp+rename+unlink，与既有持久化同一写路径
+		try {
+			const probe = join(this.#stateRoot, ".readyz-probe");
+			writeFileSync(probe + ".tmp", "1", { mode: 0o600 });
+			renameSync(probe + ".tmp", probe);
+			unlinkSync(probe);
+		} catch {
+			return false;
+		}
+		try { this.#audit.checkWritable(); } catch { return false; }
+		return true;
 	}
 
 	/** R76-R3：demo 专用 —— 静态网关 token（+ 自报 actor）换与生产同形态的会话 Cookie。
@@ -1624,6 +1725,8 @@ export class Gateway {
 		if (!this.#hostOk(req)) return reject(socket, 421, "Misdirected Request");
 		const origin = req.headers.origin;
 		if (origin !== undefined && (typeof origin !== "string" || !this.#originOk(origin))) return reject(socket, 403, "Forbidden");
+		// S3a：关闭中（drain 或已 close）拒绝一切新升级 —— 不再新建会话或接入
+		if (this.#draining || this.#closed) return reject(socket, 503, "Service Unavailable");
 		if (this.#conns.size + this.#pending >= this.#limits.maxConnections) return reject(socket, 503, "Service Unavailable");
 		this.#pending++;
 		let identity: { actor: string; principal?: Principal; expiresAt: number; sid?: string } | undefined;
@@ -1926,6 +2029,8 @@ interface AttachOpts {
 	revoked: Set<string>;
 	isAuthorized: (actor: string, meta: Meta) => boolean;
 	isPrincipalId?: (id: string) => boolean;
+	/** S3a：网关正在关闭（drain/close）—— 新 prompt/steer 在网关门上被拒，abort/approve 不受限 */
+	gatewayDraining?: () => boolean;
 }
 
 function attach(ws: WebSocket, session: Session, actor: string, opts: AttachOpts): void {
@@ -2015,6 +2120,11 @@ function attach(ws: WebSocket, session: Session, actor: string, opts: AttachOpts
 					sendError("无权执行命令：只有 owner 与 editor 可发起任务或中止");
 					return;
 				}
+			}
+			// S3a：有序关闭中拒新任务（固定类别）；abort/approve 不受限（手动收尾与在途审批）
+			if ((cmd.type === "prompt" || cmd.type === "steer") && opts.gatewayDraining?.()) {
+				sendError("网关正在关闭，拒绝新任务");
+				return;
 			}
 			if (cmd.type === "approve") {
 				if (role !== "approver") {
@@ -2183,10 +2293,29 @@ if (process.argv[1] && import.meta.filename === process.argv[1]) {
 			token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: process.env.PERIMETER_MODEL ?? "default",
 		},
 	};
+	// S3a：SIGTERM/SIGINT → 有界有序关闭（readiness 翻红 → 拒新 → drain → 逐项收尾 → 释放锁）。
+	// 硬上限兜底：即使某个收尾步骤卡死，进程也以非零码退出，不悬挂。
+	const DRAIN_MS = 30_000;
+	const shutdownOnSignal = async (gw: Gateway) => {
+		const hard = setTimeout(() => process.exit(1), DRAIN_MS + 15_000);
+		hard.unref();
+		try {
+			await gw.shutdown({ drainMs: DRAIN_MS });
+			process.exit(0);
+		} catch (err) {
+			console.error("有序关闭失败:", err instanceof Error ? err.message : err);
+			process.exit(1);
+		}
+	};
+	const wireShutdownSignals = (gw: Gateway) => {
+		process.once("SIGTERM", () => { void shutdownOnSignal(gw); });
+		process.once("SIGINT", () => { void shutdownOnSignal(gw); });
+	};
 	if (mode === "demo") {
 		const token = process.env.PERIMETER_TOKEN ?? "dev-token";
 		const gw = new Gateway({ ...base, mode, token });
 		const port = await gw.listen();
+		wireShutdownSignals(gw);
 		console.log(`网关已启动（demo，仅限本机） http://127.0.0.1:${port}/`);
 	} else {
 		const scopes = JSON.parse(need("PERIMETER_GROUP_SCOPES")) as Record<string, { repo: string; team: string }>;
@@ -2202,6 +2331,7 @@ if (process.argv[1] && import.meta.filename === process.argv[1]) {
 			resolveScope: (_actor, principal) => principal ? scopeFromGroups(scopes)(principal) : undefined,
 		});
 		const port = await gw.listen();
+		wireShutdownSignals(gw);
 		// 生产不打印任何凭据或带凭据的 URL
 		console.log(`网关已启动（production） 端口 ${port}`);
 	}

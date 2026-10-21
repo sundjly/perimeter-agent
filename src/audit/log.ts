@@ -214,6 +214,12 @@ export class AuditLog {
 		return entry;
 	}
 
+	/** S3a 就绪探测：审计通道仍可同步刷盘（fd 已关 / IO 故障即抛）。不写链、不产生新条目 */
+	checkWritable(): void {
+		if (this.#closed) throw new Error("审计已关闭");
+		fdatasyncSync(this.#fd);
+	}
+
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;

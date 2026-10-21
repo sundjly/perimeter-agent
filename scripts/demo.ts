@@ -240,6 +240,12 @@ HOME 在 workspace 之外，agent 的 git commit 带不走它。
   node -e "import('./src/audit/log.ts').then(async m => console.log(await m.AuditLog.verify('${auditFile}')))"
 `);
 
-process.on("SIGINT", () => {
-	void gw.close().then(() => process.exit(0));
-});
+// S3a：SIGTERM/SIGINT → 有界有序关闭（readiness 翻红 → 拒新 → drain → 逐项收尾 → 释放锁）
+const shutdown = () => {
+	void gw.shutdown({ drainMs: 10_000 }).then(
+		() => process.exit(0),
+		(err) => { console.error("有序关闭失败:", err instanceof Error ? err.message : err); process.exit(1); },
+	);
+};
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);
