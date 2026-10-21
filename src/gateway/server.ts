@@ -112,6 +112,13 @@ export interface GatewayConfig {
 	oidc?: OidcConfig;
 	/** S3b：创建收据保留期 ms；默认 24h（DEFAULT_RECEIPT_TTL_MS）。过期收据清理后，同键 create 视为新创建 */
 	receiptTtlMs?: number;
+	/** S3c：prompt 幂等账本条目上限；超限固定拒绝新任务（不淘汰，避免同键重复生成无提示）。默认 10_000 */
+	promptLedgerMaxEntries?: number;
+	/**
+	 * S3c：外部持有的审计实例（测试/故障注入缝；生产不配置，走 auditFile 自开）。
+	 * 网关 close 会顺带 close 它（AuditLog.close 幂等）；open 失败语义与自开一致。
+	 */
+	auditInstance?: AuditLog;
 	/**
 	 * S3b：显式创建在各 stage 收据落盘后的回调（await）。仅供测试/故障注入：
 	 * 抛错 → 收据 failed；挂起 → 可在窗口内 kill -9 模拟中途崩溃。
@@ -289,6 +296,9 @@ export class Gateway {
 		if (cfg.receiptTtlMs !== undefined && (!Number.isSafeInteger(cfg.receiptTtlMs) || cfg.receiptTtlMs <= 0)) {
 			throw new Error("配置非法：receiptTtlMs 必须为正整数");
 		}
+		if (cfg.promptLedgerMaxEntries !== undefined && (!Number.isSafeInteger(cfg.promptLedgerMaxEntries) || cfg.promptLedgerMaxEntries <= 0)) {
+			throw new Error("配置非法：promptLedgerMaxEntries 必须为正整数");
+		}
 
 		if (cfg.mode === "production") {
 			// 生产不允许任何形式的静默降级：缺任何一项都拒绝启动，而不是回落到共享 token
@@ -390,7 +400,7 @@ export class Gateway {
 		this.#lock = acquireGatewayLock(this.#stateRoot);
 		try {
 			// R65：#audit 赋值前移到首次使用之前（构造期 git grants 恢复/renew hook 的固定审计此前会命中未初始化字段）
-			this.#audit = AuditLog.open(cfg.auditFile);
+			this.#audit = cfg.auditInstance ?? AuditLog.open(cfg.auditFile);
 		} catch (err) {
 			releaseGatewayLock(this.#lock);
 			throw err;
@@ -1215,6 +1225,7 @@ export class Gateway {
 			stateDirectory: ownerDir,
 			policyFile: this.#cfg.policyFile,
 			audit: this.#audit,
+			...(this.#cfg.promptLedgerMaxEntries !== undefined ? { promptLedgerMaxEntries: this.#cfg.promptLedgerMaxEntries } : {}),
 			model: this.#cfg.model,
 			approvalTimeoutMs: this.#cfg.approvalTimeoutMs,
 			wiring: this.#cfg.wiring,

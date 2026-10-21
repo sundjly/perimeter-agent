@@ -157,6 +157,8 @@ export class AuditLog {
 	#seq: number;
 	#prevHash: string;
 	#closed = false;
+	/** S3c：审计通道健康位——append/checkWritable 一旦失败即置假（粘滞）；执行面据此 fail-closed */
+	#healthy = true;
 
 	private constructor(path: string, lockPath: string, fd: number, seq: number, prevHash: string) {
 		this.#path = path;
@@ -208,22 +210,38 @@ export class AuditLog {
 		};
 		const { hash: _drop, ...unhashed } = entry;
 		entry.hash = sha256(canonicalize(unhashed));
-		appendFileSync(this.#fd, `${JSON.stringify(entry)}\n`, "utf8");
-		fdatasyncSync(this.#fd);
+		try {
+			appendFileSync(this.#fd, `${JSON.stringify(entry)}\n`, "utf8");
+			fdatasyncSync(this.#fd);
+		} catch (err) {
+			this.#healthy = false;
+			throw err;
+		}
 		this.#seq = entry.seq;
 		this.#prevHash = entry.hash;
 		return entry;
 	}
 
+	/** S3c：审计通道是否仍可写入（close/任一次写失败后为假；只降不升，重启恢复唯一） */
+	get healthy(): boolean {
+		return this.#healthy;
+	}
+
 	/** S3a 就绪探测：审计通道仍可同步刷盘（fd 已关 / IO 故障即抛）。不写链、不产生新条目 */
 	checkWritable(): void {
 		if (this.#closed) throw new Error("审计已关闭");
-		fdatasyncSync(this.#fd);
+		try {
+			fdatasyncSync(this.#fd);
+		} catch (err) {
+			this.#healthy = false;
+			throw err;
+		}
 	}
 
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#healthy = false; // 已关闭即不可写：执行面的 fail-closed 门据此立即生效
 		closeSync(this.#fd);
 		releaseLock(this.#lockPath);
 	}

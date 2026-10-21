@@ -171,8 +171,12 @@ export class ReceiptStore {
 			receipt.stage = "outcome_unknown";
 			receipt.outcome = "unknown";
 			receipt.updatedAt = new Date().toISOString();
-			writeFileSync(path, JSON.stringify(receipt), { mode: 0o600 });
-			try { chmodSync(path, 0o600); } catch { /* 同上 */ }
+			// S3c（round-1 notes）：标记写改原子 tmp+rename——与 save() 同一写路径；标记中途
+			// 崩溃不再产生半行损坏收据（旧实现直接 writeFileSync 原文件，损坏后 fail-closed 拒启）
+			const tmp = join(dir, `.${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+			writeFileSync(tmp, JSON.stringify(receipt), { mode: 0o600 });
+			renameSync(tmp, path);
+			try { chmodSync(path, 0o600); } catch { /* 刚以 0600 写入；chmod 兜底失败不影响语义 */ }
 			marked.push(receipt);
 		}
 		return marked;

@@ -3,7 +3,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { AuditLog, contentHash } from "../audit/log.ts";
+import { AuditLog, contentHash, type AuditEntry } from "../audit/log.ts";
 import type { ClientCommand, ClientEvent, SessionView, Role } from "../protocol/types.ts";
 import { HarnessHost } from "../runtime/harness-host.ts";
 import type { ModelGateway } from "../runtime/models.ts";
@@ -33,7 +33,12 @@ export interface SessionOptions {
 	onAclChanged?: (aclVersion: number) => void;
 	/** B2（R51 H4）：初始 aclVersion 在 mint/构造时正确建立，只有真实 bump 才触发 revoke */
 	aclVersion?: number;
+	/** S3c：prompt 幂等账本条目上限。超限固定拒绝新任务（**不淘汰旧键**——淘汰会让同键重复生成
+	 * 变成无提示窗口）；默认 10_000，需运维归档轮替。网关构造期校验正整数 */
+	promptLedgerMaxEntries?: number;
 }
+
+const DEFAULT_PROMPT_LEDGER_MAX_ENTRIES = 10_000;
 
 export class Session {
 	#opts: SessionOptions;
@@ -72,11 +77,39 @@ export class Session {
 	async #start(): Promise<void> {
 		const opts = this.#opts;
 		try {
+		const pendingCalls = new Map<string, AuditEntry>();
+		const resolvedCalls = new Set<string>();
+		const alreadyFlagged = new Set<string>();
 		for await (const entry of AuditLog.replay(opts.audit.path)) if (entry.sessionId === this.sessionId) {
 			this.#audit.push({ seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, verdict: entry.verdict, actor: entry.actor, approver: entry.approver });
 			if (this.#audit.length > 100) this.#audit.shift();
+			if (!entry.callId) continue;
+			if (entry.kind === "tool.call") pendingCalls.set(entry.callId, entry);
+			else if (entry.kind === "tool.result" || entry.kind === "approval.request" || entry.kind === "approval.decision") resolvedCalls.add(entry.callId);
+			else if (entry.kind === "policy.verdict" && entry.verdict === "deny") resolvedCalls.add(entry.callId);
+			else if (entry.kind === "error" && entry.summary.includes("工具结果未知")) alreadyFlagged.add(entry.callId);
 		}
 		opts.audit.append({ kind: "session.start", sessionId: this.sessionId, actor: opts.actor, repo: opts.repo, team: opts.team, summary: "会话开始" });
+		// S3c：崩溃残留的「执行中 unsafe 工具」→ outcome_unknown，对会话成员可见 + 审计留痕。
+		// durable 对非 replay:"safe" 工具崩溃后不重跑（恢复时给模型 interrupted 错误结果），
+		// 这里只补可见性：tool.call 有而 tool.result 无，且该 callId 无审批/拒绝记录（被拦或
+		// 待审批者从未执行）；重复重启不重标。git push 类附「先核对远端 ref」固定提示。
+		for (const [callId, call] of pendingCalls) {
+			if (resolvedCalls.has(callId) || alreadyFlagged.has(callId)) continue;
+			const target = (call.command ?? call.path ?? call.tool ?? "未知工具").slice(0, 80);
+			const hint = typeof call.command === "string" && call.command.includes("git push")
+				? "push 类：先核对远端 ref，不要直接再推。"
+				: "原执行进程可能仍在运行（本层无从判断，不得声称已终止），需人工核对工作区 diff 与残留进程。";
+			const summary = `工具结果未知（崩溃打断，不自动重放；阶段=执行中）：callId=${callId} ${target} ${hint}`;
+			const actor = call.actor ?? opts.actor;
+			try {
+				const flagged = opts.audit.append({ kind: "error", sessionId: this.sessionId, actor, callId, argsHash: call.argsHash, summary, verdict: "deny" });
+				this.#emit({ type: "audit.entry", entry: { seq: flagged.seq, at: flagged.at, kind: flagged.kind, summary: flagged.summary, verdict: flagged.verdict, actor: flagged.actor } });
+			} catch {
+				// 审计写入失败时可见性不缺席（seq=0 标识本条仅为会话内视图，未落链）
+				this.#emit({ type: "audit.entry", entry: { seq: 0, at: new Date().toISOString(), kind: "error", summary, verdict: "deny", actor } });
+			}
+		}
 			const home = opts.sandboxHome ?? join(opts.workspace, "..", ".homes", opts.sessionId);
 			mkdirSync(home, { recursive: true });
 			rmSync(join(home, ".pi"), { recursive: true, force: true });
@@ -257,6 +290,8 @@ export class Session {
 			});
 		} else if (cmd.type === "prompt" || cmd.type === "steer") {
 			if (role && role !== "owner" && role !== "editor") throw new Error(`无权执行命令：角色 ${role} 禁止发起任务`);
+			// S3c：审计不可用 → 拒绝新任务（固定类别，不透传底层 IO 错误）；abort/approve 不做此门
+			try { this.#opts.audit.checkWritable(); } catch { throw new Error("审计不可用，拒绝新任务（固定类别）"); }
 			// S3b 消息幂等：同 actor 同 requestId 不同内容 → 固定类别拒绝；同键同内容重复 →
 			// 不再提交，不重复模型生成。账本在 durable 提交前落盘（先记账再副作用），跨重启有效；
 			// durable 侧 scopedId 幂等仍是第二道（见 durable-runtime 测试）。
@@ -296,6 +331,10 @@ export class Session {
 			if (prev !== hash) throw new Error("requestId 已用于不同内容，拒绝重复使用（固定类别）");
 			throw new Error("重复请求：同 requestId 同内容已受理，不重复生成（固定类别）");
 		}
+		// S3c：条目上限——超限拒新不淘汰（淘汰会让同键重复生成变成无提示窗口）
+		const configured = this.#opts.promptLedgerMaxEntries;
+		const max = configured !== undefined && Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_PROMPT_LEDGER_MAX_ENTRIES;
+		if (ledger.size >= max) throw new Error(`prompt 幂等账本已满（上限 ${max} 条），拒绝新任务（固定类别；不淘汰旧键，需运维归档轮替）`);
 		ledger.set(key, hash);
 		const tmp = `${this.#ledgerFile}.${process.pid}.${randomUUID()}.tmp`;
 		try {
@@ -319,8 +358,10 @@ export class Session {
 	publish(event: ClientEvent): void { this.#emit(event); }
 	auditCommand(actor: string, summary: string): void {
 		this.#lastActivity = Date.now();
-		const entry = this.#opts.audit.append({ kind: "prompt", sessionId: this.sessionId, actor, summary: `命令 ${summary}` });
-		this.#emit({ type: "audit.entry", entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, actor: entry.actor } });
+		try {
+			const entry = this.#opts.audit.append({ kind: "prompt", sessionId: this.sessionId, actor, summary: `命令 ${summary}` });
+			this.#emit({ type: "audit.entry", entry: { seq: entry.seq, at: entry.at, kind: entry.kind, summary: entry.summary, actor: entry.actor } });
+		} catch { /* S3c：审计不可用不阻断命令面——abort/deny 必须保持可用；缺口由 readyz 503 与拒新任务兜底 */ }
 	}
 	async snapshotFrame(deliver?: (frame: { seq: number; event: ClientEvent }) => void): Promise<{ seq: number; event: ClientEvent }> {
 		for (;;) {
