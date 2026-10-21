@@ -68,6 +68,9 @@ export class OwnedRenewTimer {
 		}
 		if (deps.closed()) {
 			deps.clearTimeoutImpl(timer);
+			// R78：与 stop() 同构——close-during-arm 清掉的句柄也要因 gen 失效而不可再
+			// 执行 onFire（fake timer 手动触发边界契约；native clearTimeout 后不会真触发）。
+			this.#gen += 1;
 			return "skipped-closed";
 		}
 		if (nestedSync) {

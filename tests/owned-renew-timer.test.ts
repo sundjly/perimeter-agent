@@ -109,3 +109,21 @@ test("owned-timer：stop 配对 clear；stop 后旧句柄 fire 不执行（迟�
 	timers[0]!.fn(); // 迟到触发：slot 已空 → 不执行
 	assert.equal(fired, 0, "迟到 fire 不执行");
 });
+
+test("owned-timer：close-during-arm 清掉的句柄因 gen 失效，手动触发不执行 onFire（R78）", () => {
+	// 与 stop() 同构的 fake-timer 边界（native clearTimeout 后不会真触发，此为手动触发契约）：
+	// close-during-arm 分支此前只 clear 不 bump gen——被清句柄仍可被手动触发执行 onFire。
+	let closed = false;
+	let fired = 0;
+	const t = new OwnedRenewTimer();
+	const captured: { fn: () => void }[] = [];
+	const outcome = t.arm(100, () => { fired += 1; }, {
+		setTimeoutImpl: (fn) => { closed = true; const o = { fn }; captured.push(o); return o; }, // timerImpl 内同步置 closed
+		clearTimeoutImpl: () => {},
+		closed: () => closed,
+	});
+	assert.equal(outcome, "skipped-closed", "close-during-arm 不补写 slot");
+	assert.equal(t.activeSlot, false);
+	captured[0]!.fn(); // 迟到句柄（fake 手动触发）：gen 已失效 → 不得执行
+	assert.equal(fired, 0, "close-during-arm 清掉的句柄不得再执行 onFire");
+});

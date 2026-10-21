@@ -80,7 +80,7 @@ async function connect() {
 			// Cookie（demo 专用路径；production 走 IdP 验签，行为不变）。WS 本体不带凭据。
 			const res = await fetch("/auth/session", {
 				method: "POST",
-				headers: { Authorization: `Bearer ${bearer}`, ...(hashActor ? { "x-perimeter-actor": hashActor } : {}) },
+				headers: { Authorization: `Bearer ${bearer}`, ...(hashActor ? { "x-demo-actor": hashActor } : {}) },
 			});
 			authed = res.ok;
 		} catch {}

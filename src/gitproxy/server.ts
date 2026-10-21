@@ -688,6 +688,7 @@ export class GitCredentialProxy {
 			deny(502, `拒绝：上游返回重定向 ${upRes.status}（redirect:error，不跟随）`, claims);
 			await upRes.body?.cancel().catch(() => {});
 			detachClientClose(); // v3：早退解绑（幂等）
+			preparedDispose?.(); // R78：与其他完成路径一致收束全寿命 timer（disarm 幂等，只 dispose 一次）
 			return;
 		}
 

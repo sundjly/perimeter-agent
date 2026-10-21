@@ -9,7 +9,7 @@
 import { isSha1, isValidRefname } from "./grants.ts";
 
 export const CMD_BAND_MAX_BYTES = 64 * 1024;
-export const PKT_MAX = 65524; // 0xffff - 4
+export const PKT_MAX = 65524; // 0xfff4
 
 export type ScanState =
 	| { phase: "need-more" }

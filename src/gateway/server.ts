@@ -1189,7 +1189,9 @@ export class Gateway {
 		if (!this.#authRateLimiter.allow()) return send(429);
 		const credential = bearer(req.headers.authorization);
 		if (!credential || !timingSafeEqual(createHash("sha256").update(credential).digest(), this.#demoToken!)) return send(401);
-		const actorHeader = req.headers["x-perimeter-actor"];
+		// R78：更名 x-demo-actor——x-perimeter-* 命名空间在 gitproxy 合同里固定为
+		// 「客户端头不进授权判定」，demo 自报身份不再占用它。
+		const actorHeader = req.headers["x-demo-actor"];
 		const actor = (typeof actorHeader === "string" ? actorHeader : Array.isArray(actorHeader) ? actorHeader[0] : undefined) ?? "demo@local";
 		if (actor.length === 0 || actor.length > 256) return send(401);
 		if (this.#revoked.has(actor)) return send(401);

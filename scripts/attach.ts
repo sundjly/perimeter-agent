@@ -30,11 +30,12 @@ const headers: Record<string, string> = {};
 if (bearerToken) {
 	headers["Authorization"] = `Bearer ${bearerToken}`;
 } else {
-	const rawToken = explicitToken ?? process.env.PERIMETER_TOKEN;
-	const queryToken = rawToken ?? "dev-token";
-	url.searchParams.set("token", queryToken);
+	// R78：token 只放 WS 握手 Authorization 头（#authenticateWS demo 分支接受 Bearer 头，
+	// 与 query 等价）——不再进 URL query（会随 URL 落日志）。actor 无头部通道
+	// （demo 分支只读 query），保留 query 携带。
+	const token = explicitToken ?? process.env.PERIMETER_TOKEN ?? "dev-token";
+	headers["Authorization"] = `Bearer ${token}`;
 	url.searchParams.set("actor", explicitActor ?? "demo@local");
-	if (rawToken) headers["Authorization"] = `Bearer ${rawToken}`;
 }
 let state = initialState();
 const shownMessages = new Map<string, string>();

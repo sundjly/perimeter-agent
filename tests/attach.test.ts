@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
+import { createServer, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -88,4 +89,34 @@ test("R76：attach CLI —— open 前输入的 /share 排队生效（不再丢�
 		await new Promise((r) => setTimeout(r, 200));
 	}
 	assert.ok(attached, "share 必须生效：approver 接入同会话且角色为 approver（10s 超时）");
+});
+
+test("R78：attach 握手 URL 不携带 token —— token 走 WS 握手 Authorization 头", async () => {
+	// 本地 http server 的 upgrade 事件捕获 attach 发出的握手请求：query 不得含 token
+	//（会随 URL 落日志）；token 改经 Authorization 头（#authenticateWS demo 分支接受，行为等价）。
+	const server = createServer((_req, res) => { res.writeHead(404).end(); });
+	let upgradeResolve: ((req: IncomingMessage) => void) | undefined;
+	const seen = new Promise<IncomingMessage>((resolve) => { upgradeResolve = resolve; });
+	server.on("upgrade", (req, socket) => {
+		socket.on("error", () => {});
+		upgradeResolve?.(req);
+		socket.destroy(); // 捕获即断：attach 侧报错退出，本例只断言握手形态
+	});
+	await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+	cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+	const port = (server.address() as { port: number }).port;
+	const child = spawn(
+		process.execPath,
+		[ATTACH, "--url", `http://127.0.0.1:${port}`, "--session", "hdrcheck", "--actor", "demo@local", "--token", "hdr-only-token"],
+		{ stdio: ["ignore", "ignore", "pipe"] },
+	);
+	cleanups.push(() => void child.kill());
+	const req = await Promise.race([
+		seen,
+		new Promise<never>((_, reject) => setTimeout(() => reject(new Error("attach 未在 5s 内发起 WS 握手")), 5_000).unref()),
+	]);
+	const handshake = new URL(req.url ?? "/", "http://127.0.0.1");
+	assert.equal(handshake.searchParams.get("token"), null, "握手 URL 不得携带 token（会随 URL 进访问日志）");
+	assert.equal(handshake.searchParams.get("actor"), "demo@local", "actor 无头部通道，仍走 query（#authenticateWS demo 分支只读 query）");
+	assert.equal(req.headers.authorization, "Bearer hdr-only-token", "token 经 WS 握手 Authorization 头（#authenticateWS demo 分支接受）");
 });

@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -483,6 +483,142 @@ test("R74：运行中 share 新增 approver —— 旧 grant 立即失效、新 
 	assert.ok(snap.revokedJtis.length > 0, "旧 jti 必须已进吊销表");
 });
 
+/** R78 共用：起真实本地上游 git（clone 必须成功，否则会话启动失败会先撤 grant，撞不进 acl 重签路径） */
+async function seedUpstream(prefix: string): Promise<number> {
+	const execP = promisify(execFile);
+	const upstreamAuth = `Basic ${Buffer.from(`x-access-token:${UPSTREAM_KEY}`).toString("base64")}`;
+	const scmRoot = mkdtempSync(join(tmpdir(), `${prefix}-scm-`));
+	const upstreamRepo = join(scmRoot, "app.git");
+	const seed = mkdtempSync(join(tmpdir(), `${prefix}-seed-`));
+	const g = (args: string[], cwd: string) =>
+		execP("git", args, { cwd, env: { PATH: process.env.PATH ?? "", HOME: cwd, GIT_AUTHOR_NAME: "s", GIT_AUTHOR_EMAIL: "s@s", GIT_COMMITTER_NAME: "s", GIT_COMMITTER_EMAIL: "s@s" } });
+	await g(["init", "-q", "-b", "main"], seed);
+	writeFileSync(join(seed, "README.md"), `${prefix} seed\n`);
+	await g(["add", "."], seed);
+	await g(["commit", "-qm", "初始提交"], seed);
+	await g(["init", "-q", "--bare", upstreamRepo], scmRoot);
+	await g(["remote", "add", "origin", upstreamRepo], seed);
+	await g(["push", "-q", "origin", "main"], seed);
+	const scm = spawn(process.execPath, [GIT_SERVER, scmRoot, upstreamAuth], { stdio: ["ignore", "pipe", "inherit"] });
+	cleanups.push(() => void scm.kill());
+	return await new Promise((r) => scm.stdout?.once("data", (d) => r(JSON.parse(d.toString()).port)));
+}
+
+test("R78：acl 重签（#remintGitGrant）写 HOME 失败 —— 旧 grant 已撤不复活、新 entry 不残留登记", async () => {
+	// round-13 缺口 (a)：重签事务失败路径此前无测试。失败注入用现有真实缝（零 prod 改动）：
+	// 沙箱 HOME 目录置 0o500 → 重签投递步 writeGitCredentialConfig 的 writeFileSync(tmp) EACCES。
+	// 期望（renew 同缝事务语义）：new jti 退役（不可用）、回滚不复活旧 grant、
+	// fresh entry 连同移除（不留无 token 的半登记）、固定类别审计可见。
+	const dir = mkdtempSync(join(tmpdir(), "r78a-"));
+	const masterKey = randomBytes(32);
+	const internalToken = randomBytes(24).toString("base64url");
+	const sid = "r78remint1";
+	const scmPort = await seedUpstream("r78a");
+
+	const gwPort = await reservePort();
+	const gitAudit = AuditLog.open(join(dir, "gitproxy.jsonl"));
+	cleanups.push(() => gitAudit.close());
+	const gitProxy = new GitCredentialProxy({
+		port: 0, host: "127.0.0.1", mode: "production", masterKey,
+		registry: { url: `http://127.0.0.1:${gwPort}/internal/git/registry`, internalToken, pollMs: 250 },
+		audit: gitAudit,
+		repos: [{ name: "git.internal/app.git", upstream: `http://127.0.0.1:${scmPort}/app.git`, username: "x-access-token", token: UPSTREAM_KEY, allowPush: true }],
+	});
+	cleanups.push(() => gitProxy.close());
+	const proxyPort = await gitProxy.listen();
+
+	const workspaceRoot = join(dir, "workspaces");
+	const stateRoot = join(dir, "state");
+	mkdirSync(join(stateRoot, "sessions", sid), { recursive: true });
+	writeFileSync(join(stateRoot, "revocations.json"), JSON.stringify({ revoked: [], updatedAt: new Date().toISOString() }), { mode: 0o600 });
+
+	const gateway = new Gateway({
+		mode: "demo", port: gwPort, host: "127.0.0.1", token: GATEWAY_TOKEN,
+		policyFile: join(REPO, "config/policy.yaml"), auditFile: join(dir, "audit.jsonl"),
+		workspaceRoot, stateRoot, webRoot: join(REPO, "web"),
+		gitGrants: { masterKey, internalToken, writeRefs: ["refs/heads/*"], repos: [{ name: "git.internal/app.git", allowPush: true }] },
+		wiring: { gitProxyToken: "", proxyToken: PROXY_TOKEN, modelGatewayUrl: "http://127.0.0.1:1/v1", model: "m", gitProxyUrl: `http://127.0.0.1:${proxyPort}`, scmHosts: ["git.internal"] },
+		repoUrl: "https://git.internal/app.git",
+	});
+	cleanups.push(() => gateway.close());
+	await gateway.listen();
+
+	// 快照就绪探针（同 R74）：clone 不得撞上「快照缺失 fail-closed」空窗
+	const probeGrant = signGrant({
+		v: 1, tenant: "probe", principal: "probe", session: "probe-s", repo: "git.internal/app.git",
+		caps: { read: true, write: false, writeRefs: [] }, exp: Date.now() + 60_000, jti: "probe-jti",
+		epoch: "epoch-probe", aclVersion: 1,
+	} as never, masterKey, Date.now());
+	{
+		const probeDeadline = Date.now() + 10_000;
+		for (;;) {
+			await fetch(`http://127.0.0.1:${proxyPort}/git.internal/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${probeGrant}` } });
+			let snapReady = false;
+			for await (const e of AuditLog.replay(join(dir, "gitproxy.jsonl"))) {
+				if (e.verdict === "deny" && /epoch 与 registry 快照不一致|session 未在活会话登记/.test(e.summary)) snapReady = true;
+			}
+			if (snapReady) break;
+			if (Date.now() > probeDeadline) throw new Error("git 代理未及时拉取 registry 快照");
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	}
+
+	const ws = new WebSocket(`ws://127.0.0.1:${gwPort}/?token=${GATEWAY_TOKEN}&actor=demo@local&session=${sid}`);
+	const events: ClientEvent[] = [];
+	ws.on("message", (raw) => { const m = JSON.parse(String(raw)); if (m.type !== "control" && m.event) events.push(m.event); });
+	await new Promise((r) => ws.once("open", r));
+	cleanups.push(() => void ws.close());
+	const waitFor = async (pred: () => boolean, ms = 20_000): Promise<void> => {
+		const deadline = Date.now() + ms;
+		while (!pred()) {
+			if (Date.now() > deadline) throw new Error(`超时；事件：${events.map((e) => e.type).join(",")}`);
+			await new Promise((r) => setTimeout(r, 20));
+		}
+	};
+	await waitFor(() => events.some((e) => e.type === "session.ready"));
+
+	const home = join(workspaceRoot, ".homes", sid);
+	const grantFromHome = (): string => {
+		const m = readFileSync(join(home, ".gitconfig"), "utf8").match(/x-session:([^@\s]+)@/);
+		assert.ok(m, "沙箱 HOME .gitconfig 必须携带 grant");
+		return m[1]!;
+	};
+	const registry = async (): Promise<{ activeSessions: Record<string, { principal: string; aclVersion: number }>; revokedJtis: string[] }> => {
+		const res = await fetch(`http://127.0.0.1:${gwPort}/internal/git/registry`, { headers: { authorization: `Bearer ${internalToken}` } });
+		assert.equal(res.status, 200);
+		return await res.json() as { activeSessions: Record<string, { principal: string; aclVersion: number }>; revokedJtis: string[] };
+	};
+
+	const grant0 = grantFromHome();
+	{
+		const snap0 = await registry();
+		assert.ok(snap0.activeSessions[sid], "初签 entry 必须在登记");
+		assert.equal(snap0.revokedJtis.length, 0, "基线无 git grant 吊销");
+	}
+
+	// 失败注入：HOME 只读 → 重签投递步 writeFileSync EACCES（save 本身不失败 → 走「写 HOME 失败」回滚支路）
+	chmodSync(home, 0o500);
+	cleanups.unshift(() => { try { chmodSync(home, 0o700); } catch { /* 已被收尾清理 */ } });
+
+	ws.send(JSON.stringify({ type: "share", actor: "approver@local", role: "approver" }));
+
+	// 终态收敛：active 无该 session（fresh entry 回滚连同移除）；revoked 恰 2 = 旧 jti + 未投递 new jti
+	const deadline = Date.now() + 5_000;
+	let snap: Awaited<ReturnType<typeof registry>>;
+	for (;;) {
+		snap = await registry();
+		if (!snap.activeSessions[sid] && snap.revokedJtis.length === 2) break;
+		if (Date.now() > deadline) throw new Error(`重签失败后登记未收敛：active=${Object.keys(snap.activeSessions)} revoked=${snap.revokedJtis.length}`);
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	assert.ok(!snap.activeSessions[sid], "新 entry 不得残留登记（fresh entry 回滚连同移除）");
+	assert.equal(snap.revokedJtis.length, 2, "旧 jti 已撤 + new jti 已退役（恰 2 —— 旧 grant 不复活、新 grant 不可用）");
+	assert.equal(grantFromHome(), grant0, "写 HOME 失败：沙箱 .gitconfig 仍是旧 grant 串（已吊销失效，未被替换）");
+	const entries: { summary: string }[] = [];
+	for await (const e of AuditLog.replay(join(dir, "audit.jsonl"))) entries.push(e as { summary: string });
+	assert.ok(entries.some((e) => /git grant acl 变更回调失败/.test(e.summary)), "重签失败必须有固定类别审计（不静默）");
+});
+
 test("R76：demo 浏览器入口 —— 按 app.js 实际请求序列（静态页 + /auth/session 换 Cookie + 带 Cookie 的 WS）能建立会话", async () => {
 	// round-13 R3：banner 的 #token= 流在 demo 下原先必败（/auth/session 401 + WS 无凭据）。
 	// app.js R76 后的实际序列：GET / → POST /auth/session（demo：静态 token 换同生产形态
@@ -505,10 +641,10 @@ test("R76：demo 浏览器入口 —— 按 app.js 实际请求序列（静态�
 	const page = await fetch(`http://127.0.0.1:${port}/?token=${token}&actor=demo@local`);
 	assert.equal(page.status, 200);
 	assert.match(page.headers.get("content-type") ?? "", /text\/html/);
-	// ② app.js：POST /auth/session（demo：静态 token + x-perimeter-actor 换同形态会话 Cookie）
+	// ② app.js：POST /auth/session（demo：静态 token + x-demo-actor 换同形态会话 Cookie）
 	const s = await fetch(`http://127.0.0.1:${port}/auth/session`, {
 		method: "POST",
-		headers: { authorization: `Bearer ${token}`, origin: `http://127.0.0.1:${port}`, "x-perimeter-actor": "demo@local" },
+		headers: { authorization: `Bearer ${token}`, origin: `http://127.0.0.1:${port}`, "x-demo-actor": "demo@local" },
 	});
 	assert.equal(s.status, 204);
 	const setCookie = s.headers.get("set-cookie") ?? "";
@@ -532,7 +668,7 @@ test("R76：demo 浏览器入口 —— 按 app.js 实际请求序列（静态�
 	// 必须 4003 被拒（防越权）；share 后可接入的完整流由 demo-e2e R74 例覆盖。
 	const s2 = await fetch(`http://127.0.0.1:${port}/auth/session`, {
 		method: "POST",
-		headers: { authorization: `Bearer ${token}`, origin: `http://127.0.0.1:${port}`, "x-perimeter-actor": "approver@local" },
+		headers: { authorization: `Bearer ${token}`, origin: `http://127.0.0.1:${port}`, "x-demo-actor": "approver@local" },
 	});
 	assert.equal(s2.status, 204);
 	const cookie2 = (s2.headers.get("set-cookie") ?? "").split(";")[0]!;
