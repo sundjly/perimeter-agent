@@ -131,6 +131,7 @@ export async function runTask(task: TaskSpec, opts: RunOptions): Promise<TaskRes
 
 	const token = `eval-${task.id}`;
 	const gateway = new Gateway({
+		mode: "demo",
 		port: 0,
 		host: "127.0.0.1",
 		token,

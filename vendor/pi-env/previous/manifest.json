@@ -1,0 +1,47 @@
+{
+ "name": "env-session-pin",
+ "purpose": "G1 known-disconnect no-reconnect: Connection.snapshot() + RemoteExecutionEnv sessionPin (client-side only; compatible with installed 1.1.0 daemon, zero protocol/daemon change)",
+ "base": {
+  "repo": "/Users/sundy/projects/pi-mono",
+  "head": "cdaf6c227",
+  "headIs": "v1.1.0-24 (git diff v1.1.0..HEAD -- packages/env = CHANGELOG +2 only; src identical to v1.1.0)",
+  "targetPackage": "@earendil-works/pi-env",
+  "targetVersion": "1.1.0",
+  "sources": {
+   "packages/env/src/connection.ts": "7e1f77ddf2d3a8b6506f429cc7f698c10fc85b30fa2c2fbd86406ce3cde7ff31",
+   "packages/env/src/remote-env.ts": "373019b5ac2ff2791003105a312e74646d2055e6b31f4e1a438dae4e3a7e1d5b"
+  },
+  "sourceBaseHashes": {
+   "packages/env/src/connection.ts": "740c6e340d61b789c9343e9c093efd38377059297bb8352d32c732cb2751d1ad",
+   "packages/env/src/remote-env.ts": "06bba09bc86ce421c2ac5203364896947ef983f070ba7a40ac13b22b0fea974a"
+  }
+ },
+ "compiler": {
+  "typescript": "5.9.3",
+  "command": "node <pi-mono>/node_modules/typescript/bin/tsc -p <owned>/tsconfig.env.json (extends pi-mono/tsconfig.base.json; paths -> perimeter node_modules 1.1.0 d.ts, read-only; outDir owned temp)",
+  "driftCheck": "unpatched-source emit vs installed dist: connection.js/remote-env.js/both d.ts byte-identical (maps differ: sources paths)"
+ },
+ "files": {
+  "connection.js": {
+   "patched": "24a59aacbfcad549ee30a34d9db0dc02e26b7da3fabb527049b48666b59ce2e8",
+   "original": "a11354eefc264d6c98b8183ceb0df57cd984cea8a40fec9847c9118ab781f053"
+  },
+  "remote-env.js": {
+   "patched": "e1650f38131cc04b1c83a9ce1142db061d2fd46440cec8790aac6e2997b40fbc",
+   "original": "b3d31de4dbdc22ce8738d93320a6c48a349534aa447ed91dabde3fa29239fcd0"
+  },
+  "connection.d.ts": {
+   "patched": "8aed5a1d460f94079225262ad50bbfa15cb33b25168722a8b2e7629e63dba806",
+   "original": "7a0c63f682df9e562ed501623fbeec1f3b625eb83696d769b20521ff4afeffc7"
+  },
+  "remote-env.d.ts": {
+   "patched": "b60ea61c74529261a8157711c8f938e9c6f1b0ebcda3747165491097dc6c5bb3",
+   "original": "21afc6ffa0034764c4c4442208ee1e8f49f377d61418bcfa6edcbee1d7beb524"
+  }
+ },
+ "installTarget": "node_modules/@earendil-works/pi-env/dist/",
+ "notes": [
+  "maps (.js.map/.d.ts.map) intentionally NOT replaced: old maps stay for debugging only, runtime never reads them",
+  "runtime fail-closed: perimeter refuses to create pinned guard env unless capability (snapshot/pinnedSession) AND patched hashes match"
+ ]
+}

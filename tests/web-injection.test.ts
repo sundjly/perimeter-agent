@@ -79,6 +79,7 @@ test("网关下发的 CSP 真的能拦住 token 外传", async () => {
 	// 更重要的是将来多一条不带 CSP 的响应路径（错误页、304）源码扫描看不出来
 	const dir = mkdtempSync(join(tmpdir(), "web-csp-"));
 	const gw = new Gateway({
+		mode: "demo",
 		port: 0,
 		host: "127.0.0.1",
 		token: "t",

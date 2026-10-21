@@ -17,6 +17,15 @@ version: 1
 # 这份名单与 pi 的对齐由 tests/tool-alignment.test.ts 守着。
 read_only_tools: [read]
 
+# ── B1 deny_reads：只读工具的凭据读取拒绝 ──────────────────────
+# read 豁免 deny_paths/审批的取舍（审批疲劳）保持不变，但凭据文件不该例外：
+# 读进模型上下文就是外泄通道的前半程。deny_reads 只对 read_only_tools 名单内、
+# 带 path 的调用生效，且与写类路径规则走同一 canonical 守卫（symlink 解析后
+# 按真实目标复判）与硬链接保守拒。边界如实：这是策略层/进程内防线，
+# 不是 OS 边界 —— bash 里的 cat/base64 仍然看不见路径（tests/redteam.test.ts 固定该局限）。
+# 注意：读类工具没有审批兜底档（deny_reads 只有 deny），这是刻意的：
+# 凭据读取不存在「问一下再读」的合法场景。
+
 # 沙箱 NetworkPolicy 的唯一事实来源（由 deploy/ 的清单生成器消费）。
 # 默认 deny all，只放通 git 代理。这是四条铁律里唯一的技术边界，
 # 但它的作用范围要说准确：它杀掉的是「直连任意外部主机」这一类外泄，
@@ -84,6 +93,22 @@ rules:
       # 就是靠它把 SCM 重写到凭据代理的。真实收益不是「重定向到攻击者地址」
       # （那由 egress 挡），而是审批门绕过：写一句 [alias] p = push，
       # 之后 git p 不再匹配 git push* 模式，审批门静默失效；core.hooksPath 同理。
+      - "**/.gitconfig"
+
+  # ── 凭据文件读取拒绝（B1 deny_reads；只对 read 类工具生效）───
+  - name: credential-files-read-denied
+    tool: "*"
+    deny_reads:
+      # 与 deny_paths 凭据节同源：能被写保护的根本就不该被读
+      - "**/secrets/**"
+      - "**/.env"
+      - "**/.env.*"
+      - "**/.npmrc"
+      - "**/.ssh/**"
+      - "**/.aws/**"
+      - "**/.git-credentials"
+      - "**/.kube/config"
+      # 全局 .gitconfig 同样承载 credential.helper（非必要读取一并拒）
       - "**/.gitconfig"
 
   # ── 破坏性与外泄类命令 ─────────────────────────────────────

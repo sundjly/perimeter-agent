@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtempSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { AuditLog } from "../src/audit/log.ts";
 import { ModelGateway, assertAllowed } from "../src/modelgw/server.ts";
-import { redact, scanSecrets } from "../src/modelgw/secrets.ts";
+import { decodeStrictUtf8, redact, scanJsonDecoded, scanSecrets } from "../src/modelgw/secrets.ts";
 import { GCP_TOKEN_HOST, clearTokenCache } from "../src/modelgw/upstream-auth.ts";
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -209,8 +209,9 @@ test("占位符不误报", () => {
 	assert.deepEqual(scanSecrets("api_key: changeme"), []);
 });
 
-test("命中凭据只告警不改写请求体 —— 改写代码流的误伤率无法接受", async () => {
-	const { url, up, auditFile } = await startGateway();
+test("命中凭据只告警不改写请求体 —— audit 模式（显式获批低敏部署）下的语义", async () => {
+	// B3：audit 已不再是默认；仅显式获批（dlp.auditApproved）的低敏部署可以 audit。
+	const { url, up, auditFile } = await startGateway({ dlp: { mode: "audit", auditApproved: true } });
 	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 	const res = await call(url, { messages: [{ role: "user", content: `修一下这段：token = "${secret}"` }] });
 	await res.text();
@@ -223,6 +224,233 @@ test("命中凭据只告警不改写请求体 —— 改写代码流的误伤率
 	const alert = entries.find((e) => e.summary.includes("命中凭据特征"));
 	assert.ok(alert, "应有告警");
 	assert.ok(!alert!.summary.includes(secret));
+});
+
+// ── B3：出站 DLP（生产默认 block） ──────────────────────
+
+test("B3：dlp.mode 非法值启动即炸（fail-fast，不静默回退）", async () => {
+	const up = await startUpstream();
+	assert.throws(
+		() => new ModelGateway({
+			port: 0, host: "127.0.0.1", token: "t",
+			upstreams: [{ id: "x", baseUrl: up.url, apiKey: "k" }],
+			egressAllowlist: [up.host],
+			dlp: { mode: "off" as never },
+		}),
+		/dlp\.mode 非法/,
+	);
+});
+
+test("B3：audit 模式无显式批准 → 启动即炸（audit 仅限获批低敏部署）", async () => {
+	const up = await startUpstream();
+	assert.throws(
+		() => new ModelGateway({
+			port: 0, host: "127.0.0.1", token: "t",
+			upstreams: [{ id: "x", baseUrl: up.url, apiKey: "k" }],
+			egressAllowlist: [up.host],
+			dlp: { mode: "audit" },
+		}),
+		/auditApproved/,
+	);
+	// 显式批准后可启动
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "t",
+		upstreams: [{ id: "x", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+		dlp: { mode: "audit", auditApproved: true },
+	});
+	cleanups.push(() => gw.close());
+	assert.equal(gw.dlpMode, "audit");
+});
+
+test("B3：未配置 dlp = 生产默认 block；命中凭据 403 + 固定类别 + 上游零调用", async () => {
+	const up = await startUpstream();
+	const auditFile = join(mkdtempSync(join(tmpdir(), "mgw-")), "audit.jsonl");
+	const audit = AuditLog.open(auditFile);
+	cleanups.push(() => audit.close());
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "upstream-secret-key" }],
+		egressAllowlist: [up.host],
+		audit,
+	});
+	cleanups.push(() => gw.close());
+	assert.equal(gw.dlpMode, "block", "缺省必须是 block（生产默认）");
+	const port = await gw.listen();
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		messages: [{ role: "user", content: "deploy key: AKIAIOSFODNN7EXAMPLE" }],
+	});
+	assert.equal(res.status, 403);
+	const text = await res.text();
+	assert.match(text, /dlp_block/);
+	assert.match(text, /aws-access-key/, "回给沙箱的是固定类别");
+	assert.ok(!text.includes("AKIAIOSFODNN7EXAMPLE"), "不得回原文");
+	assert.ok(!JSON.stringify(text).includes("***"), "不得回 hint 余文");
+	assert.equal(up.seen.length, 0, "block 命中后上游调用必须为零");
+	// 审计（私有面）有记录且脱敏
+	const entries = [];
+	for await (const e of AuditLog.replay(auditFile)) entries.push(e);
+	const alert = entries.find((e) => e.summary.includes("命中凭据特征"));
+	assert.ok(alert, "审计应留痕");
+	assert.ok(!alert!.summary.includes("AKIAIOSFODNN7EXAMPLE"));
+});
+
+test("B3：block 模式下认证副作用也不发生（GCP 换 token 在扫描之后）", async () => {
+	clearTokenCache();
+	const key = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	}).privateKey;
+	const up = await startUpstream();
+	const fetchCalls: { url: string; init?: RequestInit }[] = [];
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "vertex", baseUrl: up.url, auth: { kind: "gcp", clientEmail: "sa@x", privateKey: key } }],
+		egressAllowlist: [up.host, GCP_TOKEN_HOST],
+		fetchImpl: (async (u: string, init?: RequestInit) => {
+			fetchCalls.push({ url: String(u), init });
+			if (String(u).includes("oauth2.googleapis.com")) {
+				return new Response(JSON.stringify({ access_token: "tk", expires_in: 3600 }));
+			}
+			return fetch(u, init);
+		}) as unknown as typeof fetch,
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		messages: [{ role: "user", content: "token: ghp_abcdefghijklmnopqrstuvwxyz0123456789" }],
+	});
+	assert.equal(res.status, 403);
+	assert.equal(fetchCalls.length, 0, "扫描命中后连换 token 的认证副作用都不得发生");
+	assert.equal(up.seen.length, 0);
+});
+
+test("B3：扫描器故障 fail-closed（audit 模式也不例外）", async () => {
+	const up = await startUpstream();
+	for (const mode of ["block", "audit"] as const) {
+		const gw = new ModelGateway({
+			port: 0, host: "127.0.0.1", token: "gw-token",
+			upstreams: [{ id: "x", baseUrl: up.url, apiKey: "k" }],
+			egressAllowlist: [up.host],
+			dlp: mode === "audit" ? { mode, auditApproved: true } : { mode },
+			scanSecretsImpl: () => {
+				throw new Error("scan exploded");
+			},
+		});
+		cleanups.push(() => gw.close());
+		const port = await gw.listen();
+		const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, { messages: [] });
+		assert.equal(res.status, 503, `${mode} 模式下扫描器故障必须 fail-closed`);
+		await res.text();
+		assert.equal(up.seen.length, 0, `${mode} 模式下扫描器故障不得放行到上游`);
+	}
+});
+
+test("B3：超过 body 上限 413 fail-closed，上游零调用，不新增无界 buffer", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "x", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const big = "x".repeat(8 * 1024 * 1024 + 1);
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, { messages: [{ role: "user", content: big }] });
+	assert.equal(res.status, 413);
+	await res.text();
+	assert.equal(up.seen.length, 0, "超限请求不得到达上游");
+});
+
+test("B3：上游 fetch 一律 redirect:error（含 GCP 换 token），302 被拒不跟随", async () => {
+	clearTokenCache();
+	// 真实重定向负控：上游 302 → Location 指向另一台本地服务器；redirect:error 下网关必须 502 且跳转目标零请求
+	const redirectedToSeen: string[] = [];
+	const target = createServer((_req, res) => {
+		redirectedToSeen.push("hit");
+		res.writeHead(200).end("leaked");
+	});
+	await new Promise<void>((r) => target.listen(0, "127.0.0.1", r));
+	cleanups.push(() => new Promise<void>((r) => target.close(() => r())));
+	const targetPort = (target.address() as { port: number }).port;
+
+	const redirector = createServer((_req, res) => {
+		res.writeHead(302, { location: `http://127.0.0.1:${targetPort}/v1/chat/completions` });
+		res.end();
+	});
+	await new Promise<void>((r) => redirector.listen(0, "127.0.0.1", r));
+	cleanups.push(() => new Promise<void>((r) => redirector.close(() => r())));
+	const redirectPort = (redirector.address() as { port: number }).port;
+
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "r", baseUrl: `http://127.0.0.1:${redirectPort}`, apiKey: "k" }],
+		egressAllowlist: ["127.0.0.1"],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, { messages: [] });
+	assert.equal(res.status, 502, "redirect:error 下 302 必须失败而非跟随");
+	await res.text();
+	assert.equal(redirectedToSeen.length, 0, "重定向目标必须零请求（跨 host/同 host 多跳都拒）");
+});
+
+test("B3：fetch init 携带 redirect:'error'（上游与换 token 的每次调用都被注入点观测）", async () => {
+	clearTokenCache();
+	const key = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	}).privateKey;
+	const inits: (RequestInit | undefined)[] = [];
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "vertex", baseUrl: up.url, auth: { kind: "gcp", clientEmail: "sa@x", privateKey: key } }],
+		egressAllowlist: [up.host, GCP_TOKEN_HOST],
+		fetchImpl: (async (u: string, init?: RequestInit) => {
+			inits.push(init);
+			if (String(u).includes("oauth2.googleapis.com")) {
+				return new Response(JSON.stringify({ access_token: "tk", expires_in: 3600 }));
+			}
+			return new Response("data: x\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch,
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	await (await call(`http://127.0.0.1:${port}/v1/chat/completions`, { model: "m", messages: [] })).text();
+	assert.ok(inits.length >= 2, "换 token + 上游至少两次 fetch");
+	for (const init of inits) assert.equal(init?.redirect, "error", "每个携带凭据的 fetch 都必须 redirect:error");
+});
+
+test("B3 对照集：真阳性全检出；历史误报源（commit SHA/base64/UUID/占位符）不误报（不宣称零误报）", () => {
+	// 真阳性（高置信类别）
+	const tps = scanSecrets([
+		"AKIAIOSFODNN7EXAMPLE",
+		"ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+		"-----BEGIN RSA PRIVATE KEY-----",
+		"Authorization: Bearer abcdef1234567890abcdef",
+		"password = \"supersecret123456\"",
+	].join("\n"));
+	assert.ok(tps.length >= 5, `真阳性必须全检出: ${JSON.stringify(tps.map((t) => t.kind))}`);
+	// 历史误报源：不误报（但样本有限，不宣称零误报 —— 真实误报率要靠真实流量数据）
+	const fps = scanSecrets([
+		"commit 3f2a9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b",
+		"const blob = atob('SGVsbG8gV29ybGQhIVIQ==');",
+		"id: 550e8400-e29b-41d4-a716-446655440000",
+		"password=your-password-here",
+		"api_key: changeme",
+	].join("\n"));
+	assert.deepEqual(fps, [], `历史误报源不得命中: ${JSON.stringify(fps)}`);
+});
+
+test("B3 对照集：JSON 转义形态的凭据赋值可检出（转义引号不致漏检）", () => {
+	// JSON.stringify 后 password 前后的引号变成 \" —— 旧字符类不容忍反斜杠会漏检
+	const body = JSON.stringify({ messages: [{ role: "user", content: 'password = "hunter2hunter2"' }] });
+	assert.ok(body.includes("\\\""), "夹具必须真实含转义引号");
+	const hits = scanSecrets(body);
+	assert.ok(hits.some((h) => h.kind === "credential-assignment"), `JSON 转义凭据必须检出: ${JSON.stringify(hits)}`);
 });
 
 // ── 路由 ────────────────────────────────────────────────────
@@ -505,4 +733,412 @@ test("缓存亲和头与 cache_control 请求体原样转发，审计使用 sess
 	const entries = [];
 	for await (const entry of AuditLog.replay(env.auditFile)) entries.push(entry);
 	assert.ok(entries.some((entry) => entry.sessionId === "stable" && entry.kind === "usage"));
+});
+
+// ── R41 修复2负控：完整 body 语义解码扫描（unicode 逃逸/非法JSON/非法UTF8/无界嵌套/扫描器非法返回）──
+// 语义红判定口径：负控断言的是「状态码+上游零调用」的产品语义，非 TypeError/hash/setup 失败。
+
+const ESC = (s: string) => s.split("").map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+// AWS 官方文档公开示例 key（非真实凭据；拼接构造避免展示层掩码歧义）：满足 aws-access-key 规则
+const EXAMPLE_AKIA = "AKIA" + "IOSFODNN7EXAMPLE";
+
+test("R41负控：unicode 逃逸的凭据赋值必须被语义解码后拦截（当前裸扫描漏检=红）", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "upstream-secret-key" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	// JSON 转义后 raw 扫描不可见，但上游 JSON.parse 后会收到明文 password = "AKIA..."
+	const plain = `password = "${EXAMPLE_AKIA}"`;
+	const body = `{"messages":[{"role":"user","content":"${ESC(plain)}"}]}`;
+	assert.ok(!body.includes("password ="), "夹具必须真实全转义（raw 裸扫描不可见）");
+	const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" }, body,
+	});
+	assert.equal(res.status, 403, `语义逃逸必须拦截，实际=${res.status}`);
+	await res.text();
+	assert.equal(up.seen.length, 0, "拦截前上游零调用");
+});
+
+test("R41负控：string value 逐字符 unicode 逃逸的独立凭据 token 同样拦截", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"messages":[{"role":"user","content":"${ESC(EXAMPLE_AKIA)}"}]}`;
+	assert.ok(!body.includes("AKIA"), "夹具必须真实全转义");
+	const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" }, body,
+	});
+	assert.equal(res.status, 403);
+	await res.text();
+	assert.equal(up.seen.length, 0);
+});
+
+test("R41负控：非法 JSON body → fail-closed 403（不得透传上游）", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" },
+		body: '{"messages":[{"role":"user","content":"hi"}}',
+	});
+	assert.equal(res.status, 403, `非法 JSON 必须 fail-closed，实际=${res.status}`);
+	await res.text();
+	assert.equal(up.seen.length, 0);
+});
+
+test("R41负控：非法 UTF-8 序列 → fail-closed（不得经有损解码放行）", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const bad = Buffer.from('{"messages":[{"role":"user","content":"\xff\xfe\x80"}]}', "latin1");
+	const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" }, body: bad,
+	});
+	assert.equal(res.status, 403, `非法 UTF-8 必须 fail-closed，实际=${res.status}`);
+	await res.text();
+	assert.equal(up.seen.length, 0);
+});
+
+test("R41负控：超过深度上限的无界嵌套 → fail-closed 403", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	let body = '{"x":'.repeat(200) + '1' + "}".repeat(200);
+	const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" }, body,
+	});
+	assert.equal(res.status, 403, `超深嵌套必须 fail-closed，实际=${res.status}`);
+	await res.text();
+	assert.equal(up.seen.length, 0);
+});
+
+test("R41负控：扫描器返回 null / 非数组 / 未知 kind / 超长 hint → 一律 503 fail-closed（双模式）", async () => {
+	const up = await startUpstream();
+	const badReturns: unknown[] = [null, 42, [{ kind: "totally-unknown-kind", hint: "x" }], [{ kind: "aws-access-key", hint: "x".repeat(4096) }], [{ kind: "aws-access-key" }]];
+	for (const mode of ["block", "audit"] as const) {
+		for (const bad of badReturns) {
+			const gw = new ModelGateway({
+				port: 0, host: "127.0.0.1", token: "gw-token",
+				upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+				egressAllowlist: [up.host],
+				dlp: mode === "audit" ? { mode, auditApproved: true } : { mode },
+				scanSecretsImpl: (() => bad) as unknown as typeof scanSecrets,
+			});
+			cleanups.push(() => gw.close());
+			const port = await gw.listen();
+			const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, { messages: [] });
+			assert.equal(res.status, 503, `mode=${mode} bad=${JSON.stringify(bad)} 必须fail-closed，实际=${res.status}`);
+			await res.text();
+			assert.equal(up.seen.length, 0, "扫描器非法返回不得放行到上游");
+		}
+	}
+});
+
+test("R41正控：跨字段不得误拼误报 —— key 与另一字段的值各自独立不构成命中", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	// "password" 与 12+ 字符值分属不同字段：独立扫描均不命中；拼接才会假阳
+	const res = await call(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		field_a: "password", field_b: "totally-innocent-value-123456", messages: [],
+	});
+	assert.equal(res.status, 200, `跨字段不得误拼误报，实际=${res.status}`);
+	await res.text();
+	assert.equal(up.seen.length, 1, "正常 body 必须逐字节透传上游");
+});
+
+test("R41正控：decoded 扫描不得改写上游收到的 body（语义扫描、字节透传）", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"messages":[{"role":"user","content":"${ESC("please review commit 3f2a9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b")}"}]}`;
+	const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" }, body,
+	});
+	assert.equal(res.status, 200);
+	await res.text();
+	assert.equal(up.seen.length, 1);
+	assert.equal(up.seen[0]!.body, body, "上游收到的必须逐字节等于原始 body（含转义序列原文）");
+});
+
+// ── R43 修复负控：同条目 key→value 语义赋值判定 + 重复键不塌缩丢失（R-Q42-1）──
+// 口径：A1–A5/A9b 形态（逃逸 key + 同条目凭据值）真实 HTTP 403 + 上游/认证副作用零调用；
+// A7/A8 干净形态保持 200 + 逐字节透传；重复键（含转义重复键）经 JSON.parse 塌缩后
+// 前条真实 secret 不得丢失。原始 body 串直接 POST，不经 JS 预解析。
+
+/** R43 夹具值：拼接构造（避免字面 secret token 形态；≥12 类内字符、非占位前缀） */
+const R43_VAL = "fixture" + "CredentialValue4R43";
+
+/** 原始串 POST（body 即字面字节） */
+async function postRaw43(port: number, body: string): Promise<{ status: number; text: string }> {
+	const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+		method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" }, body,
+	});
+	return { status: res.status, text: await res.text() };
+}
+
+/** 跨 chunk 原始写入（中停 80ms；读路径聚合后扫描必须与整包一致） */
+async function postRawChunked43(port: number, body: string, splitAt: number): Promise<{ status: number; text: string }> {
+	return new Promise((resolve, reject) => {
+		const req = httpRequest(
+			{ host: "127.0.0.1", port, path: "/v1/chat/completions", method: "POST", headers: { authorization: "Bearer gw-token", "content-type": "application/json" } },
+			(res) => {
+				let text = "";
+				res.on("data", (c) => (text += c));
+				res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+			},
+		);
+		req.on("error", reject);
+		req.write(body.slice(0, splitAt));
+		setTimeout(() => {
+			req.write(body.slice(splitAt));
+			req.end();
+		}, 80);
+	});
+}
+
+test("R43负控A1：同条目逃逸 key → 真实凭据值 必须 403 + 上游零调用（coor 指定夹具）", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"messages":[{"role":"user","content":"clean"}],"metadata":{"${ESC("password")}":"LongRealCredential12345"}}`;
+	assert.ok(body.includes("\\u0077"), "夹具必须真实含逃逸 key（raw 裸扫描不可见）");
+	const { status, text } = await postRaw43(port, body);
+	assert.equal(status, 403, `同条目逃逸 key→凭据值必须拦截，实际=${status}`);
+	assert.match(text, /dlp_block/);
+	assert.ok(!text.includes("LongRealCredential12345"), "公共面不得回原文");
+	assert.equal(up.seen.length, 0, "拦截前上游零调用");
+});
+
+test("R43负控A2/A3：api_key 与 token 的同条目逃逸 key 同样 403", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	for (const key of [ESC("api_key"), ESC("token")]) {
+		const body = `{"messages":[],"metadata":{"${key}":"${R43_VAL}"}}`;
+		const { status } = await postRaw43(port, body);
+		assert.equal(status, 403, `逃逸 key=${key} 必须拦截，实际=${status}`);
+	}
+	assert.equal(up.seen.length, 0, "上游零调用");
+});
+
+test("R43负控A4：任意嵌套（对象套数组）中的同条目逃逸赋值 403", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"a":{"b":[{"note":"x"},{"${ESC("password")}":"longvalue1234567"}]}}`;
+	const { status } = await postRaw43(port, body);
+	assert.equal(status, 403, `任意嵌套同条目逃逸赋值必须拦截，实际=${status}`);
+	assert.equal(up.seen.length, 0, "上游零调用");
+});
+
+test("R43负控A5：同 A1 夹具跨 chunk 原始写入（中停 80ms）聚合后同样 403", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"messages":[{"role":"user","content":"clean"}],"metadata":{"${ESC("password")}":"LongRealCredential12345"}}`;
+	const { status } = await postRawChunked43(port, body, Math.floor(body.length / 2));
+	assert.equal(status, 403, `跨 chunk 聚合扫描必须拦截，实际=${status}`);
+	assert.equal(up.seen.length, 0, "上游零调用");
+});
+
+test("R43负控A9b：转义重复键 先真实 secret 后 placeholder —— 重复键保守拒（fail-closed 403）", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"${ESC("password")}":"real-secret-value-1","${ESC("password")}":"placeholder-value"}`;
+	const { status } = await postRaw43(port, body);
+	assert.equal(status, 403, `重复键塌缩前条真实 secret 必须保守拒，实际=${status}`);
+	assert.equal(up.seen.length, 0, "上游零调用");
+});
+
+test("R43负控：未转义重复键 先真实 secret 后 clean 占位 —— 同样 403（不得按塌缩后文档放行）", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"password":"${R43_VAL}","password":"your-password-here"}`;
+	const { status } = await postRaw43(port, body);
+	assert.equal(status, 403, `重复键前条真实 secret 必须 403，实际=${status}`);
+	assert.equal(up.seen.length, 0, "上游零调用");
+});
+
+test("R43负控：逃逸 key + 逃逸值（值整串 unicode 转义）同条目赋值 403", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"${ESC("password")}":"${ESC(R43_VAL)}","note":"clean"}`;
+	const { status } = await postRaw43(port, body);
+	assert.equal(status, 403, `逃逸 key+逃逸值必须拦截，实际=${status}`);
+	assert.equal(up.seen.length, 0, "上游零调用");
+});
+
+test("R43保守拒：重复键（含 clean 值）一律 fail-closed 403 —— 不把塌缩后文档当完整扫描证明", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"${ESC("password")}":"your-password-here","${ESC("password")}":"placeholder-value"}`;
+	const { status } = await postRaw43(port, body);
+	assert.equal(status, 403, `重复解码 key 必须保守拒，实际=${status}`);
+	assert.equal(up.seen.length, 0, "上游零调用");
+});
+
+test("R43边界：own value 判定——数组兄弟元素/数组值/number/bool/null 都不是 key 自己的字符串 value → 200", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const bodies = [
+		`[{"password":null},"${R43_VAL}"]`, // 数组兄弟元素不得配给前对象 key（token 序相邻≠own value）
+		`{"password":["${R43_VAL}"]}`, // 数组值不是字符串赋值（仅直接字符串 value）
+		`{"${ESC("password")}":${R43_VAL.length}00000}`, // number 值
+		`{"${ESC("password")}":true}`, // bool 值
+		`{"${ESC("password")}":null}`, // null 值
+		`{"password":"short"}`, // own value 但短于 12 字符 → 不命中
+		`{"note":"${R43_VAL}","other":["more","clean"]}`, // innocent key 承载长值 → 不误拼
+	];
+	for (const body of bodies) {
+		const { status } = await postRaw43(port, body);
+		assert.equal(status, 200, `非 own-value 形态不得误报，实际=${status} body=${body}`);
+	}
+	assert.equal(up.seen.length, bodies.length, "干净 body 全部透传");
+});
+
+test("R43正控：干净 body 含逃逸 key（值=clean 占位）→ 200 不误伤", async () => {
+	const up = await startUpstream();
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "azure", baseUrl: up.url, apiKey: "k" }],
+		egressAllowlist: [up.host],
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"messages":[],"metadata":{"${ESC("api_key")}":"placeholder-value","note":"hello"}}`;
+	const { status } = await postRaw43(port, body);
+	assert.equal(status, 200, `逃逸 key+占位值不得误伤，实际=${status}`);
+	assert.equal(up.seen[0]!.body, body, "逐字节透传");
+});
+
+test("R43负控：block 403 时 GCP 换 token 认证副作用也为零（逃逸 key 形态）", async () => {
+	clearTokenCache();
+	const key = generateKeyPairSync("rsa", {
+		modulusLength: 2048,
+		privateKeyEncoding: { type: "pkcs8", format: "pem" },
+		publicKeyEncoding: { type: "spki", format: "pem" },
+	}).privateKey;
+	const up = await startUpstream();
+	const fetchCalls: string[] = [];
+	const gw = new ModelGateway({
+		port: 0, host: "127.0.0.1", token: "gw-token",
+		upstreams: [{ id: "vertex", baseUrl: up.url, auth: { kind: "gcp", clientEmail: "sa@x", privateKey: key } }],
+		egressAllowlist: [up.host, GCP_TOKEN_HOST],
+		fetchImpl: (async (u: string, init?: RequestInit) => {
+			fetchCalls.push(String(u));
+			if (String(u).includes("oauth2.googleapis.com")) return new Response(JSON.stringify({ access_token: "tk", expires_in: 3600 }));
+			return fetch(u, init);
+		}) as unknown as typeof fetch,
+	});
+	cleanups.push(() => gw.close());
+	const port = await gw.listen();
+	const body = `{"messages":[],"metadata":{"${ESC("token")}":"longvalue123456789"}}`;
+	const { status } = await postRaw43(port, body);
+	assert.equal(status, 403);
+	assert.equal(fetchCalls.length, 0, "扫描命中后换 token 的认证副作用不得发生");
+	assert.equal(up.seen.length, 0);
+});
+
+test("R43单元：scanJsonDecoded 同条目语义 / 重复键保留 / 跨字段不拼接 / 有界不变式", () => {
+	// 同条目逃逸 key → 凭据值：语义赋值命中
+	const hits1 = scanJsonDecoded(`{"messages":[],"metadata":{"${ESC("password")}":"value-with-your-secret-123456"}}`);
+	assert.ok(hits1.some((h) => h.kind === "credential-assignment"), `同条目逃逸赋值必须命中: ${JSON.stringify(hits1)}`);
+	// 重复键：保守拒（fail-closed），无论值是否 clean
+	assert.throws(() => scanJsonDecoded(`{"password":"REALTOK123456","password":"your-clean-value"}`), /json_duplicate_key/);
+	assert.throws(() => scanJsonDecoded(`{"${ESC("password")}":"ghp_REAL...36","${ESC("password")}":"your-clean-value"}`), /json_duplicate_key/);
+	// 跨字段绝不拼接：innocent key 承载别条目的凭据形态值；数组兄弟元素不是 own value
+	const hits4 = scanJsonDecoded(`{"field_a":"password","field_b":"{{SECRET_c9xdwq2p}}","note":"clean"}`);
+	assert.deepEqual(hits4, [], `跨字段不得误拼误报: ${JSON.stringify(hits4)}`);
+	assert.deepEqual(scanJsonDecoded(`[{"password":null},"{{SECRET_c9xdwq2p}}"]`), [], "数组兄弟元素不得配给前对象 key");
+	assert.deepEqual(scanJsonDecoded(`{"password":["{{SECRET_c9xdwq2p}}"]}`), [], "数组值不是字符串赋值");
+	// 有界遍历不变式保持：超深 → fail-closed；非法 JSON → fail-closed
+	assert.throws(() => scanJsonDecoded(`{"x":`.repeat(200) + "1" + "}".repeat(200)), /json_bounds_exceeded/);
+	assert.throws(() => scanJsonDecoded('{"messages":[突破'), /invalid_json/);
+	// 严格 UTF-8 不变式保持
+	assert.throws(() => decodeStrictUtf8(Buffer.from([0xff, 0xfe, 0x80])), /invalid_utf8/);
 });

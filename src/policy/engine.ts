@@ -24,6 +24,7 @@ interface CompiledRule {
 	repos: string[] | null;
 	teams: string[] | null;
 	denyPaths: Matcher[];
+	denyReads: Matcher[];
 	denyPatterns: Matcher[];
 	approvalPatterns: Matcher[];
 	approvalPaths: Matcher[];
@@ -35,6 +36,7 @@ const RULE_KEYS = new Set([
 	"repos",
 	"teams",
 	"deny_paths",
+	"deny_reads",
 	"deny_patterns",
 	"require_approval",
 	"require_approval_paths",
@@ -54,9 +56,12 @@ const RULE_KEYS = new Set([
  *   base64 解码、别名、间接调用）注定了黑名单可被绕过。
  * - 真正的安全边界是另外三条：egress 默认 deny、凭据不进沙箱、每会话独占沙箱。
  *   本引擎的价值在于「拦下不可逆操作交人工确认」与「留痕」，不在于挡住有意的攻击者。
- * - deny_paths 只对**带 path 参数的工具**生效。bash 里的
+ * - deny_paths 只对**带 path 参数的非只读工具**生效。bash 里的
  *   `echo x > .github/workflows/ci.yml` 本引擎看不见路径，只能靠命令模式兜。
  *   路径规则要真正统一，得等 Phase 2 的 RemoteExecutionEnv 在 FS 层收口。
+ * - deny_reads 对**只读工具**（read_only_tools 名单）生效，补上「read 豁免一切路径规则」
+ *   留下的凭据读取缺口：凭据文件（.env/.aws/.ssh 等）默认 deny，其它普通读取仍豁免审批
+ *   （审批疲劳取舍不变）。注意：这是策略层的进程内防线，不是 OS 边界；bash 仍然看不见路径。
  * - 路径规则按仓库相对路径的形状书写；工作区之外的绝对路径要靠沙箱挂载限制，
  *   不是靠这里的规则。
  */
@@ -88,6 +93,16 @@ export class PolicyEngine {
 		return this.#rules.length;
 	}
 
+	/** 该工具是否只读（read_only_tools 名单；写性质工具不在此列） */
+	isReadOnly(tool: string): boolean {
+		return this.#readOnlyTools.has(tool);
+	}
+
+	/** 是否配置了任何 deny_reads 规则（决定 read 类工具是否需要走 canonical 守卫复判） */
+	get denyReadsEnabled(): boolean {
+		return this.#rules.some((r) => r.denyReads.length > 0);
+	}
+
 	evaluate(action: ActionDescriptor, ctx: PolicyContext): Verdict {
 		try {
 			return this.#evaluate(action, ctx);
@@ -103,17 +118,23 @@ export class PolicyEngine {
 	#evaluate(action: ActionDescriptor, ctx: PolicyContext): Verdict {
 		const applicable = this.#rules.filter((r) => matchesScope(r, action.tool, ctx));
 		const commands = action.command ? splitCommand(action.command) : [];
-		// 只读工具不受路径规则约束：否则 agent 每次读 package.json 都要人批一次，
+		const readOnly = this.#readOnlyTools.has(action.tool);
+		// 只读工具不受 deny_paths/require_approval_paths 约束：否则 agent 每次读 package.json 都要人批一次，
 		// 几轮之后操作员就会无脑点同意 —— 审批疲劳本身就是安全失效。
-		const path = action.path && !this.#readOnlyTools.has(action.tool) ? normalizePath(action.path) : null;
+		// writePath 仅对「会改文件」的非只读工具；readPath 仅对只读工具（deny_reads 专用）。
+		const writePath = action.path && !readOnly ? normalizePath(action.path) : null;
+		const readPath = readOnly && action.path ? normalizePath(action.path) : null;
 
-		// deny 优先于 require_approval：一条规则拒绝就不再问人
+		// deny 优先于 require_approval：一条规则拒绝就不再问人。
+		// deny_paths（写面）与 deny_reads（读面）同层：任一命中即 deny。
 		for (const r of applicable) {
-			const hit = firstHit(r.denyPatterns, commands) ?? (path ? firstMatch(r.denyPaths, path) : null);
+			const hit = firstHit(r.denyPatterns, commands)
+				?? (writePath ? firstMatch(r.denyPaths, writePath) : null)
+				?? (readPath ? firstMatch(r.denyReads, readPath) : null);
 			if (hit) return { decision: "deny", rule: r.name, reason: `命中拒绝规则：${hit}` };
 		}
 		for (const r of applicable) {
-			const hit = firstHit(r.approvalPatterns, commands) ?? (path ? firstMatch(r.approvalPaths, path) : null);
+			const hit = firstHit(r.approvalPatterns, commands) ?? (writePath ? firstMatch(r.approvalPaths, writePath) : null);
 			if (hit) return { decision: "require_approval", rule: r.name, reason: `不可逆或高风险操作：${hit}` };
 		}
 		return { decision: "allow" };
@@ -137,6 +158,7 @@ function compile(raw: unknown, index: number): CompiledRule {
 		denyPatterns: compileList(r.deny_patterns, `rules[${index}].deny_patterns`, commandGlobToRegex),
 		approvalPatterns: compileList(r.require_approval, `rules[${index}].require_approval`, commandGlobToRegex),
 		approvalPaths: compileList(r.require_approval_paths, `rules[${index}].require_approval_paths`, pathGlobToRegex),
+		denyReads: compileList(r.deny_reads, `rules[${index}].deny_reads`, pathGlobToRegex),
 	};
 }
 

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AuditLog } from "../audit/log.ts";
-import { scanSecrets } from "./secrets.ts";
+import { BodyScanError, decodeStrictUtf8, scanJsonDecoded, scanSecrets, validateFindings, type SecretFinding } from "./secrets.ts";
 import { GCP_TOKEN_HOST, type UpstreamAuth, authorizeUpstream } from "./upstream-auth.ts";
 
 export interface UpstreamConfig {
@@ -38,6 +38,25 @@ export interface Quota {
 	maxTotalTokens: number;
 }
 
+/**
+ * 出站 DLP（B3）模式。
+ * - **block（生产默认）**：完整 body 在任何上游副作用（认证/转发）之前扫描，
+ *   命中高置信凭据规则 → 403 + 审计固定类别，请求不达上游；
+ * - **audit**：检测+告警+放行，仅限显式获批的低敏感部署（构造期强制 auditApproved），
+ *   但扫描器自身故障仍 fail-closed（安全检测坏了不能变成盲目放行）。
+ * 边界如实：本层是内容检测，不提供 DNS/SSRF 隔离；hostname allowlist 不防重绑定/重定向
+ * （重定向由 redirect:"error" 逐跳拒绝）；零留存/DPA 是外部合同，不因 block 模式而视为已满足。
+ */
+export interface DlpConfig {
+	/** 缺省 = block（生产默认 fail-closed；demo/评估流量无凭据，行为不变） */
+	mode?: "audit" | "block";
+	/** audit 模式的显式批准标记（部署方对低敏场景的具名批准）；构造期强制 */
+	auditApproved?: boolean;
+}
+
+/** 完整 body 上限（B7 全量预算/流控后置；本上限仅为「扫描前有界、不新增无界 buffer」的安全必要最小限） */
+export const MAX_BODY_BYTES = 8 * 1024 * 1024;
+
 export interface ModelGatewayConfig {
 	port: number;
 	host: string;
@@ -50,8 +69,12 @@ export interface ModelGatewayConfig {
 	egressAllowlist: string[];
 	quotas?: Quota[];
 	audit?: AuditLog;
+	/** B3 出站 DLP 配置；缺省 = block（生产默认） */
+	dlp?: DlpConfig;
 	/** 便于测试注入；默认用全局 fetch */
 	fetchImpl?: typeof fetch;
+	/** 便于测试注入扫描器故障（fail-closed 负控）；默认 scanSecrets */
+	scanSecretsImpl?: typeof scanSecrets;
 }
 
 interface Usage {
@@ -92,12 +115,26 @@ export class ModelGateway {
 	#cfg: ModelGatewayConfig;
 	#http = createServer();
 	#fetch: typeof fetch;
+	#scan: typeof scanSecrets;
 	/** team → 已用 token */
 	#used = new Map<string, number>();
+	/** B3：生效的 DLP 模式（构造期已校验） */
+	readonly dlpMode: "audit" | "block";
 
 	constructor(cfg: ModelGatewayConfig) {
 		this.#cfg = cfg;
 		this.#fetch = cfg.fetchImpl ?? fetch;
+		this.#scan = cfg.scanSecretsImpl ?? scanSecrets;
+		// B3：模式校验 fail-fast（未知值/枚举外值启动即炸，绝不静默回退到任一模式）
+		const mode = cfg.dlp?.mode ?? "block"; // 生产默认：block（strict fail-closed）
+		if (mode !== "audit" && mode !== "block") {
+			throw new Error(`模型网关 dlp.mode 非法：${String(cfg.dlp?.mode)}（只接受 audit | block）`);
+		}
+		// audit 仅限显式获批低敏部署：没有具名批准标记就拒绝以 audit 模式启动
+		if (mode === "audit" && cfg.dlp?.auditApproved !== true) {
+			throw new Error("模型网关 dlp.mode=audit 必须显式设置 dlp.auditApproved=true（仅限已获批低敏感部署）；生产默认 block");
+		}
+		this.dlpMode = mode;
 		// 换 token 的端点是网关自身的一条硬编码出口，不像 baseUrl 那样
 		// 天然过 assertAllowed。不校验的话，「allowlist 是唯一事实来源」
 		// 这条不变量就只靠一行注释维持，锁死出口的生产环境里 Vertex 会在
@@ -159,7 +196,44 @@ export class ModelGateway {
 		const team = String(req.headers["x-perimeter-team"] ?? "default");
 		const sessionId = String(req.headers.session_id ?? req.headers["x-session-affinity"] ?? req.headers["x-perimeter-session"] ?? "unknown");
 		const actor = String(req.headers["x-perimeter-actor"] ?? "unknown");
-		const body = await readBody(req);
+		// B3/R41：完整 body 有界读取（超限 413 fail-closed）+ 严格 UTF-8 解码 + raw/语义双层扫描。
+		// 任何body形态异常（非法UTF-8/非法JSON/无界嵌套）或扫描器故障/非法返回都在任何上游副作用前 fail-closed。
+		let body: string;
+		let findings: SecretFinding[];
+		try {
+			const raw = await readBody(req, MAX_BODY_BYTES);
+			body = decodeStrictUtf8(raw);
+			const rawFindings = validateFindings(this.#scan(body));
+			const decodedFindings = scanJsonDecoded(body, this.#scan);
+			findings = [...rawFindings, ...decodedFindings];
+		} catch (err) {
+			if (err instanceof BodyTooLargeError) {
+				this.#cfg.audit?.append({
+					kind: "error",
+					sessionId,
+					actor,
+					team,
+					summary: `请求体超过上限 ${MAX_BODY_BYTES} 字节，fail-closed 拒绝（未达上游）`,
+				});
+				res.writeHead(413, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "请求体超过上限" } }));
+				return;
+			}
+			// 客户端 body 形态异常（非法 UTF-8/JSON/嵌套超限）→ 403；扫描器故障/非法返回 → 503。都未达上游。
+			const isClientShape = err instanceof BodyScanError && err.category !== "scan_invalid_return";
+			const status = isClientShape ? 403 : 503;
+			const category = err instanceof BodyScanError ? err.category : "scan_error";
+			this.#cfg.audit?.append({
+				kind: "error",
+				sessionId,
+				actor,
+				team,
+				summary: `出站扫描 fail-closed（${category}），请求未达上游`,
+			});
+			res.writeHead(status, { "content-type": "application/json" }).end(
+				JSON.stringify({ error: { message: isClientShape ? "请求体不合法，请求被拒绝" : "出站扫描失败，请求被拒绝" } }),
+			);
+			return;
+		}
 
 		const quota = this.#cfg.quotas?.find((q) => q.team === team);
 		if (quota && this.usedTokens(team) >= quota.maxTotalTokens) {
@@ -174,9 +248,10 @@ export class ModelGateway {
 			return;
 		}
 
-		// audit-only：检测并留痕，不改写请求体
-		const findings = scanSecrets(body);
+		// B3/R41：raw + 解码双层扫描已完成（上方）。命中处理不变：审计（私有面）保留 kind+脱敏 hint；
+		// 回给沙箱（公共面）只有固定类别；block 模式下认证/转发都不发生。
 		if (findings.length > 0) {
+			// 审计（私有面）保留 kind + 脱敏 hint；回给沙箱（公共面）只有固定类别，无原文/无 hint/无 token
 			this.#cfg.audit?.append({
 				kind: "error",
 				sessionId,
@@ -184,6 +259,12 @@ export class ModelGateway {
 				team,
 				summary: `出站内容命中凭据特征 ${findings.length} 处：${findings.map((f) => `${f.kind}(${f.hint})`).join(", ")}`,
 			});
+			if (this.dlpMode === "block") {
+				res.writeHead(403, { "content-type": "application/json" }).end(
+					JSON.stringify({ error: { message: "出站内容命中凭据特征（dlp_block）", categories: findings.map((f) => f.kind) } }),
+				);
+				return;
+			}
 		}
 
 		const upstream = this.#pickUpstream(req, body);
@@ -221,7 +302,9 @@ export class ModelGateway {
 			}
 		}
 
-		const upRes = await this.#fetch(target, { method: "POST", headers, body });
+		// redirect:"error"（B3）：携带凭据的上游请求逐跳拒绝重定向 —— 不跟随跨 host/同 host 多跳，
+		// 不把 hostname allowlist 当作 DNS/SSRF 隔离（那要靠网络层）。上游想重定向 = 本次请求失败。
+		const upRes = await this.#fetch(target, { method: "POST", headers, body, redirect: "error" });
 		// 上游的错误正文**有意透传**给沙箱：agent 要据此判断是 rate limit、
 		// context 超长还是参数错误，并决定重试还是改写请求。这与换 token
 		// 失败不同 —— 那种错误对 agent 毫无用处，纯粹是内部拓扑泄漏。
@@ -327,10 +410,23 @@ function safeModel(body: string): string | undefined {
 	}
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+class BodyTooLargeError extends Error {
+	constructor() {
+		super("request body too large");
+		this.name = "BodyTooLargeError";
+	}
+}
+
+/** 完整 body 有界读取（Buffer；超限立即停止读，不新增无界 buffer）。严格 UTF-8 解码在上层统一做 */
+async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
 	const chunks: Buffer[] = [];
-	for await (const c of req) chunks.push(c as Buffer);
-	return Buffer.concat(chunks).toString("utf8");
+	let total = 0;
+	for await (const c of req) {
+		total += (c as Buffer).length;
+		if (total > maxBytes) throw new BodyTooLargeError();
+		chunks.push(c as Buffer);
+	}
+	return Buffer.concat(chunks);
 }
 
 /**

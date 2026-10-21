@@ -94,7 +94,9 @@ test("路径规则覆盖所有非只读工具，而不是硬编码的 write/edit
 
 test("只读工具不触发路径审批，否则每次读 package.json 都要人批一次", () => {
 	assert.equal(std.evaluate({ tool: "read", path: "package.json" }, CTX).decision, "allow");
-	assert.equal(std.evaluate({ tool: "read", path: ".env" }, CTX).decision, "allow");
+	// B1 加固：凭据文件读取不再豁免（deny_reads）—— 原断言 read .env=allow 已随策略加固更新；
+	// 普通读取仍免审批，审批疲劳取舍不变。
+	assert.equal(std.evaluate({ tool: "read", path: ".env" }, CTX).decision, "deny");
 	assert.equal(std.evaluate({ tool: "write", path: "package.json" }, CTX).decision, "require_approval");
 });
 
@@ -244,4 +246,41 @@ test("egress allowlist 返回副本，外部改动不影响引擎", () => {
 test("空策略不崩溃", () => {
 	assert.equal(engine("").ruleCount, 0);
 	assert.equal(engine("rules: []").evaluate({ tool: "bash", command: "rm -rf /" }, CTX).decision, "allow");
+});
+
+// ── B1 deny_reads：只读工具的凭据读取拒绝 ──────────────────────
+
+test("deny_reads：默认策略拒绝 read 凭据文件，普通读取不受影响", () => {
+	// 凭据文件：deny（读进模型上下文就是外泄的前半程；无审批兜底是刻意的）
+	for (const p of [".env", ".env.local", "config/secrets/prod.key", ".aws/credentials", "deploy/.npmrc", ".ssh/id_rsa", ".git-credentials", "ops/.kube/config", ".gitconfig"]) {
+		assert.equal(std.evaluate({ tool: "read", path: p }, CTX).decision, "deny", p);
+	}
+	// 普通开发读取：仍然豁免（审批疲劳取舍不变）
+	for (const p of ["package.json", "src/auth/login.ts", "docs/api.md", "env.ts"]) {
+		assert.equal(std.evaluate({ tool: "read", path: p }, CTX).decision, "allow", p);
+	}
+});
+
+test("deny_reads：只对只读工具生效；写类工具继续由更严的 deny_paths 约束", () => {
+	const custom = engine(`
+read_only_tools: [read]
+rules:
+  - name: r
+    tool: "*"
+    deny_reads: ["**/.env"]
+`);
+	// read 命中 deny_reads；bash 不带 path 不受路径规则（既有局限如实）
+	assert.equal(custom.evaluate({ tool: "read", path: ".env" }, CTX).decision, "deny");
+	// 非只读工具不受 deny_reads（它受 deny_paths 管，本规则未配 deny_paths 故 allow）
+	assert.equal(custom.evaluate({ tool: "write", path: ".env" }, CTX).decision, "allow");
+	assert.equal(custom.denyReadsEnabled, true);
+	assert.equal(engine("rules: []").denyReadsEnabled, false);
+});
+
+test("deny_reads：未知字段仍然 fail-fast（deny_read 少个 s 启动即炸）", () => {
+	assert.throws(() => engine("rules:\n  - name: r\n    tool: \"*\"\n    deny_read: [\"**/.env\"]\n"), /未知字段/);
+});
+
+test("deny_reads：read 工具不受 require_approval_paths 影响（无审批疲劳回归）", () => {
+	assert.equal(std.evaluate({ tool: "read", path: "package.json" }, CTX).decision, "allow");
 });

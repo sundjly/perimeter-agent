@@ -48,7 +48,10 @@ test("Durable：重启保留 transcript 与 requestId 幂等，移除守卫拒�
 
 test("Durable 审批：先到先得，批准人和超时决定进入审计", async () => {
 	await fixture([], async (host, dir, _reopen, events) => {
-		const pending = host.approvals.request("call", { tool: "bash", command: "git push" }, "push", "不可逆", "alice", 1000, new AbortController().signal);
+		const pending = host.approvals.request("call", { tool: "bash", command: "git push" }, "push", "不可逆", "alice", 1000, new AbortController().signal, {
+			sessionIdentity: "test", tenantIdentity: "default", repoIdentity: "default",
+			gitRevision: "0".repeat(40), policyHash: "f".repeat(64), aclVersion: 1, reliable: false, isProduction: false,
+		});
 		while (!events.some((event) => event.type === "approval.request")) await new Promise((resolve) => setTimeout(resolve, 5));
 		const request = events.find((event) => event.type === "approval.request")!;
 		assert.equal(request.type, "approval.request");

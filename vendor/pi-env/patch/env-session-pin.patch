@@ -1,0 +1,118 @@
+diff --git a/packages/env/src/connection.ts b/packages/env/src/connection.ts
+index 9bfe18df4..ab0c9a0c0 100644
+--- a/packages/env/src/connection.ts
++++ b/packages/env/src/connection.ts
+@@ -187,6 +187,13 @@ export class Connection {
+ 		return (await this.#connect()).session.id;
+ 	}
+ 
++	/** Connect if needed and return the daemon's report and the live session's id from one connect, so callers that
++	 *  need both (metadata plus a session pin) never mix two sessions. */
++	async snapshot(): Promise<{ info: RemoteInfo; sessionId: number }> {
++		const { info, session } = await this.#connect();
++		return { info, sessionId: session.id };
++	}
++
+ 	async request(op: string, json: Json, options: RequestOptions = {}): Promise<Reply> {
+ 		if (options.session !== undefined) {
+ 			const current = this.#session;
+@@ -307,16 +314,32 @@ export class Connection {
+ 	#teardown(session: Session, error: Error): void {
+ 		if (!session.live) return;
+ 		session.live = false;
+-		clearInterval(session.timer);
+-		if (this.#session === session) {
+-			this.#session = undefined;
+-			this.#ready = undefined;
++		try {
++			clearInterval(session.timer);
++			if (this.#session === session) {
++				this.#session = undefined;
++				this.#ready = undefined;
++			}
++			// A half-dead transport may reject these calls, but cleanup failures must not interrupt the
++			// remaining cleanup steps, and this is the last chance for in-flight requests to learn that
++			// the connection is gone.
++			try {
++				session.child.stdin.end();
++			} catch {
++				// Ignore; the daemon side is torn down by the daemon's own exit handling.
++			}
++			try {
++				session.child.kill();
++			} catch {
++				// Ignore; settlement below must still run.
++			}
++		} finally {
++			// Independent finalizer: even if the teardown steps above throw, every pending request is
++			// settled here exactly once, and `close()` stays idempotent without skipping settlement.
++			const pending = [...session.pending.values()];
++			session.pending.clear();
++			for (const request of pending) request.reject(error);
+ 		}
+-		session.child.stdin.end();
+-		session.child.kill();
+-		const pending = [...session.pending.values()];
+-		session.pending.clear();
+-		for (const request of pending) request.reject(error);
+ 	}
+ 
+ 	#onData(session: Session, chunk: Buffer): void {
+diff --git a/packages/env/src/remote-env.ts b/packages/env/src/remote-env.ts
+index 52092c1d5..776928625 100644
+--- a/packages/env/src/remote-env.ts
++++ b/packages/env/src/remote-env.ts
+@@ -55,6 +55,10 @@ export interface RemoteExecutionEnvOptions {
+ 	shellEnv?: Record<string, string>;
+ 	/** How the daemon watches, like `NodeExecutionEnv`'s `watch` option. */
+ 	watch?: RemoteWatchOptions;
++	/** Pin every `exec` of this environment to one daemon session: after that session is lost, `exec` fails
++	 *  immediately instead of starting a new daemon. Callers capture the id with `connection.snapshot()`; once the
++	 *  session is gone, a pinned environment stays failed until it is recreated — it never follows a new session. */
++	sessionPin?: number;
+ }
+ 
+ /** An info record from the daemon. */
+@@ -355,6 +359,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
+ 	readonly #shellPath: string | undefined;
+ 	readonly #shellEnv: Record<string, string> | undefined;
+ 	readonly #watchOptions: RemoteWatchOptions;
++	readonly #sessionPin: number | undefined;
+ 	/** Running commands this environment started, for `cleanup()`. */
+ 	readonly #running = new Map<number, number>();
+ 
+@@ -365,6 +370,14 @@ export class RemoteExecutionEnv implements ExecutionEnv {
+ 		this.#shellPath = options.shellPath;
+ 		this.#shellEnv = options.shellEnv;
+ 		this.#watchOptions = options.watch ?? {};
++		this.#sessionPin = options.sessionPin;
++	}
++
++	/** The session every `exec` is pinned to, or `undefined` when `exec` may reconnect after a lost connection.
++	 *  Read-only and settable only through the constructor, so callers can verify a pin actually took effect
++	 *  (an SDK that silently ignores unknown option fields fails this check instead of pretending). */
++	get pinnedSession(): number | undefined {
++		return this.#sessionPin;
+ 	}
+ 
+ 	/** Node's `resolvePath` on the remote system, with its home directory and working directories. */
+@@ -848,6 +861,11 @@ export class RemoteExecutionEnv implements ExecutionEnv {
+ 			}
+ 		}
+ 		const inheritEnv = options?.inheritEnv ?? true;
++		// A pinned environment must never lazily reconnect through a prep path: `#resolve` calls `connection.info()`,
++		// which would start a new daemon behind the caller's back. The pinned exec takes no cwd override.
++		if (this.#sessionPin !== undefined && options?.cwd !== undefined) {
++			return err(new ExecutionError("spawn_error", "pinned exec does not support a cwd override"));
++		}
+ 		let cwd: string;
+ 		try {
+ 			cwd = options?.cwd ? await this.#resolve(options.cwd) : this.cwd;
+@@ -882,6 +900,7 @@ export class RemoteExecutionEnv implements ExecutionEnv {
+ 				},
+ 				{
+ 					signal: controller.signal,
++					...(this.#sessionPin === undefined ? {} : { session: this.#sessionPin }),
+ 					onStart: (requestId, session) => {
+ 						running = requestId;
+ 						this.#running.set(requestId, session);

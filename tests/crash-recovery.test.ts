@@ -44,6 +44,8 @@ test("kill -9 恢复 transcript、owner 与待审批；旧审批不重用", asyn
 		await wait(() => first.events.some((event) => event.type === "session.ready"));
 		first.ws.send(JSON.stringify({ type: "prompt", text: "第一轮", requestId: "one" }));
 		await wait(() => first.events.some((event) => event.type === "agent.end"));
+		first.ws.send(JSON.stringify({ type: "share", actor: "approver", role: "approver" }));
+		await new Promise((r) => setTimeout(r, 50));
 		first.ws.send(JSON.stringify({ type: "prompt", text: "推送", requestId: "two" }));
 		await wait(() => first.events.some((event) => event.type === "approval.request"));
 		const old = first.events.find((event) => event.type === "approval.request")!;
@@ -57,8 +59,10 @@ test("kill -9 恢复 transcript、owner 与待审批；旧审批不重用", asyn
 		const state = next.events.reduce(reduce, initialState());
 		assert.ok(state.messages.some((message) => message.text === "第一轮" && message.role === "assistant"));
 		const approval = state.approvals[0]!;
-		next.ws.send(JSON.stringify({ type: "approve", approvalId: old.approvalId, decision: "allow" }));
-		next.ws.send(JSON.stringify({ type: "approve", approvalId: approval.approvalId, decision: "deny" }));
+		const approverConn = await connect(port, "approver");
+		await wait(() => approverConn.events.some((e) => e.type === "session.snapshot"));
+		approverConn.ws.send(JSON.stringify({ type: "approve", approvalId: old.approvalId, decision: "allow" }));
+		approverConn.ws.send(JSON.stringify({ type: "approve", approvalId: approval.approvalId, decision: "deny" }));
 		await wait(() => next.events.some((event) => event.type === "agent.end"));
 		assert.equal(existsSync(join(dir, "workspaces/crash/bypass")), false);
 	} finally {

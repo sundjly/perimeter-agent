@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, normalize } from "node:path";
 import { k8sNameFragment, renderPodManifest } from "../deploy/pod-template.ts";
 import { promisify } from "node:util";
 
@@ -132,6 +132,60 @@ export const TIMEOUT_EXIT = 124;
  */
 const OUTPUT_CAP = 8 * 1024 * 1024;
 
+export function safeDockerCmd(args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn("docker", args, {
+			detached: true,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { PATH: process.env.PATH, ...dockerClientEnv() },
+		});
+		let stdout = "";
+		let stderr = "";
+		let exited = false;
+		let timedOut = false;
+
+		child.stdout?.on("data", (d) => { if (stdout.length < OUTPUT_CAP) stdout += d; });
+		child.stderr?.on("data", (d) => { if (stderr.length < OUTPUT_CAP) stderr += d; });
+
+		const timer = setTimeout(() => {
+			timedOut = true;
+			try { if (child.pid) process.kill(-child.pid, "SIGTERM"); } catch {}
+			const killTimer = setTimeout(() => {
+				if (!exited) {
+					try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch {}
+				}
+			}, 1000);
+			killTimer.unref();
+		}, timeoutMs);
+
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			if (!exited) {
+				exited = true;
+				reject(err);
+			}
+		});
+
+		child.on("exit", (code, signal) => {
+			clearTimeout(timer);
+			if (!exited) {
+				exited = true;
+				if (timedOut) {
+					reject(new Error(`docker 调用超时 (${timeoutMs}ms) 强制终结: docker ${args.join(" ")} (signal: ${signal})`));
+				} else if (code !== 0) {
+					const err = new Error(`docker 调用非零退出 (${code}): ${stderr.trim() || stdout.trim()}`);
+					(err as any).code = code;
+					(err as any).stdout = stdout;
+					(err as any).stderr = stderr;
+					reject(err);
+				} else {
+					resolve({ stdout, stderr });
+				}
+			}
+		});
+	});
+}
+
 function runCapturing(
 	bin: string,
 	args: string[],
@@ -234,7 +288,7 @@ export interface DockerBackendOptions {
 	/** 容器内的工作区挂载点 */
 	workdir?: string;
 	/** 额外的 docker run 参数 */
-	extraArgs?: string[];
+	extraArgs?: readonly string[] | string[];
 	/** 默认 4g。不设上限等于把宿主机内存交给 agent */
 	memory?: string;
 	/** 默认 2 */
@@ -298,17 +352,138 @@ export interface DockerBackendOptions {
  * macOS 的 Docker Desktop / OrbStack 做属主重映射所以本机看不出来。
  * 因此容器身份默认取网关自己的 uid/gid，见 DockerBackendOptions.user。
  */
+function isRootUser(u: string): boolean {
+	const trimmed = u.trim().toLowerCase();
+	if (trimmed === "0" || trimmed === "root") return true;
+	const parts = trimmed.split(":");
+	return parts.some((p) => p === "0" || p === "root");
+}
+
+function validateDockerSecurity(opts: DockerBackendOptions): void {
+	if (opts.user && isRootUser(opts.user)) {
+		throw new Error("docker 隔离后端绝不能以 root 用户运行");
+	}
+	if (opts.network === "host") {
+		throw new Error("docker 隔离后端禁止使用 host 网络");
+	}
+	if (opts.extraArgs && opts.extraArgs.length > 0) {
+		for (let i = 0; i < opts.extraArgs.length; i++) {
+			const arg = opts.extraArgs[i]!;
+			const next = opts.extraArgs[i + 1];
+
+			// 1. 特权
+			if (arg === "--privileged" || arg.startsWith("--privileged=")) {
+				throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止 --privileged 特权模式");
+			}
+
+			// 2. cap-add
+			if (arg === "--cap-add" || arg.startsWith("--cap-add=")) {
+				throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止 --cap-add 增加 Linux capabilities");
+			}
+
+			// 3. 用户身份 (-u, --user)
+			let userVal: string | undefined;
+			if (arg === "-u" || arg === "--user") {
+				userVal = next;
+			} else if (arg.startsWith("-u=")) {
+				userVal = arg.slice(3);
+			} else if (arg.startsWith("--user=")) {
+				userVal = arg.slice(7);
+			} else if (arg.startsWith("-u") && arg.length > 2 && !arg.includes("=")) {
+				userVal = arg.slice(2);
+			}
+			if (userVal !== undefined && isRootUser(userVal)) {
+				throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止通过 extraArgs 指定 root 身份");
+			}
+
+			// 4. 网络覆盖 (--net, --network)
+			if (arg === "--net" || arg === "--network" || arg.startsWith("--net=") || arg.startsWith("--network=")) {
+				throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止通过 extraArgs 覆盖网络配置");
+			}
+
+			// 5. 命名空间 (--pid, --ipc, --uts, --userns)
+			for (const ns of ["--pid", "--ipc", "--uts", "--userns"]) {
+				let val: string | undefined;
+				if (arg === ns) val = next;
+				else if (arg.startsWith(`${ns}=`)) val = arg.slice(ns.length + 1);
+				if (val && val.toLowerCase() === "host") {
+					throw new Error(`docker extraArgs 包含破坏隔离的安全敏感参数: 禁止使用 host ${ns.slice(2).toUpperCase()} 命名空间`);
+				}
+			}
+
+			// 6. 只读根覆盖 (--read-only=false)
+			if (arg === "--read-only=false" || (arg === "--read-only" && next === "false")) {
+				throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止通过 extraArgs 禁用只读根文件系统");
+			}
+
+			// 7. security-opt 削弱
+			let secVal: string | undefined;
+			if (arg === "--security-opt") secVal = next;
+			else if (arg.startsWith("--security-opt=")) secVal = arg.slice(15);
+			if (secVal) {
+				const lower = secVal.toLowerCase();
+				if (lower.includes("no-new-privileges=false") || lower.includes("label=disable") || lower.includes("seccomp=unconfined") || lower.includes("apparmor=unconfined")) {
+					throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止禁用安全策略或 seccomp/apparmor");
+				}
+			}
+
+			// 8. 挂载禁用 (-v, --volume, --mount)：挂载面只能由 backend 内部从受信任的 LaunchContext 构造
+			if (
+				arg === "-v" ||
+				arg.startsWith("-v=") ||
+				(arg.startsWith("-v") && arg.length > 2 && !arg.startsWith("--")) ||
+				arg === "--volume" ||
+				arg.startsWith("--volume=") ||
+				arg === "--mount" ||
+				arg.startsWith("--mount=")
+			) {
+				throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止通过 extraArgs 指定任何自定义挂载 (-v, --volume, --mount)");
+			}
+
+			// 9. 容器名覆盖 (--name)
+			if (arg === "--name" || arg.startsWith("--name=")) {
+				throw new Error("docker extraArgs 包含破坏隔离的安全敏感参数: 禁止通过 extraArgs 覆盖容器名称");
+			}
+		}
+	}
+}
+
 export class DockerBackend implements ExecutionBackend {
 	readonly kind = "docker" as const;
-	#opts: DockerBackendOptions;
+	readonly #opts: Readonly<DockerBackendOptions>;
 
 	#gatewayId: string;
+	#verifiedNetworkId?: string;
 
 	constructor(opts: DockerBackendOptions) {
-		this.#opts = opts;
+		validateDockerSecurity(opts);
+		this.#opts = Object.freeze({
+			...opts,
+			extraArgs: Object.freeze([...(opts.extraArgs ?? [])]),
+			env: Object.freeze({ ...(opts.env ?? {}) }),
+		});
 		// 必须可区分到实例。恒为 "default" 的话，reapOrphans 会按 label
 		// 扫掉另一个网关**正在跑**的容器 —— 正是 gatewayId 要防的那件事。
-		this.#gatewayId = opts.gatewayId ?? `${hostname()}-${process.pid}`;
+		this.#gatewayId = this.#opts.gatewayId ?? `${hostname()}-${process.pid}`;
+	}
+
+	bindVerifiedNetwork(id: string): void {
+		if (!id || typeof id !== "string" || !id.trim()) {
+			throw new Error("绑定网络失败: networkId 必须为有效非空字符串");
+		}
+		this.#verifiedNetworkId = id.trim();
+	}
+
+	get verifiedNetworkId(): string | undefined {
+		return this.#verifiedNetworkId;
+	}
+
+	get network(): string {
+		return this.#opts.network ?? "bridge";
+	}
+
+	get options(): DockerBackendOptions {
+		return this.#opts;
 	}
 
 	environmentPlan(ctx: LaunchContext): EnvironmentPlan {
@@ -321,7 +496,9 @@ export class DockerBackend implements ExecutionBackend {
 		}
 		args.splice(-1, 1, "/bin/sh", "-c", "while :; do sleep 3600; done");
 		return { cwd: this.#opts.workdir ?? "/workspace", command: ["docker", "exec", "-i", containerName(ctx.sessionId, this.#gatewayId), "pi-env"],
-			start: { bin: "docker", args, env: dockerClientEnv() } };
+			// 与 safeDockerCmd 同口径：client 需 PATH 才能解析 docker 可执行文件（仅限 host 侧 client 环境；
+			// 容器内环境仍由 args 严格构造，不继承网关进程环境）。
+			start: { bin: "docker", args, env: { PATH: process.env.PATH, ...dockerClientEnv() } } };
 	}
 
 	environment(ctx: LaunchContext): Promise<EnvironmentHandle> {
@@ -332,6 +509,7 @@ export class DockerBackend implements ExecutionBackend {
 		const workdir = this.#opts.workdir ?? "/workspace";
 		const home = CONTAINER_HOME;
 		const name = containerName(ctx.sessionId, this.#gatewayId);
+		const targetNetwork = this.#verifiedNetworkId ?? (this.#opts.network === "none" ? "none" : (this.#opts.network ?? "bridge"));
 
 		const mountRoot = "/opt/perimeter";
 		const args = [
@@ -342,7 +520,7 @@ export class DockerBackend implements ExecutionBackend {
 			"--name",
 			name,
 			"--network",
-			this.#opts.network ?? "bridge",
+			targetNetwork,
 			// 与 deploy/sandbox.yaml 对齐的收紧项
 			"--read-only",
 			"--user",
@@ -358,6 +536,12 @@ export class DockerBackend implements ExecutionBackend {
 			"-v",
 			`${ctx.workspace}:${workdir}`,
 			...(ctx.home ? ["-v", `${ctx.home}:${home}`] : []),
+			"-v",
+			`${join(this.#opts.repoRoot, "src")}:${mountRoot}/src:ro`,
+			"-v",
+			`${join(this.#opts.repoRoot, "config")}:${mountRoot}/config:ro`,
+			"-v",
+			`${join(this.#opts.repoRoot, "node_modules")}:${mountRoot}/node_modules:ro`,
 			// 只读根意味着这些可写目录要显式给。
 			// noexec/nosuid/nodev 与 no-new-privileges 配套；size 不能太大 ——
 			// tmpfs 写入直接算宿主机内存，没有 memory 上限时是一条 DoS 路径。
@@ -438,20 +622,28 @@ export class DockerBackend implements ExecutionBackend {
 	async exec(sessionId: string, _workspace: string, command: string, timeoutMs = 120_000): Promise<ExecResult> {
 		// docker 客户端自身的环境也要收窄：不传的话 DOCKER_* 之外的一切
 		// 都跟着进来，`launch` 路径上那套客户端变量消毒在这条路上就不成立了
-		return runCapturing("docker", this.execArgs(sessionId, command), timeoutMs, undefined, minimalEnv(this.#opts.env ?? {}));
+		return runCapturing("docker", this.execArgs(sessionId, command), timeoutMs, undefined, { PATH: process.env.PATH, ...dockerClientEnv(), ...minimalEnv(this.#opts.env ?? {}) });
+	}
+
+	#unconfirmedResources = new Set<string>();
+
+	get unconfirmedResources(): readonly string[] {
+		return Array.from(this.#unconfirmedResources);
 	}
 
 	async cleanup(sessionId: string): Promise<void> {
+		const name = containerName(sessionId, this.#gatewayId);
 		try {
-			// 必须带超时：daemon 卡住时没有超时会让 Gateway.close() 永久挂起
-			await exec("docker", ["rm", "-f", containerName(sessionId, this.#gatewayId)], { timeout: 10_000 });
+			// 必须带超时与精确退出：daemon 卡住时超时强杀子进程，防 live work 悬挂
+			await safeDockerCmd(["rm", "-f", name], 5_000);
+			this.#unconfirmedResources.delete(name);
 		} catch (err) {
 			// 「容器已不存在」是正常路径（正常退出时 --rm 已经收掉了）；
-			// 其余情况意味着容器可能泄漏了，不能和前者一样静默吞掉
+			// 其余情况意味着容器可能泄漏或清理未能完成，标记为 unknown 待 reconcile，绝不虚称 0
 			const msg = err instanceof Error ? err.message : String(err);
 			if (!/No such container/i.test(msg)) {
-				// 没有回调时也要出声：静默等于容器泄漏没人知道
-				const report = this.#opts.onCleanupError ?? ((id, e) => console.error(`容器清理失败 ${id}:`, e));
+				this.#unconfirmedResources.add(name);
+				const report = this.#opts.onCleanupError ?? ((id, e) => console.error(`容器清理失败 (待reconcile) ${id}:`, e));
 				report(sessionId, err);
 			}
 		}
@@ -464,12 +656,16 @@ export class DockerBackend implements ExecutionBackend {
 	async reapOrphans(): Promise<string[]> {
 		const label = `perimeter.gateway=${this.#gatewayId}`;
 		try {
-			const { stdout } = await exec("docker", ["ps", "-aq", "--filter", `label=${label}`], { timeout: 10_000 });
+			// 快速探测超时 (2500ms)：若 daemon 挂死或不可用，快速失败不阻塞网关启动
+			const { stdout } = await safeDockerCmd(["ps", "-aq", "--filter", `label=${label}`], 2_500);
 			const ids = stdout.split("\n").map((x) => x.trim()).filter(Boolean);
-			if (ids.length > 0) await exec("docker", ["rm", "-f", ...ids], { timeout: 30_000 });
+			if (ids.length > 0) {
+				await safeDockerCmd(["rm", "-f", ...ids], 5_000);
+				for (const id of ids) this.#unconfirmedResources.delete(id);
+			}
 			return ids;
 		} catch (err) {
-			const report = this.#opts.onCleanupError ?? ((id, e) => console.error(`孤儿容器扫描失败 ${id}:`, e));
+			const report = this.#opts.onCleanupError ?? ((id, e) => console.error(`孤儿容器扫描快速失败 (待reconcile) ${id}:`, e));
 			report("<orphan-scan>", err);
 			return [];
 		}
@@ -736,7 +932,7 @@ function kubectlClientEnv(): NodeJS.ProcessEnv {
 	return out;
 }
 
-function dockerClientEnv(): NodeJS.ProcessEnv {
+export function dockerClientEnv(): NodeJS.ProcessEnv {
 	const out: NodeJS.ProcessEnv = {};
 	for (const k of DOCKER_CLIENT_KEYS) {
 		if (process.env[k] !== undefined) out[k] = process.env[k];

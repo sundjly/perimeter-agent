@@ -5,6 +5,7 @@ import { Harness, LiveDoc, createRegistry, type Conversation, type HarnessSettin
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { localEnvironment } from "./execution-env.ts";
+import { createPathGuardResolver } from "./path-guard.ts";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import type { AuditLog } from "../audit/log.ts";
 import { contentHash } from "../audit/log.ts";
@@ -12,7 +13,7 @@ import type { ClientEvent } from "../protocol/types.ts";
 import { PolicyEngine } from "../policy/engine.ts";
 import { snapshotView, newTranslateState, toClientEvent } from "../protocol/translate.ts";
 import { AuthorsDoc } from "./authors.ts";
-import { Approvals, ApprovalsDoc } from "./approvals.ts";
+import { Approvals, ApprovalsDoc, type ApprovalContext } from "./approvals.ts";
 import { gatewayModels, type ModelGateway } from "./models.ts";
 import { perimeterExtension } from "./perimeter-extension.ts";
 
@@ -29,9 +30,25 @@ export interface HostOptions {
 	env?: ExecutionEnv;
 	approvalTimeoutMs?: number;
 	emit: (event: ClientEvent) => void;
+	getContext?: () => Promise<ApprovalContext> | ApprovalContext;
+	getPrincipal?: (actor: string) => string | undefined;
+	isProduction?: boolean;
+	/** 路径守卫单阶段（一次受控 exec helper）的总预算；审批人工等待不计入，获批后复检是新一次阶段 */
+	guardTimeoutMs?: number;
+	/** 远端会话的守卫专用 pinned env（同一 Connection/sessionPin；openEnvironment 提供，缺省=本地走 localEnvironment） */
+	guardEnv?: ExecutionEnv;
 }
 
 export const RUNTIME_SETTINGS: HarnessSettings = { toolExecution: "sequential", compaction: { backgroundTokens: 32768 } };
+
+/**
+ * 路径守卫的单阶段总预算（一次受控 exec helper，覆盖 helper 启动与全部解析，不按层拆分）。
+ * 方案B：Slice A 的不可取消 canonicalPath RPC + awaitWithContext 早返回包装已整体移除——
+ * 守卫改走同一 ExecutionEnv.exec 的受控 helper，deadline/abort 真实杀 helper 进程组并 await 真实收尾。
+ * 边界（如实）：远端 exec 取消=daemon 内杀进程组（协议保证，本地容器已验证）；
+ * Pod 场景真实集群 kill/close 未验证，保持 unknown；主动 setsid 逃逸出组的后代不在覆盖范围。
+ */
+const DEFAULT_GUARD_TIMEOUT_MS = 3_000;
 
 export interface RuntimeStream {
 	snapshot: Awaited<ReturnType<HarnessHost["view"]>>;
@@ -63,6 +80,10 @@ export class HarnessHost {
 		let approvals: Approvals;
 		let harness: Harness | undefined;
 		const actor = { value: opts.actor };
+		const envFactory = () => opts.env ?? localEnvironment(opts.workspace);
+		// 守卫专用 pinned env（远端）；捕获为局部常量以便类型收窄。绝不回退到 unpinned 远端 env。
+		const guardEnv = opts.guardEnv;
+		const guardEnvFactory = guardEnv ? () => guardEnv : envFactory;
 		registry.install(perimeterExtension({
 			repo: opts.repo, team: opts.team, actor: async (api) => {
 				const live = await api.snapshot(LiveDoc, api.conversationId, BACKGROUND_CONTEXT);
@@ -71,6 +92,21 @@ export class HarnessHost {
 				const authors = await api.snapshot(AuthorsDoc, api.conversationId, BACKGROUND_CONTEXT);
 				return record?.requestId ? authors?.requests[record.requestId] ?? opts.actor : opts.actor;
 			},
+			actorPrincipal: async (api) => {
+				const live = await api.snapshot(LiveDoc, api.conversationId, BACKGROUND_CONTEXT);
+				const input = live?.run?.inputs.at(-1);
+				const record = input ? await (await harness?.submission(input, BACKGROUND_CONTEXT))?.status(BACKGROUND_CONTEXT) : undefined;
+				const authors = await api.snapshot(AuthorsDoc, api.conversationId, BACKGROUND_CONTEXT);
+				const act = record?.requestId ? authors?.requests[record.requestId] ?? opts.actor : opts.actor;
+				return opts.getPrincipal?.(act) ?? act;
+			},
+			getContext: opts.getContext,
+			isProduction: opts.isProduction,
+			// S3c：审计健康探针 → 执行面 fail-closed（含重启恢复后的续跑与审批后执行）
+			auditHealthy: () => opts.audit.healthy,
+			// 守卫解析器绑定 pinned guardEnv（远端）；本地沿用 envFactory。绝不回退到 unpinned 远端 env。
+			resolveGuardPath: createPathGuardResolver(guardEnvFactory, opts.guardTimeoutMs ?? DEFAULT_GUARD_TIMEOUT_MS),
+			guardTimeoutMs: opts.guardTimeoutMs,
 			policy: PolicyEngine.fromYaml(readFileSync(opts.policyFile, "utf8")),
 			approvals: () => approvals, approvalTimeoutMs: opts.approvalTimeoutMs ?? 120_000, emit: opts.emit,
 			audit: (input) => {
@@ -85,7 +121,7 @@ export class HarnessHost {
 		try {
 			harness = await Harness.open(storage, {
 				models: gatewayModels(opts.model), registry,
-				env: () => opts.env ?? localEnvironment(opts.workspace),
+				env: envFactory,
 				settings: { ...RUNTIME_SETTINGS, stream: { headers: { "x-perimeter-team": opts.team, "x-perimeter-session": opts.sessionId } } },
 			}, BACKGROUND_CONTEXT);
 			const root = await harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider: "perimeter", modelId: opts.model.model }, cwd: opts.workspace } });
@@ -139,7 +175,7 @@ export class HarnessHost {
 		const view = snapshotView(snapshot, this.#opts.sessionId);
 		const approvals = await this.harness.snapshot(ApprovalsDoc, this.root.id, BACKGROUND_CONTEXT);
 		view.approvals = (approvals?.items ?? []).filter((item) => item.status === "pending").map((item) => ({
-			approvalId: item.id, action: item.action, reason: item.reason, actor: item.actor, expiresAt: item.expiresAt,
+			approvalId: item.id, action: item.action, reason: item.reason, actor: item.requester ?? item.actor, expiresAt: item.expiresAt, argsHash: item.argsHash,
 		}));
 		const authors = await this.harness.snapshot(AuthorsDoc, this.root.id, BACKGROUND_CONTEXT);
 		const messages = new Map(view.messages.map((message) => [message.id, message]));

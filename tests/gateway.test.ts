@@ -61,6 +61,7 @@ async function startGateway(script: unknown[], extra: Partial<ConstructorParamet
 	const auditFile = join(dir, "audit.jsonl");
 	const workspaceRoot = join(dir, "workspaces");
 	const gateway = new Gateway({
+		mode: "demo",
 		port: 0,
 		host: "127.0.0.1",
 		token: TOKEN,
@@ -172,16 +173,21 @@ test("审批门：拦下不可逆操作，前端批准后才执行", async () =>
 	const env = await startGateway([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
 	const c = await connect(env);
 	await c.waitFor(() => c.find("session.ready") !== undefined);
+	const sessionId = c.find("session.ready")!.sessionId;
+
+	c.send({ type: "share", actor: "approver@corp", role: "approver" });
+	const cApprover = await connect(env, `&actor=approver@corp&session=${sessionId}`);
+	await cApprover.waitFor(() => cApprover.find("session.snapshot") !== undefined);
 
 	c.send({ type: "prompt", text: "升级依赖" });
-	await c.waitFor(() => c.find("approval.request") !== undefined);
+	await cApprover.waitFor(() => cApprover.find("approval.request") !== undefined);
 
-	const req = c.find("approval.request")!;
+	const req = cApprover.find("approval.request")!;
 	assert.match(req.reason, /git push|package.json|不可逆|高风险/);
 	assert.ok(req.expiresAt > Date.now());
 
-	c.send({ type: "approve", approvalId: req.approvalId, decision: "allow" });
-	await c.waitFor(() => c.find("approval.resolved") !== undefined);
+	cApprover.send({ type: "approve", approvalId: req.approvalId, decision: "allow" });
+	await cApprover.waitFor(() => cApprover.find("approval.resolved") !== undefined);
 	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
 
 	const ws = c.find("session.ready")!.workspace;
@@ -190,12 +196,17 @@ test("审批门：拦下不可逆操作，前端批准后才执行", async () =>
 
 test("审批门：拒绝后工具不执行，审计里留下审批人", async () => {
 	const env = await startGateway([{ tool: "write", args: { path: "package.json", content: "{}" } }, { text: "完成" }]);
-	const c = await connect(env, "&actor=bob@corp");
+	const c = await connect(env, "&actor=alice@corp");
 	await c.waitFor(() => c.find("session.ready") !== undefined);
+	const sessionId = c.find("session.ready")!.sessionId;
+
+	c.send({ type: "share", actor: "bob@corp", role: "approver" });
+	const cApprover = await connect(env, `&actor=bob@corp&session=${sessionId}`);
+	await cApprover.waitFor(() => cApprover.find("session.snapshot") !== undefined);
 
 	c.send({ type: "prompt", text: "升级依赖" });
-	await c.waitFor(() => c.find("approval.request") !== undefined);
-	c.send({ type: "approve", approvalId: c.find("approval.request")!.approvalId, decision: "deny" });
+	await cApprover.waitFor(() => cApprover.find("approval.request") !== undefined);
+	cApprover.send({ type: "approve", approvalId: cApprover.find("approval.request")!.approvalId, decision: "deny" });
 	await c.waitFor(() => c.events.some((e) => e.type === "agent.end" && !e.willRetry));
 
 	assert.equal(existsSync(join(c.find("session.ready")!.workspace, "package.json")), false);
@@ -457,20 +468,23 @@ test("快照包含挂起审批，同一审批可从重连端决定", async () =>
 	const env = await startGateway([{ tool: "bash", args: { command: "git push" } }, { text: "完成" }]);
 	const c = await connect(env);
 	await c.waitFor(() => !!c.find("session.ready"));
+	const sessionId = c.find("session.ready")!.sessionId;
+	c.send({ type: "share", actor: "approver@corp", role: "approver" });
+	const approverConn = await connect(env, `&actor=approver@corp&session=${sessionId}`);
+	await approverConn.waitFor(() => !!approverConn.find("session.snapshot"));
+
 	c.send({ type: "prompt", text: "推送", requestId: "r" });
-	await c.waitFor(() => !!c.find("approval.request"));
-	const next = await connect(env, "&session=" + c.find("session.ready")!.sessionId);
+	await approverConn.waitFor(() => !!approverConn.find("approval.request"));
+	const next = await connect(env, `&actor=approver@corp&session=${sessionId}`);
 	await next.waitFor(() => next.events.some((event) => event.type === "session.snapshot" && event.view.approvals.length === 1));
-	assert.deepEqual(c.events.reduce(reduce, initialState()).approvals, next.find("session.snapshot")!.view.approvals);
-	const approvalId = c.find("approval.request")!.approvalId;
+	assert.deepEqual(approverConn.events.reduce(reduce, initialState()).approvals, next.find("session.snapshot")!.view.approvals);
+	const approvalId = approverConn.find("approval.request")!.approvalId;
 	next.send({ type: "approve", approvalId, decision: "deny" });
 	await c.waitFor(() => !!c.find("approval.resolved"));
 	await c.waitFor(() => !!c.find("agent.end"));
-	const fresh = await connect(env, "&session=" + c.find("session.ready")!.sessionId);
-	await fresh.waitFor(() => !!fresh.find("session.snapshot"));
-	await c.waitFor(() => c.events.some((event) => event.type === "session.presence" && event.participants[0]?.clients === 3));
-	assert.deepEqual(c.events.reduce(reduce, initialState()), fresh.events.reduce(reduce, initialState()));
-	assert.equal(c.events.filter((event) => event.type === "session.snapshot").length, 1);
+	const fresh = await connect(env, `&actor=approver@corp&session=${sessionId}`);
+	await approverConn.waitFor(() => approverConn.events.some((event) => event.type === "session.presence" && event.participants.some((p) => p.actor === "approver@corp" && p.clients === 3)));
+	assert.deepEqual(approverConn.events.reduce(reduce, initialState()), fresh.events.reduce(reduce, initialState()));
 });
 
 test("多人：viewer 只读、editor 可操作、非成员拒绝，作者留在快照", async () => {
@@ -492,6 +506,15 @@ test("多人：viewer 只读、editor 可操作、非成员拒绝，作者留在
 	await new Promise((resolve) => setTimeout(resolve, 30));
 	viewer.send({ type: "prompt", text: "正常", requestId: "e" });
 	await viewer.waitFor(() => viewer.events.some((event) => event.type === "message.start" && event.actor === "bob"));
+
+	owner.send({ type: "share", actor: "charlie", role: "approver" });
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	const approver = await connect(env, `&actor=charlie&session=${id}`);
+	await approver.waitFor(() => !!approver.find("session.snapshot"));
+	assert.equal(approver.find("session.snapshot")!.view.role, "approver");
+	approver.send({ type: "prompt", text: "approver禁止执行", requestId: "ap" });
+	await approver.waitFor(() => !!approver.find("error"));
+
 	const intruder = await connect(env, `&actor=constructor&session=${id}`);
 	await intruder.waitFor(() => intruder.controls.some((control) => control.control === "error"));
 });
@@ -500,7 +523,10 @@ test("CLI 已接入时实时审批 ID 可见，可通过行命令决定", async 
 	const env = await startGateway([{ tool: "bash", args: { command: "git push; touch bypass" } }, { text: "完成" }]);
 	const owner = await connect(env);
 	await owner.waitFor(() => !!owner.find("session.ready"));
-	const cli = spawn(process.execPath, ["scripts/attach.ts", "--session", owner.find("session.ready")!.sessionId, "--url", env.url, "--token", TOKEN]);
+	const sessionId = owner.find("session.ready")!.sessionId;
+	owner.send({ type: "share", actor: "approver@local", role: "approver" });
+	await new Promise((r) => setTimeout(r, 50));
+	const cli = spawn(process.execPath, ["scripts/attach.ts", "--session", sessionId, "--url", env.url, "--token", TOKEN, "--actor", "approver@local"]);
 	let output = "";
 	cli.stdout.on("data", (chunk) => { output += String(chunk); });
 	try {

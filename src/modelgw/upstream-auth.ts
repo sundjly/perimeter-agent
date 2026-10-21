@@ -124,6 +124,9 @@ async function refresh(
 			body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: jwt }).toString(),
 			// 没有超时的话 Google 挂起会让这条请求永远挂着
 			signal: AbortSignal.timeout(10_000),
+			// B3：token 端点同样逐跳拒绝重定向 —— 换 token 的请求携带凭据断言，
+			// 跟随重定向等于把断言发到未批准目的地（跨/同 host 多跳都拒）。
+			redirect: "error",
 		});
 	} catch (err) {
 		return fallbackOrThrow(key, `换取 GCP access token 失败：${err instanceof Error ? err.message : String(err)}`);

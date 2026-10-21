@@ -1,0 +1,50 @@
+{
+ "name": "env-session-pin",
+ "purpose": "G1 known-disconnect no-reconnect: Connection.snapshot() + RemoteExecutionEnv sessionPin, plus Connection teardown settlement hardening (independent finalizer: end/kill sync-throw cannot skip pending rejection or session release; client-side only; compatible with installed 1.1.0 daemon, zero protocol/daemon change)",
+ "base": {
+  "repo": "/Users/sundy/projects/pi-mono",
+  "head": "cdaf6c227",
+  "headIs": "v1.1.0-24 (git diff v1.1.0..HEAD -- packages/env = CHANGELOG +2 only; src identical to v1.1.0)",
+  "targetPackage": "@earendil-works/pi-env",
+  "targetVersion": "1.1.0",
+  "sources": {
+   "packages/env/src/connection.ts": "56e504b4b2c92e76b63ac94b6049686858c4e106cd85e2565776cfd1fab895cb",
+   "packages/env/src/remote-env.ts": "373019b5ac2ff2791003105a312e74646d2055e6b31f4e1a438dae4e3a7e1d5b"
+  },
+  "sourceBaseHashes": {
+   "packages/env/src/connection.ts": "740c6e340d61b789c9343e9c093efd38377059297bb8352d32c732cb2751d1ad",
+   "packages/env/src/remote-env.ts": "06bba09bc86ce421c2ac5203364896947ef983f070ba7a40ac13b22b0fea974a"
+  }
+ },
+ "compiler": {
+  "typescript": "Version 5.9.3",
+  "command": "node <sdk-root>/node_modules/typescript/bin/tsc -p <generated from vendor/pi-env/build/tsconfig.env.template.json>（由 build.mjs 组装；outDir=本轮 owned 临时目录）",
+  "builder": "vendor/pi-env/build/build.mjs",
+  "driftCheck": "未改源同流程 emit vs 安装 dist：{\"connection.js\":\"SAME\",\"remote-env.js\":\"SAME\",\"connection.d.ts\":\"SAME\",\"remote-env.d.ts\":\"SAME\"}"
+ },
+ "files": {
+  "connection.js": {
+   "patched": "fa270daaa72295fb8733fc631c204519929f049a0f73da9f93fa875c9066f81a",
+   "original": "a11354eefc264d6c98b8183ceb0df57cd984cea8a40fec9847c9118ab781f053"
+  },
+  "remote-env.js": {
+   "patched": "5ba868c9eea03c0376e9b60c7ddd0cdc93cf318cd974a9f344fac85522ba399e",
+   "original": "b3d31de4dbdc22ce8738d93320a6c48a349534aa447ed91dabde3fa29239fcd0"
+  },
+  "connection.d.ts": {
+   "patched": "13394770e323f347fea0c5adf8b629080af3ac89ead82e08b3d620fd40c0cb11",
+   "original": "7a0c63f682df9e562ed501623fbeec1f3b625eb83696d769b20521ff4afeffc7"
+  },
+  "remote-env.d.ts": {
+   "patched": "6333328d0433e554da67b3ac687208a09054c019a809944b7445aba4e94bb347",
+   "original": "21afc6ffa0034764c4c4442208ee1e8f49f377d61418bcfa6edcbee1d7beb524"
+  }
+ },
+ "installTarget": "node_modules/@earendil-works/pi-env/dist/",
+ "notes": [
+  "maps (.js.map/.d.ts.map) intentionally NOT replaced: old maps stay for debugging only, runtime never reads them",
+  "runtime fail-closed: perimeter refuses to create pinned guard env unless capability (snapshot/pinnedSession) AND patched hashes match"
+ ],
+ "sourceMapPolicy": "stripped: 生成 JS/d.ts 的 sourceMappingURL 注释已剥离；安装目录旧 map 成为无引用孤儿（可清理），调试器不再读到过期映射",
+ "patchFileSha256": "aac1576e4b82a5b94559f51d46063ae1ffdc51b22e5a60dc42d15c8b2c1e8f52"
+}

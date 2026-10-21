@@ -116,12 +116,16 @@ test("已声明的边界：路径 deny 规则对 bash 完全不生效", () => {
 	// 要让路径规则真正统一，得等 Phase 2 在 FS 层（RemoteExecutionEnv）收口
 });
 
-test("已声明的边界：只读工具可以读取凭据文件，内容会进模型上下文", () => {
-	// read 被排除在路径规则之外是有意的（否则每次读 package.json 都要人批，
-	// 审批疲劳本身就是安全失效），代价是凭据文件可被读进上下文。
-	// 唯一的缓解是模型网关的 audit-only 检测 —— 而它当前不在网关链路上。
-	assert.equal(deny("read", { path: ".env" }), "allow");
-	assert.equal(deny("read", { path: ".aws/credentials" }), "allow");
+test("凭据文件读取已被 deny_reads 拒绝；普通读取仍豁免（B1 加固后的新边界）", () => {
+	// 原边界「只读工具可以读取凭据文件」随 deny_reads 落地而收紧 —— 按本文件先例，
+	// 加固后更新期望值而不是回退策略。仍然如实：deny_reads 只管带 path 的读类工具，
+	// bash 里的 cat/base64 依旧看不见路径（上一条测试固定该局限，不能假称闭合）。
+	assert.equal(deny("read", { path: ".env" }), "deny");
+	assert.equal(deny("read", { path: ".aws/credentials" }), "deny");
+	assert.equal(deny("read", { path: "work/.npmrc" }), "deny");
+	// 普通读取豁免保持（审批疲劳取舍不变）
+	assert.equal(deny("read", { path: "package.json" }), "allow");
+	assert.equal(deny("read", { path: "src/.env-sample.ts" }), "allow");
 });
 
 test("agent 不能改写全局 .gitconfig —— 一句 alias 就能让审批门静默失效", () => {

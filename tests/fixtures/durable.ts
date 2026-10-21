@@ -9,6 +9,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AuditLog } from "../../src/audit/log.ts";
 import { ModelGateway } from "../../src/modelgw/server.ts";
 import type { ClientEvent } from "../../src/protocol/types.ts";
+import type { ApprovalContext } from "../../src/runtime/approvals.ts";
 import { HarnessHost } from "../../src/runtime/harness-host.ts";
 
 export async function fixture(script: unknown[], run: (host: HarnessHost, dir: string, reopen: () => Promise<HarnessHost>, events: ClientEvent[]) => Promise<void>, timeout = 200) {
@@ -21,8 +22,14 @@ export async function fixture(script: unknown[], run: (host: HarnessHost, dir: s
 		upstreams: [{ id: "mock", baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "upstream-secret" }], audit });
 	const mp = await mgw.listen();
 	const events: ClientEvent[] = [];
+	// 审批绑定：fixture 无 git，显式 unreliable 零值标记（非生产 demo 兼容，非 production 后门）
+	const approvalContext: ApprovalContext = {
+		sessionIdentity: "test", tenantIdentity: "default", repoIdentity: "default",
+		gitRevision: "0".repeat(40), policyHash: "f".repeat(64), aclVersion: 1, reliable: false, isProduction: false,
+	};
 	const opts = { sessionId: "test", file: join(dir, "state/session.sqlite"), workspace: join(dir, "workspace"), actor: "alice", repo: "default", team: "default",
-		policyFile: "config/policy.yaml", audit, model: { baseUrl: `http://127.0.0.1:${mp}/v1`, token: "model-token", model: "mock-model" }, approvalTimeoutMs: timeout, emit: (event: ClientEvent) => events.push(event) };
+		policyFile: "config/policy.yaml", audit, model: { baseUrl: `http://127.0.0.1:${mp}/v1`, token: "model-token", model: "mock-model" }, approvalTimeoutMs: timeout, emit: (event: ClientEvent) => events.push(event),
+		getContext: () => approvalContext };
 	let host: HarnessHost | undefined;
 	try {
 		host = await HarnessHost.open(opts);

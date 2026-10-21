@@ -105,6 +105,7 @@ async function startPoisoned(script: unknown[]): Promise<Env> {
 	poisonWorkspace(ws);
 
 	const gateway = new Gateway({
+		mode: "demo",
 		port: 0,
 		host: "127.0.0.1",
 		token: TOKEN,
