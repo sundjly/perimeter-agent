@@ -34,11 +34,13 @@ export interface SignedRequest {
 /**
  * 为一次上游请求算出认证头。
  * fetchImpl 只有 gcp 分支用得到（换 token 是一次网络调用），注入是为了可测。
+ * signal 同样只有 gcp 分支用得到（S4a）：网关的 connect/总 deadline 会中止在途的换 token。
  */
 export async function authorizeUpstream(
 	auth: UpstreamAuth,
 	req: { method: string; url: string; body: string },
 	fetchImpl: typeof fetch = fetch,
+	signal?: AbortSignal,
 ): Promise<SignedRequest> {
 	switch (auth.kind) {
 		case "static":
@@ -60,7 +62,7 @@ export async function authorizeUpstream(
 				}),
 			};
 		case "gcp":
-			return { headers: { authorization: `Bearer ${await gcpAccessToken(auth, fetchImpl)}` } };
+			return { headers: { authorization: `Bearer ${await gcpAccessToken(auth, fetchImpl, signal)}` } };
 	}
 }
 
@@ -85,6 +87,7 @@ export const GCP_TOKEN_HOST = "oauth2.googleapis.com";
 export async function gcpAccessToken(
 	auth: Extract<UpstreamAuth, { kind: "gcp" }>,
 	fetchImpl: typeof fetch = fetch,
+	signal?: AbortSignal,
 ): Promise<string> {
 	const scope = auth.scope ?? "https://www.googleapis.com/auth/cloud-platform";
 	// key 带私钥指纹：SA 轮换密钥后不该继续用旧 token 到过期
@@ -95,7 +98,7 @@ export async function gcpAccessToken(
 	const pending = inflight.get(key);
 	if (pending) return pending;
 
-	const task = refresh(auth, scope, key, fetchImpl).finally(() => inflight.delete(key));
+	const task = refresh(auth, scope, key, fetchImpl, signal).finally(() => inflight.delete(key));
 	inflight.set(key, task);
 	return task;
 }
@@ -105,6 +108,7 @@ async function refresh(
 	scope: string,
 	key: string,
 	fetchImpl: typeof fetch,
+	signal?: AbortSignal,
 ): Promise<string> {
 	const now = Math.floor(Date.now() / 1000);
 	const claims = {
@@ -122,8 +126,9 @@ async function refresh(
 			method: "POST",
 			headers: { "content-type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: jwt }).toString(),
-			// 没有超时的话 Google 挂起会让这条请求永远挂着
-			signal: AbortSignal.timeout(10_000),
+			// 没有超时的话 Google 挂起会让这条请求永远挂着。除固定 10s 外，网关的
+			// connect/总 deadline（S4a）也通过 signal 传入：AbortSignal.any 取更早者。
+			signal: signal ? AbortSignal.any([AbortSignal.timeout(10_000), signal]) : AbortSignal.timeout(10_000),
 			// B3：token 端点同样逐跳拒绝重定向 —— 换 token 的请求携带凭据断言，
 			// 跟随重定向等于把断言发到未批准目的地（跨/同 host 多跳都拒）。
 			redirect: "error",

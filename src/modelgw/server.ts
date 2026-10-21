@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AuditLog } from "../audit/log.ts";
 import { BodyScanError, decodeStrictUtf8, scanJsonDecoded, scanSecrets, validateFindings, type SecretFinding } from "./secrets.ts";
-import { GCP_TOKEN_HOST, type UpstreamAuth, authorizeUpstream } from "./upstream-auth.ts";
+import { GCP_TOKEN_HOST, type SignedRequest, type UpstreamAuth, authorizeUpstream } from "./upstream-auth.ts";
 
 export interface UpstreamConfig {
 	/** provider id，客户端用 model 前缀或 header 选择 */
@@ -54,6 +54,45 @@ export interface DlpConfig {
 	auditApproved?: boolean;
 }
 
+/**
+ * S4a：模型请求的四段 deadline（handoff §3.2）。任一超时 → AbortController 中止
+ * 上游 fetch 与 body reader，释放连接；未写响应头回 504 + 固定文案，已开流则终止
+ * 写回，并审计 kind 固定（error）的超时事件（含段别）。换 token 的 fetch 也受
+ * connect/总 deadline 约束。
+ */
+export interface GatewayDeadlines {
+	/** 客户端请求体读取上限：慢发 body 的连接被 408 + 断开 */
+	bodyMs?: number;
+	/** 发起上游请求（含换 token）到收到响应头 */
+	connectMs?: number;
+	/** 响应头到首个响应 body chunk（首 token） */
+	firstTokenMs?: number;
+	/** 相邻 body chunk / 写回 drain 等待的最长间隔 */
+	idleMs?: number;
+	/** 单请求总时长，覆盖以上所有段 */
+	totalMs?: number;
+}
+
+/** handoff §3.2 建议初值 10s/30s/60s/10min；body 读取无建议值，对齐首 token 取 30s */
+export const DEFAULT_DEADLINES: Required<GatewayDeadlines> = {
+	bodyMs: 30_000,
+	connectMs: 10_000,
+	firstTokenMs: 30_000,
+	idleMs: 60_000,
+	totalMs: 600_000,
+};
+
+/** 构造期校验：非正/非有限 deadline 启动即炸（fail-fast，与 dlp.mode 同口径） */
+function resolveDeadlines(cfg: GatewayDeadlines | undefined): Required<GatewayDeadlines> {
+	const merged = { ...DEFAULT_DEADLINES, ...cfg };
+	for (const [key, value] of Object.entries(merged)) {
+		if (!Number.isFinite(value) || value <= 0) {
+			throw new Error(`模型网关 deadlines.${key} 必须是正数，收到 ${String(value)}`);
+		}
+	}
+	return merged;
+}
+
 /** 完整 body 上限（B7 全量预算/流控后置；本上限仅为「扫描前有界、不新增无界 buffer」的安全必要最小限） */
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -71,6 +110,8 @@ export interface ModelGatewayConfig {
 	audit?: AuditLog;
 	/** B3 出站 DLP 配置；缺省 = block（生产默认） */
 	dlp?: DlpConfig;
+	/** S4a：四段 deadline（缺省 = DEFAULT_DEADLINES） */
+	deadlines?: GatewayDeadlines;
 	/** 便于测试注入；默认用全局 fetch */
 	fetchImpl?: typeof fetch;
 	/** 便于测试注入扫描器故障（fail-closed 负控）；默认 scanSecrets */
@@ -120,11 +161,13 @@ export class ModelGateway {
 	#used = new Map<string, number>();
 	/** B3：生效的 DLP 模式（构造期已校验） */
 	readonly dlpMode: "audit" | "block";
+	#deadlines: Required<GatewayDeadlines>;
 
 	constructor(cfg: ModelGatewayConfig) {
 		this.#cfg = cfg;
 		this.#fetch = cfg.fetchImpl ?? fetch;
 		this.#scan = cfg.scanSecretsImpl ?? scanSecrets;
+		this.#deadlines = resolveDeadlines(cfg.deadlines);
 		// B3：模式校验 fail-fast（未知值/枚举外值启动即炸，绝不静默回退到任一模式）
 		const mode = cfg.dlp?.mode ?? "block"; // 生产默认：block（strict fail-closed）
 		if (mode !== "audit" && mode !== "block") {
@@ -169,6 +212,17 @@ export class ModelGateway {
 		return this.#used.get(team) ?? 0;
 	}
 
+	/** S4a：中止/断流的固定类别审计 —— 含段别与 usage_unknown；不写 0 token 假成功（持久预算归 S4b） */
+	#auditAbort(abort: AbortState, sessionId: string, actor: string, team: string): void {
+		const cause = abort.cause;
+		if (!cause) return;
+		const summary =
+			cause.kind === "timeout"
+				? `上游 deadline 超时中止（segment=${cause.segment}），usage_unknown`
+				: "客户端断开，上游请求已取消，usage_unknown";
+		this.#cfg.audit?.append({ kind: "error", sessionId, actor, team, summary });
+	}
+
 	async #handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		try {
 			await this.#route(req, res);
@@ -201,12 +255,25 @@ export class ModelGateway {
 		let body: string;
 		let findings: SecretFinding[];
 		try {
-			const raw = await readBody(req, MAX_BODY_BYTES);
+			const raw = await readBodyBounded(req, MAX_BODY_BYTES, this.#deadlines.bodyMs);
 			body = decodeStrictUtf8(raw);
 			const rawFindings = validateFindings(this.#scan(body));
 			const decodedFindings = scanJsonDecoded(body, this.#scan);
 			findings = [...rawFindings, ...decodedFindings];
 		} catch (err) {
+			if (err instanceof BodyReadTimeoutError) {
+				this.#cfg.audit?.append({
+					kind: "error",
+					sessionId,
+					actor,
+					team,
+					summary: "请求体读取超时（segment=body_read），请求未达上游",
+				});
+				// 先把固定错误发出去再断读：客户端看到 408，而不是裸断连
+				res.writeHead(408, { "content-type": "application/json" });
+				res.end(JSON.stringify({ error: { message: "请求体读取超时" } }), () => req.destroy());
+				return;
+			}
 			if (err instanceof BodyTooLargeError) {
 				this.#cfg.audit?.append({
 					kind: "error",
@@ -280,53 +347,129 @@ export class ModelGateway {
 		}
 		// 凭据只在这里注入 —— 沙箱侧从头到尾看不到它
 		const auth = upstream.auth ?? (upstream.apiKey ? staticAuth(upstream) : null);
-		if (auth) {
-			try {
-				const signed = await authorizeUpstream(auth, { method: "POST", url: target, body }, this.#fetch);
-				Object.assign(headers, signed.headers);
-			} catch (err) {
-				// 详情进审计日志，**不回给沙箱**：换 token 失败的消息里嵌着
-				// 上游响应正文，长度无界、内容由上游控制，还会暴露 SA 邮箱
-				// 之类的内部拓扑
-				const detail = err instanceof Error ? err.message : String(err);
-				this.#cfg.audit?.append({
-					kind: "error",
-					sessionId: "-",
-					actor: "modelgw",
-					summary: `上游 ${upstream.id} 认证失败：${detail.slice(0, 500)}`,
-				});
-				res.writeHead(502, { "content-type": "application/json" }).end(
-					JSON.stringify({ error: { message: "上游认证失败，详情见网关审计日志" } }),
-				);
-				return;
+
+		// S4a：四段 deadline + 断流取消上游 + 写回背压。
+		// abort.cause 是「这次请求为何结束」的唯一事实源：哪个先发生（超时/客户端断开）
+		// 就记哪个，后到的 ac.abort()（如超时后又触发 res 'close'）不再改写。
+		const ac = new AbortController();
+		const abort: AbortState = { cause: null };
+		let streamStarted = false;
+		res.on("error", () => {
+			// 向已断开的客户端写数据可能 EPIPE；abort 流是预期路径，不让它炸进程
+		});
+		res.on("close", () => {
+			// writableEnded=false = 写回未正常结束：客户端断开 → 立即 abort 上游 fetch 与 reader
+			if (!res.writableEnded && abort.cause === null) {
+				abort.cause = { kind: "client" };
+				ac.abort();
 			}
-		}
-
-		// redirect:"error"（B3）：携带凭据的上游请求逐跳拒绝重定向 —— 不跟随跨 host/同 host 多跳，
-		// 不把 hostname allowlist 当作 DNS/SSRF 隔离（那要靠网络层）。上游想重定向 = 本次请求失败。
-		const upRes = await this.#fetch(target, { method: "POST", headers, body, redirect: "error" });
-		// 上游的错误正文**有意透传**给沙箱：agent 要据此判断是 rate limit、
-		// context 超长还是参数错误，并决定重试还是改写请求。这与换 token
-		// 失败不同 —— 那种错误对 agent 毫无用处，纯粹是内部拓扑泄漏。
-
-		res.writeHead(upRes.status, {
-			"content-type": upRes.headers.get("content-type") ?? "text/event-stream",
-			"cache-control": "no-cache",
+		});
+		const watch = new DeadlineWatch((segment) => {
+			if (abort.cause !== null) return;
+			abort.cause = { kind: "timeout", segment };
+			ac.abort();
+			// 已开始流：终止写回，让 read/drain 等待立即退出（客户端看到流被截断）
+			if (streamStarted) res.destroy();
 		});
 
-		const usage = await pipeAndMeter(upRes, res);
-		if (usage.total > 0) {
-			this.#used.set(team, this.usedTokens(team) + usage.total);
-			this.#cfg.audit?.append({
-				kind: "usage",
-				sessionId,
-				actor,
-				team,
-				summary: `模型网关计量 ${usage.total} token（${upstream.id}）`,
-				tokensInput: usage.input,
-				tokensOutput: usage.output,
-				tokensTotal: usage.total,
+		try {
+			// 计时从认证开始：换 token 也是「连上游」的一部分，受 connect/总 deadline 约束
+			watch.arm("total", this.#deadlines.totalMs);
+			watch.arm("connect", this.#deadlines.connectMs);
+			if (auth) {
+				let signed: SignedRequest;
+				try {
+					signed = await authorizeUpstream(auth, { method: "POST", url: target, body }, this.#fetch, ac.signal);
+				} catch (err) {
+					if (abort.cause !== null) {
+						this.#auditAbort(abort, sessionId, actor, team);
+						// 尚未写响应头，回固定类别错误，不透传内部错误
+						if (abort.cause.kind === "timeout" && !res.destroyed) {
+							res.writeHead(504, { "content-type": "application/json" }).end(
+								JSON.stringify({ error: { message: UPSTREAM_TIMEOUT_MESSAGE } }),
+							);
+						}
+						return;
+					}
+					// 详情进审计日志，**不回给沙箱**：换 token 失败的消息里嵌着
+					// 上游响应正文，长度无界、内容由上游控制，还会暴露 SA 邮箱
+					// 之类的内部拓扑
+					const detail = err instanceof Error ? err.message : String(err);
+					this.#cfg.audit?.append({
+						kind: "error",
+						sessionId: "-",
+						actor: "modelgw",
+						summary: `上游 ${upstream.id} 认证失败：${detail.slice(0, 500)}`,
+					});
+					res.writeHead(502, { "content-type": "application/json" }).end(
+						JSON.stringify({ error: { message: "上游认证失败，详情见网关审计日志" } }),
+					);
+					return;
+				}
+				Object.assign(headers, signed.headers);
+			}
+			// 换 token 用掉的时间不挤占真正连上游的窗口：connect 段重新起算；总时长不重置
+			watch.arm("connect", this.#deadlines.connectMs);
+
+			// redirect:"error"（B3）：携带凭据的上游请求逐跳拒绝重定向 —— 不跟随跨 host/同 host 多跳，
+			// 不把 hostname allowlist 当作 DNS/SSRF 隔离（那要靠网络层）。上游想重定向 = 本次请求失败。
+			let upRes: Response;
+			try {
+				upRes = await this.#fetch(target, { method: "POST", headers, body, redirect: "error", signal: ac.signal });
+			} catch (err) {
+				watch.disarm("connect");
+				if (abort.cause !== null) {
+					this.#auditAbort(abort, sessionId, actor, team);
+					if (abort.cause.kind === "timeout" && !res.destroyed) {
+						res.writeHead(504, { "content-type": "application/json" }).end(
+							JSON.stringify({ error: { message: UPSTREAM_TIMEOUT_MESSAGE } }),
+						);
+					}
+					return;
+				}
+				throw err; // 真实上游错误 → 保留既有 502 透传语义（#handle）
+			}
+			watch.disarm("connect");
+			if (abort.cause !== null) {
+				// abort 与 fetch 完成之间的窄窗口：按已记录原因收尾，不把死响应写给客户端
+				this.#auditAbort(abort, sessionId, actor, team);
+				return;
+			}
+
+			// 上游的错误正文**有意透传**给沙箱：agent 要据此判断是 rate limit、
+			// context 超长还是参数错误，并决定重试还是改写请求。这与换 token
+			// 失败不同 —— 那种错误对 agent 毫无用处，纯粹是内部拓扑泄漏。
+			res.writeHead(upRes.status, {
+				"content-type": upRes.headers.get("content-type") ?? "text/event-stream",
+				"cache-control": "no-cache",
 			});
+			// SSE 代理：头立即冲给客户端，不等首个 body chunk —— 客户端/SDK 的 header
+			// 超时不会误触；后续首 token/idle 超时截断时，客户端看到的是
+			// 「已写头 + 流被截断」而非裸断连。
+			res.flushHeaders();
+			streamStarted = true;
+
+			const usage = await pipeAndMeter(upRes, res, watch, abort, this.#deadlines);
+			if (abort.cause !== null && !res.writableEnded) {
+				// 中止/断流：usage 不得静默写成 0 成功（持久预算归 S4b），这里固定类别审计 + 段别 + usage_unknown
+				this.#auditAbort(abort, sessionId, actor, team);
+				return;
+			}
+			if (usage.total > 0) {
+				this.#used.set(team, this.usedTokens(team) + usage.total);
+				this.#cfg.audit?.append({
+					kind: "usage",
+					sessionId,
+					actor,
+					team,
+					summary: `模型网关计量 ${usage.total} token（${upstream.id}）`,
+					tokensInput: usage.input,
+					tokensOutput: usage.output,
+					tokensTotal: usage.total,
+				});
+			}
+		} finally {
+			watch.disarmAll();
 		}
 	}
 
@@ -353,11 +496,66 @@ export function assertAllowed(baseUrl: string, allowlist: string[], what = "上�
 	}
 }
 
+/** S4a：deadline 段别（审计 summary 里的 segment= 值） */
+export type DeadlineSegment = "body_read" | "connect" | "first_token" | "idle" | "total";
+
+/** 超时时回给沙箱的 504 固定文案 —— 不透传内部错误（AbortError 等） */
+const UPSTREAM_TIMEOUT_MESSAGE = "上游响应超时，请求已中止";
+
+/** 上游请求结束原因的唯一事实源：超时（含段别）或客户端断开 */
+interface AbortState {
+	cause: { kind: "timeout"; segment: DeadlineSegment } | { kind: "client" } | null;
+}
+
+/**
+ * S4a：deadline 计时器组。同段重臂 = 重置计时（idle 逐 chunk / drain 重臂）；
+ * disarmAll 在请求收尾时清掉全部句柄，node --test 能自然退出。
+ */
+class DeadlineWatch {
+	#timers = new Map<DeadlineSegment, NodeJS.Timeout>();
+	#fire: (segment: DeadlineSegment) => void;
+	constructor(fire: (segment: DeadlineSegment) => void) {
+		this.#fire = fire;
+	}
+	arm(segment: DeadlineSegment, ms: number): void {
+		this.disarm(segment);
+		this.#timers.set(
+			segment,
+			setTimeout(() => {
+				this.#timers.delete(segment);
+				this.#fire(segment);
+			}, ms),
+		);
+	}
+	disarm(segment: DeadlineSegment): void {
+		const timer = this.#timers.get(segment);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			this.#timers.delete(segment);
+		}
+	}
+	disarmAll(): void {
+		for (const timer of this.#timers.values()) clearTimeout(timer);
+		this.#timers.clear();
+	}
+}
+
 /**
  * 边转发边计量。刻意流式转发而不是缓冲整包：
  * 长回复缓冲会让首 token 延迟变成整轮延迟，而验收指标里有「首 token < 3s」。
+ *
+ * S4a：每个 await 都有 deadline（首 chunk 前是 first_token，之后是 idle，逐 chunk 重臂）；
+ * 写回遵守背压（write 返回 false 等 drain，等待受 idle/总 deadline 约束）。
+ * 我方中止（超时/客户端断开）时返回已计量的部分结果，由调用方按 abort.cause 统一收尾；
+ * 上游自身故障仍然抛出，保持 #handle 的既有 502 语义。
  */
-async function pipeAndMeter(upRes: Response, res: ServerResponse): Promise<Usage> {
+async function pipeAndMeter(
+	upRes: Response,
+	res: ServerResponse,
+	watch: DeadlineWatch,
+	abort: AbortState,
+	deadlines: Required<GatewayDeadlines>,
+): Promise<Usage> {
 	const usage: Usage = { total: 0, input: 0, output: 0 };
 	if (!upRes.body) {
 		res.end();
@@ -366,15 +564,52 @@ async function pipeAndMeter(upRes: Response, res: ServerResponse): Promise<Usage
 	const reader = upRes.body.getReader();
 	const decoder = new TextDecoder();
 	let tail = "";
+	let first = true;
 	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		const chunk = decoder.decode(value, { stream: true });
-		res.write(chunk);
+		if (res.destroyed) return usage;
+		watch.arm(first ? "first_token" : "idle", first ? deadlines.firstTokenMs : deadlines.idleMs);
+		let read: Awaited<ReturnType<typeof reader.read>>;
+		try {
+			read = await reader.read();
+		} catch (err) {
+			if (abort.cause !== null) return usage; // 我方中止：调用方按原因审计收尾
+			throw err; // 上游自身故障：保留既有 502 语义
+		} finally {
+			watch.disarm(first ? "first_token" : "idle");
+		}
+		if (read.done) break;
+		first = false;
+		const chunk = decoder.decode(read.value, { stream: true });
+		await writeChunk(res, chunk, deadlines.idleMs, watch);
 		tail = readUsage(tail + chunk, usage);
 	}
 	res.end();
 	return usage;
+}
+
+/**
+ * S4a：写回背压。res.write 返回 false 时等 'drain'（或 close/error），等待受 idle 段
+ * 约束（总时长始终有效）。等待期间不读上游，TCP 背压逐级传到上游侧，
+ * 网关进程内缓冲有界（socket 写缓冲 + 当前这一个 chunk）。
+ */
+function writeChunk(res: ServerResponse, chunk: string, idleMs: number, watch: DeadlineWatch): Promise<void> {
+	return new Promise((resolve) => {
+		if (res.write(chunk)) {
+			resolve();
+			return;
+		}
+		watch.arm("idle", idleMs);
+		const done = () => {
+			res.off("drain", done);
+			res.off("close", done);
+			res.off("error", done);
+			watch.disarm("idle");
+			resolve();
+		};
+		res.once("drain", done);
+		res.once("close", done);
+		res.once("error", done);
+	});
 }
 
 /** 从 SSE 流里抓 usage 字段；返回尚未成行的残留 */
@@ -414,6 +649,28 @@ class BodyTooLargeError extends Error {
 	constructor() {
 		super("request body too large");
 		this.name = "BodyTooLargeError";
+	}
+}
+
+class BodyReadTimeoutError extends Error {
+	constructor() {
+		super("request body read timeout");
+		this.name = "BodyReadTimeoutError";
+	}
+}
+
+/** readBody + 读取超时：客户端慢发 body 时在 bodyMs 内拒绝，而不是无限挂住（字节上限不变） */
+async function readBodyBounded(req: IncomingMessage, maxBytes: number, timeoutMs: number): Promise<Buffer> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([
+			readBody(req, maxBytes),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new BodyReadTimeoutError()), timeoutMs);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
