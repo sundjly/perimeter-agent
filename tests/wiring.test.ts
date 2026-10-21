@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { AuditLog } from "../src/audit/log.ts";
 import { writeSandboxConfig } from "../src/gateway/sandbox-config.ts";
-import { Gateway } from "../src/gateway/server.ts";
+import { Gateway, scmGrantRepo } from "../src/gateway/server.ts";
 import { ModelGateway } from "../src/modelgw/server.ts";
 import type { ClientEvent } from "../src/protocol/types.ts";
 
@@ -268,4 +268,46 @@ test("B2：gitGrant masterKey/internalToken 与既有凭据域互异（构造期
 	// 合法互异配置真正不抛/进入生产接线（H1 正控：不再恒抛）
 	const gw = new Gateway({ ...base, gitGrants: { masterKey: randomBytes(32), internalToken: "internal-only-0123456789", writeRefs: ["refs/heads/*"] } });
 	await gw.close();
+});
+
+test("C3：scmGrantRepo 推导（正例/带端口/无路径/未登记反例；合同 A2 全等口径）", () => {
+	const repos = [{ name: "git.internal/app.git" }];
+	assert.equal(scmGrantRepo("https://git.internal/app.git", repos), "git.internal/app.git", "正例：host+path");
+	assert.equal(scmGrantRepo("https://git.internal/app.git/", repos), "git.internal/app.git", "尾斜杠归一");
+	assert.equal(scmGrantRepo("https://git.internal:8443/team/app.git", [{ name: "git.internal:8443/team/app.git" }]), "git.internal:8443/team/app.git", "带端口推导");
+	assert.equal(scmGrantRepo("https://git.internal", repos), null, "无路径 fail-closed");
+	assert.equal(scmGrantRepo("https://git.internal/", repos), null, "仅斜杠无路径 fail-closed");
+	assert.equal(scmGrantRepo("https://git.internal/app.git?x=1", repos), null, "带 query 不签发");
+	assert.equal(scmGrantRepo("https://other.internal/app.git", repos), null, "不在 repos 登记不签发（demo-app 类策略标签同理）");
+	assert.equal(scmGrantRepo(undefined, repos), null, "未配置 repoUrl 不签发");
+	assert.equal(scmGrantRepo("https://git.internal/app.git", undefined), null, "无 repos 配置不签发");
+	assert.equal(scmGrantRepo("ftp://git.internal/app.git", repos), null, "非 http(s) 不签发");
+});
+
+test("R72：构造期 fail-closed（已初始化 stateRoot 缺 revocations.json）抛错后无残留 ref 定时器", async () => {
+	// 回归锚：Gateway ctor 曾在 renew timer（ref，armed 450s）之后才跑 #loadRevocations，
+	// 构造抛错时无 close 可调 → ref 定时器泄漏拖住整个进程直至强杀。
+	const dir = mkdtempSync(join(tmpdir(), "ctor-leak-"));
+	const stateRoot = join(dir, "state");
+	// 预置「已初始化实例」痕迹：sessions 目录存在但吊销表缺失 → #loadRevocations fail-closed
+	mkdirSync(join(stateRoot, "sessions", "s1"), { recursive: true });
+	const before = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+	let threw = false;
+	try {
+		new Gateway({
+			mode: "demo", port: 0, host: "127.0.0.1", token: "browser-only-0123456789abcdef0123456789",
+			policyFile: join(REPO, "config/policy.yaml"), auditFile: join(dir, "a.jsonl"),
+			workspaceRoot: join(dir, "ws"), stateRoot, webRoot: "web",
+			model: { baseUrl: "http://model/v1", token: "model-only", model: "model" },
+			wiring: { proxyToken: "unused-model-alias", gitProxyToken: "git-proxy-only", gitProxyUrl: "http://git", scmHosts: ["git.internal"] },
+			gitGrants: { masterKey: randomBytes(32), internalToken: "registry-internal-token-xyz", writeRefs: ["refs/heads/*"] },
+		});
+	} catch {
+		threw = true; // fail-closed 抛错本身是期望行为（语义与消息不在本例断言范围）
+	}
+	assert.ok(threw, "已初始化实例缺 revocations.json 必须拒启动");
+	// 给可能的异步收尾一拍；ref Timeout 数量不得因构造失败而净增（renew timer 泄漏会 +1）
+	await new Promise((r) => setTimeout(r, 50));
+	const after = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+	assert.ok(after <= before, `构造失败不得残留 ref 定时器（before ${before} → after ${after}）`);
 });

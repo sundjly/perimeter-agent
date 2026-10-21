@@ -4,6 +4,7 @@ import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { gzipSync } from "node:zlib";
 import { randomBytes } from "node:crypto";
 import { AuditLog } from "../src/audit/log.ts";
 import { GitCredentialProxy } from "../src/gitproxy/server.ts";
@@ -141,11 +142,11 @@ async function auditEntries(file: string) {
 	return out;
 }
 
-function post(base: string, path: string, body: string, headers: Record<string, string> = {}) {
+function post(base: string, path: string, body: string | Buffer, headers: Record<string, string> = {}) {
 	return fetch(`${base}${path}`, {
 		method: "POST",
 		headers: { "content-type": "application/x-git-upload-pack-request", ...headers },
-		body,
+		body: typeof body === "string" ? body : new Uint8Array(body),
 		signal: AbortSignal.timeout(10_000),
 	});
 }
@@ -591,4 +592,86 @@ test("N12：伪造 x-perimeter-* 头不进授权与审计 —— identity=grant 
 	assert.equal(ok.status, 200);
 	assert.equal(up.seen.length, 1, "只有合法读路径到达上游");
 	assert.equal(up.seen[0]!.auth, UPSTREAM_AUTH, "上游看到的仍是注入凭据");
+});
+
+// ── R72：B4 真实 gzip push（合同 B4：解压预验、identity 单次转发、剥 content-encoding）──
+
+/** 记录型假上游（B4：额外捕获完整 body 字节与 content-encoding） */
+async function startBodyRecordingUpstream(): Promise<{
+	port: number;
+	bodyDone: Promise<void>;
+	getBody: () => Buffer;
+	seen: { method: string; url: string; auth: string | null; contentEncoding: string | null }[];
+}> {
+	const chunks: Buffer[] = [];
+	const seen: { method: string; url: string; auth: string | null; contentEncoding: string | null }[] = [];
+	let release: () => void = () => {};
+	const bodyDone = new Promise<void>((r) => { release = r; });
+	const srv = createServer((req, res) => {
+		chunks.length = 0;
+		req.on("data", (c) => chunks.push(c as Buffer));
+		req.on("end", () => {
+			seen.push({
+				method: req.method ?? "", url: req.url ?? "", auth: req.headers.authorization ?? null,
+				contentEncoding: typeof req.headers["content-encoding"] === "string" ? (req.headers["content-encoding"] as string) : null,
+			});
+			res.writeHead(200, { "content-type": "application/x-git-receive-pack-result" }).end("OK");
+			release();
+		});
+	});
+	await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+	cleanups.push(() => new Promise<void>((r) => srv.close(() => r())));
+	return { port: (srv.address() as { port: number }).port, bodyDone, getBody: () => Buffer.concat(chunks), seen };
+}
+
+test("B4：gzip 压缩的合法 receive-pack 经代理解压、以 identity 单次转发，上游收到字节与原始未压缩 body 完全一致", async () => {
+	const up = await startBodyRecordingUpstream();
+	const { base, auditFile, issue } = await startProxy(up.port, true);
+	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
+	const raw = Buffer.from(pktCmd("0".repeat(40), "2".repeat(40), "refs/heads/main"), "utf8");
+	const res = await post(base, "/app.git/git-receive-pack", gzipSync(raw), {
+		authorization: `Bearer ${grant}`,
+		"content-type": "application/x-git-receive-pack-request",
+		"content-encoding": "gzip",
+	});
+	assert.equal(res.status, 200);
+	await up.bodyDone; // 上游 body 读尽才算证据完整
+	assert.ok(up.getBody().equals(raw), "上游收到的必须是解压后的 identity 字节（与原始未压缩 body 完全一致）");
+	assert.equal(up.seen[0]!.contentEncoding, null, "B4：以 identity 转发上游必须剥掉 content-encoding");
+	assert.ok((await auditEntries(auditFile)).some((e) => e.kind === "git.push" && e.verdict === "allow"), "gzip 合法 push 照常留痕");
+});
+
+test("B4：gzip 解压后命令区越域 ref → 403，上游零请求", async () => {
+	const up = await startRecordingUpstream();
+	const { base, auditFile, issue } = await startProxy(up.port, true);
+	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/feature/*"] });
+	const raw = pktCmd("0".repeat(40), "3".repeat(40), "refs/heads/main");
+	const res = await post(base, "/app.git/git-receive-pack", gzipSync(Buffer.from(raw, "utf8")), {
+		authorization: `Bearer ${grant}`,
+		"content-type": "application/x-git-receive-pack-request",
+		"content-encoding": "gzip",
+	});
+	assert.equal(res.status, 403, "解压后越域 ref 必须 403（与 identity 同尺）");
+	assert.equal(up.seen.length, 0, "越域推送不得到达上游");
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("writeRefs")), "越权写必须留痕");
+});
+
+test("B4：gzip + >64KiB PACK（合法命令区）推送 200 且解压字节与原始一致", async () => {
+	const up = await startBodyRecordingUpstream();
+	const { base, issue } = await startProxy(up.port, true);
+	const grant = issue({ read: true, write: true, writeRefs: ["refs/heads/*"] });
+	// 64KiB 上限只钳命令区；PACK 段走 decoded 预算（默认远大于 80KiB）
+	const raw = Buffer.concat([
+		Buffer.from(pktCmd("1".repeat(40), "4".repeat(40), "refs/heads/main"), "utf8"),
+		Buffer.from("PACK", "utf8"),
+		Buffer.alloc(80 * 1024, 0x50),
+	]);
+	const res = await post(base, "/app.git/git-receive-pack", gzipSync(raw), {
+		authorization: `Bearer ${grant}`,
+		"content-type": "application/x-git-receive-pack-request",
+		"content-encoding": "gzip",
+	});
+	assert.equal(res.status, 200);
+	await up.bodyDone;
+	assert.ok(up.getBody().equals(raw), "解压后字节必须与原始 body 完全一致");
 });

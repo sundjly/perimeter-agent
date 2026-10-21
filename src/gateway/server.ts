@@ -407,13 +407,20 @@ export class Gateway {
 		}
 		this.#pkceSecret = randomBytes(32);
 		// R-Q50-3：活会话 grant 续签调度（配置 renewIntervalMs 才启用；可注入 timer）
-		this.#startGitGrantRenewTimer();
-
+		let wss: WebSocketServer | undefined;
 		try {
+			// R72：renew timer（ref 定时器）的 arm 与其后所有会抛错的加载/校验同缝进 try——
+			// 构造失败的实例没有 close() 可调，抛错前必须拆除已 armed 的定时器并关闭 audit
+			// 再重抛（抛错语义与消息不变）。真实事故：renew armed 450s + loadRevocations
+			// 抛错 → ref 定时器拖住整个进程直至强杀。
+			this.#startGitGrantRenewTimer();
 			this.#loadRevocations();
 			this.#loadSessions();
-			this.#wss = new WebSocketServer({ noServer: true, maxPayload: this.#limits.maxInboundBytes });
+			wss = new WebSocketServer({ noServer: true, maxPayload: this.#limits.maxInboundBytes });
+			this.#wss = wss;
 		} catch (err) {
+			this.#stopGitGrantRenewTimer();
+			try { wss?.close(); } catch { /* 未创建不遮原错误 */ }
 			this.#audit.close();
 			throw err;
 		}
@@ -972,7 +979,15 @@ export class Gateway {
 		// wiring.gitProxyToken（沙箱 HOME 外 .gitconfig），不进任何客户端可见面。
 		let gitGrantToken: string | undefined;
 		if (this.#cfg.gitGrants) {
-			gitGrantToken = this.#issueGitGrant(sessionId, identity.principal ? `${identity.principal.issuer}|${identity.principal.subject}` : actor, metadata.team, metadata.repo, metadata.aclVersion ?? 1, identity.expiresAt);
+			// R72-C3（合同 A2）：grant.repo 必须与代理 parsePath 名全等——由服务端配置的
+			// repoUrl 推导 SCM 仓库名（host/path），且必须在 gitGrants.repos 登记才签发。
+			// 策略作用域标签（metadata.repo）不是 SCM 仓库，不得混用（demo-app ≠ 代理名）。
+			const scmRepo = scmGrantRepo(this.#cfg.repoUrl, this.#cfg.gitGrants.repos);
+			if (!scmRepo) {
+				closeWith(ws, "git grant 签发拒绝：repoUrl 未配置或未在 gitGrants.repos 登记（fail-closed，固定类别）", this.#limits);
+				return;
+			}
+			gitGrantToken = this.#issueGitGrant(sessionId, identity.principal ? `${identity.principal.issuer}|${identity.principal.subject}` : actor, metadata.team, scmRepo, metadata.aclVersion ?? 1, identity.expiresAt);
 			// R-Q52-2：登记服务端验证得到的 browser sid ↔ agent session 关联（logout 撤权依据）
 			if (identity.sid) linkBrowserSid(this.#gitGrantSessionsByBrowserSid, identity.sid, sessionId);
 		}
@@ -1753,6 +1768,28 @@ export class Gateway {
 		res.on("close", () => stream.destroy());
 		stream.pipe(res);
 	}
+}
+
+/**
+ * R72-C3：由部署配置的 SCM 仓库 URL 推导 grant.repo（= 代理 RepoMapping 名，合同 A2 全等口径：
+ * host[/port] + path，去前导斜杠）。必须已在 gitGrants.repos 登记，否则返回 null —— 签发端
+ * fail-closed 不签发（不猜、不回落到策略作用域标签 metadata.repo）。
+ */
+export function scmGrantRepo(repoUrl: string | undefined, repos: ReadonlyArray<{ name: string }> | undefined): string | null {
+	if (!repoUrl || !repos || repos.length === 0) return null;
+	let u: URL;
+	try {
+		u = new URL(repoUrl);
+	} catch {
+		return null;
+	}
+	if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+	if (u.search || u.hash) return null;
+	const path = u.pathname.replace(/^\/+/, "").replace(/\/+$/, "");
+	if (!path) return null;
+	const host = u.port ? `${u.hostname}:${u.port}` : u.hostname;
+	const name = `${host}/${path}`;
+	return repos.some((r) => r.name === name) ? name : null;
 }
 
 /** 一个会话可以同时连着多个传输（刷新页面、多标签），事件广播给全部 */

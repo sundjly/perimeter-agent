@@ -15,6 +15,9 @@ import { CMD_BAND_MAX_BYTES as HEADER_BAND_MAX_BYTES, PktHeaderScanner, createId
 import { DeadlineError, DeadlineReadGate, armDeadlineTimer, disarmDeadlineTimer } from "./bounded-reader.ts";
 import { ByteBudget } from "./byte-budget.ts";
 
+/** R72-c：session-miss 立即重拉快照的最小间隔（另有单飞在途锁）——防未登记 grant 放大打 registry */
+const MISS_REFRESH_MIN_INTERVAL_MS = 1_000;
+
 export interface RepoMapping {
 	/** 沙箱侧使用的名字，出现在 git remote 里 */
 	name: string;
@@ -157,6 +160,10 @@ export class GitCredentialProxy {
 	};
 	/** 每轮 registry fetch 预算（AbortSignal + 发布判定共锚）；可注入避免纯 unit 藏原生 timer */
 	#signalTimeoutImpl: (ms: number) => AbortSignal;
+
+	/** R72-c：session-miss 立即重拉快照的限流（单飞 + 最小间隔 1s，防未登记 grant 放大打 registry） */
+	#missRefreshInFlight = false;
+	#missRefreshNotBeforeMono = 0;
 
 	constructor(cfg: GitProxyConfig) {
 		this.#cfg = cfg;
@@ -439,7 +446,27 @@ export class GitCredentialProxy {
 			deny(403, "拒绝：grant 已吊销（jti）", claims);
 			return;
 		}
-		const registered = snap.activeSessions[claims.session];
+		let registered = snap.activeSessions[claims.session];
+		if (!registered) {
+			// R72-C3 冷启动缝：grant 在会话接入时才 mint+登记，代理快照要等下一轮 pollMs
+			// 才包含它——clone 紧随接入发生，会撞上旧快照「session 未登记」。
+			// miss 时重拉一次快照再判，但必须限流（R72-c）：单飞（同时只一个在途拉取）
+			// + 最小间隔 1s——持合法签名但未登记 grant 的请求不得放大打 registry。
+			// 限流窗内/拉取失败：沿用旧快照结论（miss → deny，fail-closed 不变）。
+			const now = this.#mono();
+			if (!this.#missRefreshInFlight && now >= this.#missRefreshNotBeforeMono) {
+				this.#missRefreshInFlight = true;
+				try {
+					const fresh = await this.#pullRegistry();
+					this.#snapshot = fresh;
+					this.#snapshotAtMono = this.#mono();
+					registered = fresh.activeSessions[claims.session];
+				} catch { /* 拉取失败：沿用旧快照结论（miss → deny，与 maxStale 口径一致） */ } finally {
+					this.#missRefreshInFlight = false;
+					this.#missRefreshNotBeforeMono = this.#mono() + MISS_REFRESH_MIN_INTERVAL_MS;
+				}
+			}
+		}
 		if (!registered) {
 			deny(403, "拒绝：session 未在活会话登记表（已销毁/未登记/他网关签发）", claims);
 			return;
