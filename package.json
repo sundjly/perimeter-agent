@@ -9,6 +9,8 @@
   },
   "scripts": {
     "test": "node --test --test-reporter=spec \"tests/**/*.test.ts\"",
+    "test:bounded": "node scripts/bounded-test-runner.ts --timeout 1500s node --test --test-reporter=spec \"tests/**/*.test.ts\"",
+    "test:serial": "node scripts/bounded-test-runner.ts --timeout 1500s node --test --test-concurrency=1 --test-reporter=spec \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "crossverify": "node --test tests/sigv4-crossverify.test.ts",
     "gateway": "node src/gateway/server.ts",
@@ -19,7 +21,9 @@
     "gen:policy-cm": "node scripts/gen-policy-cm.ts",
     "gen:deploy": "npm run gen:netpol && npm run gen:policy-cm",
     "export:siem": "node scripts/export-siem.ts",
-    "attach": "node scripts/attach.ts"
+    "attach": "node scripts/attach.ts",
+    "backup": "node scripts/backup.ts",
+    "restore": "node scripts/restore.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.1.0",

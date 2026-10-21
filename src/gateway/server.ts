@@ -5,7 +5,7 @@ import { linkBrowserSid, peekSessionsForBrowserSid, takeSessionsForBrowserSid } 
 import { computeNextRenewDelayMs, computeGrantExpiry, decideRenew } from "./renew-policy.ts";
 import { OwnedRenewTimer } from "./owned-renew-timer.ts";
 import { applyRotation, mergeIssueIntoEntry, planRotation, retireUndeliveredNew, rollbackRotation } from "./grant-rotation.ts";
-import { createReadStream, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
 import { type ChildProcess, spawn } from "node:child_process";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { Duplex } from "node:stream";
@@ -1069,6 +1069,51 @@ export class Gateway {
 		try { this.#acceptConnection(ws, req, identity); } catch { closeWith(ws, "会话接入失败", this.#limits); }
 	}
 
+	/**
+	 * S3d（handoff §3.3 第 5 条）：既有会话目录的 meta.json 缺失或损坏 → 不得当新会话、
+	 * 不得让后来的连接成为新 owner。首次触碰时写 quarantined 标记（0600 tmp+rename）+
+	 * 固定类别审计留痕，此后该会话的一切接入都被拒绝；处置权只在运维（本片无运维命令）。
+	 * 返回 true = 该会话已隔离，调用方必须拒绝接入。
+	 */
+	#quarantineIfBroken(sessionId: string): boolean {
+		const sessionDir = join(this.#stateRoot, "sessions", sessionId);
+		try {
+			if (!statSync(sessionDir).isDirectory()) return false; // 目录不存在：正常新建路径
+		} catch {
+			return false;
+		}
+		const markerFile = join(sessionDir, "quarantined.json");
+		if (existsSync(markerFile)) return true; // 已隔离：一律拒绝（仅运维可清除）
+		const metaFile = join(sessionDir, "meta.json");
+		let reason: "meta_missing" | "meta_corrupt" | undefined;
+		if (!existsSync(metaFile)) {
+			// meta 缺失 ≠ 一律隔离：#buildSession 的建目录与 meta 落盘之间存在崩溃窗口，
+			// 且部署面会预先 mkdir 空的 sessions/<sid> 再接入。此时目录里只可能有写一半的
+			// 临时文件 —— meta 的 tmp 实际名为 meta.json.tmp（#buildSession：metaFile + ".tmp"），
+			// 与账本等 *.pid.*.tmp 同理（session.sqlite/-wal/-shm、prompt-ledger.json 都在其后
+			// 的 start() 才产生）—— 空目录（或仅剩 *.tmp 残留）视为未创建，走正常新建。
+			const meaningful = readdirSync(sessionDir).filter((name) => !name.endsWith(".tmp"));
+			if (meaningful.length === 0) return false;
+			reason = "meta_missing";
+		} else {
+			try {
+				JSON.parse(readFileSync(metaFile, "utf8"));
+			} catch {
+				reason = "meta_corrupt";
+			}
+		}
+		if (!reason) return false;
+		try {
+			// 并发首触可能都写：内容只差时间戳，语义相同（标记存在即拒绝）
+			const tmp = `${markerFile}.${process.pid}.${randomUUID()}.tmp`;
+			writeFileSync(tmp, JSON.stringify({ sessionId, reason, quarantinedAt: new Date().toISOString() }), { mode: 0o600 });
+			renameSync(tmp, markerFile);
+			try { chmodSync(markerFile, 0o600); } catch { /* 刚以 0600 写入；chmod 兑底失败不影响语义 */ }
+		} catch { /* 标记写失败不放宽：仍然拒绝，审计留痕兜底 */ }
+		this.#tryAudit({ kind: "error", sessionId, actor: "system", summary: `会话元数据${reason === "meta_missing" ? "缺失" : "损坏"}，标记 quarantined（固定类别；仅运维可处理），拒绝接入`, verdict: "deny" });
+		return true;
+	}
+
 	#acceptConnection(ws: WebSocket, req: IncomingMessage, identity: { actor: string; principal?: Principal; expiresAt: number; sid?: string }): void {
 		const url = new URL(req.url ?? "/", "http://localhost");
 		// actor 来自服务端认证结果；demo 下是客户端自报，production 下是 issuer|sub
@@ -1095,6 +1140,11 @@ export class Gateway {
 		}
 
 		if (requested) {
+			// S3d：既有会话目录 meta.json 缺失/损坏 → quarantined，拒绝接入（不得成为新 owner）
+			if (this.#quarantineIfBroken(requested)) {
+				closeWith(ws, "会话元数据缺失或损坏，会话已隔离（quarantined），拒绝接入（固定类别；交运维处理）", this.#limits);
+				return;
+			}
 			const metaFile = join(this.#cfg.stateRoot ?? this.#cfg.workspaceRoot + ".state", "sessions", requested, "meta.json");
 			if (existsSync(metaFile)) {
 				const diskMeta: Meta = JSON.parse(readFileSync(metaFile, "utf8"));

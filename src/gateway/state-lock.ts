@@ -129,3 +129,27 @@ export function lockStillHeld(lock: HeldLock): boolean {
 		return false;
 	}
 }
+
+/** S3d（备份工具用）：只读探测锁状态，不取得、不修改锁。语义与 acquireGatewayLock 同一判定原语 */
+export type GatewayLockState =
+	| { state: "none" }
+	| { state: "live"; holder: LockContent }
+	| { state: "stale"; holder: LockContent }
+	| { state: "foreign-host"; holder: LockContent }
+	| { state: "unparseable" };
+
+export function inspectGatewayLock(stateRoot: string): GatewayLockState {
+	let raw: string;
+	try {
+		raw = readFileSync(join(stateRoot, LOCK_FILE_NAME), "utf8");
+	} catch {
+		return { state: "none" };
+	}
+	try {
+		const holder = parseLockContent(raw);
+		if (holder.hostname !== hostname()) return { state: "foreign-host", holder };
+		return isAlive(holder.pid) ? { state: "live", holder } : { state: "stale", holder };
+	} catch {
+		return { state: "unparseable" };
+	}
+}
