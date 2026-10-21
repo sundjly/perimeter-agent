@@ -41,11 +41,11 @@ function makeE2eIssuer() {
 	};
 	const registryFetchImpl = (async () => new Response(JSON.stringify(snapshot), { status: 200 })) as unknown as typeof fetch;
 	return {
-		issue(opts: { write?: boolean; repo?: string; aclVersion?: number } = {}): string {
+		issue(opts: { write?: boolean; repo?: string; aclVersion?: number; writeRefs?: string[] } = {}): string {
 			return signGrant({
 				v: 1, tenant: TENANT, principal: PRINCIPAL, session: SESSION,
 				repo: opts.repo ?? "git.internal/app.git",
-				caps: { read: true, write: opts.write ?? false, writeRefs: opts.write ? ["refs/heads/*"] : [] },
+				caps: { read: true, write: opts.write ?? false, writeRefs: opts.write ? (opts.writeRefs ?? ["refs/heads/*"]) : [] },
 				exp: Date.now() + 600_000, jti: `jti-${Math.random().toString(36).slice(2)}`, epoch: snapshot.epoch, aclVersion: opts.aclVersion ?? 1,
 			} as never, MASTER_KEY, Date.now());
 		},
@@ -143,16 +143,16 @@ async function startProxy(upstreamPort: number, opts: { allowPush?: boolean } = 
 		],
 	});
 	cleanups.push(() => proxy.close());
-	const issue = (o: { write?: boolean } = {}): string => iss.issue({ write: o.write ?? (opts.allowPush ?? true) });
+	const issue = (o: { write?: boolean; writeRefs?: string[] } = {}): string => iss.issue({ write: o.write ?? (opts.allowPush ?? true), writeRefs: o.writeRefs });
 	return { auditFile, port: await proxy.listen(), issue };
 }
 
-/** 按网关的方式生成沙箱侧配置，返回 HOME */
-function sandboxHome(proxyPort: number, issue: (o: { write?: boolean }) => string): string {
+/** 按网关的方式生成沙箱侧配置，返回 HOME；grantOpts 透传给签发器（R70-N3/N10：限定写域/只读） */
+function sandboxHome(proxyPort: number, issue: (o: { write?: boolean; writeRefs?: string[] }) => string, grantOpts: { write?: boolean; writeRefs?: string[] } = {}): string {
 	const home = mkdtempSync(join(tmpdir(), "sbhome-"));
 	writeSandboxConfig(home, {
 		proxyToken: "MODEL-TOKEN-only-in-gateway",
-		gitProxyToken: issue({ write: true }),
+		gitProxyToken: issue({ write: grantOpts.write ?? true, writeRefs: grantOpts.writeRefs }),
 		modelGatewayUrl: "http://127.0.0.1:1/v1",
 		gitProxyUrl: `http://127.0.0.1:${proxyPort}`,
 		scmHosts: ["git.internal"],
@@ -294,4 +294,66 @@ test("repoUrl 以 - 开头会被 git 当成选项 —— `--` 分隔是必需的
 	// 不带 `--` 时，git 把它解析成选项而不是地址
 	await assert.rejects(git(["clone", "-q", "--upload-pack=touch /tmp/pwned", "x"], ws), /./);
 	assert.equal(existsSync("/tmp/pwned"), false);
+});
+
+// ── R70：合同 §5 覆盖缺口补齐（round-10 §4 required ①④）──────────────
+
+test("N3：writeRefs 越权写 —— 真实 git push 到 writeRefs 外分支失败，上游不变", async () => {
+	const upstreamRoot = await makeUpstream();
+	const { port, auditFile, issue } = await startProxy(await startUpstreamServer(upstreamRoot), { allowPush: true });
+	// grant 写域只含 feature/*（签发端限定，非部署面）
+	const home = sandboxHome(port, issue, { writeRefs: ["refs/heads/feature/*"] });
+	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
+	const bare = join(upstreamRoot, "app.git");
+	const headBefore = (await git(["rev-parse", "refs/heads/main"], bare)).stdout.trim();
+
+	await git(["clone", "-q", "https://git.internal/app.git", "repo"], ws, home);
+	const repo = join(ws, "repo");
+
+	// 正控：域内分支推得上（证明写能力真实在用，排除基础设施性假绿）
+	await git(["checkout", "-qb", "feature/x"], repo, home);
+	writeFileSync(join(repo, "in-scope.txt"), "域内改动\n");
+	await git(["add", "."], repo, home);
+	await git(["commit", "-qm", "域内提交"], repo, home);
+	await git(["push", "-q", "origin", "feature/x"], repo, home);
+	const featLog = (await git(["log", "--oneline", "-1", "refs/heads/feature/x"], bare)).stdout;
+	assert.match(featLog, /域内提交/);
+
+	// 负控：writeRefs 外的分支 → 代理 403，push 失败
+	writeFileSync(join(repo, "out.txt"), "越权改动\n");
+	await git(["add", "."], repo, home);
+	await git(["commit", "-qm", "越权提交"], repo, home);
+	await assert.rejects(git(["push", "-q", "origin", "HEAD:refs/heads/other"], repo, home), /403|forbidden|拒绝/i);
+
+	// 上游未变：main HEAD 与 push 前相同；越权分支不存在；越权提交未到上游
+	const headAfter = (await git(["rev-parse", "refs/heads/main"], bare)).stdout.trim();
+	assert.equal(headAfter, headBefore, "上游 main HEAD 不得变化");
+	await assert.rejects(git(["rev-parse", "--verify", "refs/heads/other"], bare), /./, "越权分支不得出现在上游");
+	const mainLog = (await git(["log", "--oneline", "-3", "refs/heads/main"], bare)).stdout;
+	assert.ok(!mainLog.includes("越权提交"));
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("writeRefs")), "越权写必须留痕");
+});
+
+test("N10：protocol.version=2 显式 clone/fetch 正例；同一只读 grant 打 receive-pack 被拒", async () => {
+	// 覆盖口径（如实标注）：裸 SHA want 属 repo 级读 caps（B5① pass-through）,
+	// 本例以显式 v2 ls-refs/fetch 正例 + 只读 grant 打 receive-pack 403 收口；
+	// fixture 上游为 v0（无 GIT_PROTOCOL），git 自动回落协商——授权与版本无关（B3）。
+	const upstreamRoot = await makeUpstream();
+	const { port, auditFile, issue } = await startProxy(await startUpstreamServer(upstreamRoot), { allowPush: true });
+	const home = sandboxHome(port, issue, { write: false }); // 只读 grant
+	const ws = mkdtempSync(join(tmpdir(), "sandbox-"));
+
+	await git(["-c", "protocol.version=2", "clone", "-q", "https://git.internal/app.git", "repo"], ws, home);
+	const repo = join(ws, "repo");
+	assert.match(readFileSync(join(repo, "README.md"), "utf8"), /上游仓库/);
+	await git(["-c", "protocol.version=2", "fetch", "origin"], repo, home);
+
+	// 同一只读 grant 打 receive-pack：caps 层 403，上游不变
+	writeFileSync(join(repo, "x.txt"), "x\n");
+	await git(["add", "."], repo, home);
+	await git(["commit", "-qm", "v2 只读不该推上"], repo, home);
+	await assert.rejects(git(["-c", "protocol.version=2", "push", "-q", "origin", "main"], repo, home), /403|forbidden|拒绝/i);
+	const mainLog = (await git(["log", "--oneline", "-1", "refs/heads/main"], join(upstreamRoot, "app.git"))).stdout;
+	assert.ok(!mainLog.includes("v2 只读不该推上"), "只读 grant 的 push 不得到达上游");
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("无写能力")), "只读推拒必须留痕");
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -46,6 +46,7 @@ interface GrantOpts {
 	principal?: string;
 	tenant?: string;
 	aclVersion?: number;
+	now?: number;
 }
 
 function makeIssuer() {
@@ -62,16 +63,17 @@ function makeIssuer() {
 		registryFetchImpl,
 		issue(opts: GrantOpts = {}): string {
 			const repo = opts.repo ?? "app.git";
+			const nowMs = opts.now ?? Date.now(); // R70-N5：签发时钟可注入（过期负控不真实 sleep）
 			return signGrant(
 				{
 					v: 1, tenant: opts.tenant ?? TENANT, principal: opts.principal ?? PRINCIPAL,
 					session: opts.session ?? SESSION, repo,
 					caps: { read: opts.read ?? true, write: opts.write ?? false, writeRefs: opts.writeRefs ?? (opts.write ? ["refs/heads/*"] : []) },
-					exp: opts.exp ?? Date.now() + 600_000,
+					exp: opts.exp ?? nowMs + 600_000,
 					jti: opts.jti ?? `jti-${Math.random().toString(36).slice(2)}`,
 					epoch: snapshot.epoch, aclVersion: opts.aclVersion ?? 1,
 				} as never,
-				MASTER_KEY, Date.now(),
+				MASTER_KEY, nowMs,
 			);
 		},
 	};
@@ -516,4 +518,77 @@ test("service 值的大小写变体不透传 —— 判定与转发不能各看�
 	if (up.seen.length > 0) {
 		assert.ok(!/service=/i.test(up.seen.at(-1)!.url), "不认识的 service 值不该原样递给上游");
 	}
+});
+
+// ── R70：合同 §5 覆盖缺口补齐（round-10 §4 required ②③⑤）──────────────
+
+test("N5：HTTP 层过期 grant（签发时钟回拨，无真实 sleep）→ 403，上游零请求", async () => {
+	const up = await startRecordingUpstream();
+	const { base, auditFile, issue } = await startProxy(up.port);
+	// 签发时钟回拨 700s：exp=签发now+600s 落在真实当下之前（签名时仍合法：exp>签发now 且 ≤+15min）
+	const grant = issue({ now: Date.now() - 700_000 });
+	const res = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${grant}` } });
+	assert.equal(res.status, 403);
+	assert.equal(up.seen.length, 0, "过期 grant 不得到达上游");
+	assert.ok((await auditEntries(auditFile)).some((e) => e.verdict === "deny" && e.summary.includes("过期")), "过期拒绝必须留痕");
+});
+
+test("N8：路径 %编码/大小写/双斜杠/.. 负控 → 403/404，上游零请求", async () => {
+	const up = await startRecordingUpstream();
+	const { base, issue } = await startProxy(up.port);
+	const auth = { authorization: `Bearer ${issue({ read: true })}` };
+
+	// %编码：allowlist 名是部署者写的字面量，不做解码匹配（B1）
+	const pct = await fetch(`${base}/%61pp.git/info/refs?service=git-upload-pack`, { headers: auth });
+	assert.equal([403, 404].includes(pct.status), true, `%编码 实际 ${pct.status}`);
+	// 大小写变体：allowlist 字符串全等
+	const upper = await fetch(`${base}/APP.GIT/info/refs?service=git-upload-pack`, { headers: auth });
+	assert.equal([403, 404].includes(upper.status), true, `大写 实际 ${upper.status}`);
+	// 双斜杠：raw url 先查（路由 B1，在 new URL 规范化之前）
+	const dslash = await fetch(`${base}//app.git/info/refs?service=git-upload-pack`, { headers: auth });
+	assert.equal([403, 404].includes(dslash.status), true, `双斜杠 实际 ${dslash.status}`);
+	// ..：fetch/WHATWG URL 与 http.request(URL 字符串) 都会规范化点段；须用 options 形态
+	// 的 path（node http 对 options.path 不做规范化）原样发出，才能测到服务端 raw url 检查
+	const dotdot = await new Promise<{ status: number }>((resolve, reject) => {
+		const rq = httpRequest({ host: "127.0.0.1", port: new URL(base).port, path: "/app.git/../app.git/info/refs?service=git-upload-pack", method: "GET", headers: auth }, (rs) => {
+			rs.resume();
+			rs.on("end", () => resolve({ status: rs.statusCode ?? 0 }));
+		});
+		rq.on("error", reject);
+		rq.end();
+	});
+	assert.equal([403, 404].includes(dotdot.status), true, `.. 实际 ${dotdot.status}`);
+
+	assert.equal(up.seen.length, 0, "四个负控形态都不得到达上游");
+});
+
+test("N12：伪造 x-perimeter-* 头不进授权与审计 —— identity=grant 真值", async () => {
+	const up = await startRecordingUpstream();
+	const { base, auditFile, issue } = await startProxy(up.port, true);
+	const forged = {
+		"x-perimeter-session": "forged-session",
+		"x-perimeter-actor": "forged-actor",
+		"x-perimeter-team": "forged-team",
+	};
+	// 无 grant + 伪造头：仍是 401 挑战（伪造头不构成凭据）
+	const noGrant = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: forged });
+	assert.equal(noGrant.status, 401);
+	// read-only grant + 伪造头打 receive-pack：仍按 grant caps 拒（allowPush 已开，走到写能力层）
+	const denied = await post(base, "/app.git/git-receive-pack", "0000", {
+		authorization: `Bearer ${issue({ read: true, write: false })}`,
+		"content-type": "application/x-git-receive-pack-request",
+		...forged,
+	});
+	assert.equal(denied.status, 403, "伪造头不得抬高授权结果");
+	const denyEntry = (await auditEntries(auditFile)).find((e) => e.verdict === "deny" && e.summary.includes("无写能力"));
+	assert.ok(denyEntry, "caps deny 必须留痕");
+	assert.equal(denyEntry!.sessionId, "sess-test");
+	assert.equal(denyEntry!.actor, "principal-test");
+	assert.equal(denyEntry!.team, "tenant-test");
+	assert.ok(!JSON.stringify(denyEntry).includes("forged-"), "伪造值不得进审计");
+	// 合法读 grant + 伪造头：授权结果不变（照常 200，凭据照常注入）
+	const ok = await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${issue({ read: true })}`, ...forged } });
+	assert.equal(ok.status, 200);
+	assert.equal(up.seen.length, 1, "只有合法读路径到达上游");
+	assert.equal(up.seen[0]!.auth, UPSTREAM_AUTH, "上游看到的仍是注入凭据");
 });
