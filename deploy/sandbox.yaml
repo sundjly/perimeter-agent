@@ -73,6 +73,103 @@ spec:
       volumeMounts:
         - name: workspace
           mountPath: /workspace
+        # ── S2 Phase B：受保护路径 RO subPath 挂载（与 config/policy.yaml deny_paths
+        # 派生清单同源，见 src/gateway/protected-mounts.ts；tests/protected-paths-docker.test.ts
+        # 钉死两者一致）────────────────────────────
+        # 语义：同一 workspace emptyDir 的子路径以只读再挂载，容器内 bash/python 写这些
+        # 路径（新建/覆盖/rm/mv/chmod）被内核拒绝（EROFS），与 docker 后端的 RO bind 对齐。
+        # ⚠️ 部署前置（与 docker 侧流形门控同源）：
+        # 1. 这些路径必须在容器启动前存在于 emptyDir 中（目录由平台预创建；文件型条目
+        #    需预置空文件或实际文件）—— kubelet 对缺失 subPath 的自动创建行为与
+        #    文件型 subPath 的挂载语义未在真实集群验证；
+        # 2. 会话内 git clone（repoUrl 流形）要求空目录 —— clone 型会话必须整组关掉
+        #    这些挂载（与 docker 侧 ctx.repoUrl 门控同源），否则 clone fatal。
+        # ⚠️ external_blocked：kubectl 未配置，本组挂载未在真实集群 apply/验证过，
+        # 只完成了生成物与本文件的单测（tests/protected-paths-docker.test.ts）。
+        - name: workspace
+          mountPath: /workspace/.aws
+          subPath: .aws
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.buildkite
+          subPath: .buildkite
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.clinerules
+          subPath: .clinerules
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.circleci
+          subPath: .circleci
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.cursorrules
+          subPath: .cursorrules
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.env
+          subPath: .env
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.git/config
+          subPath: .git/config
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.git/hooks
+          subPath: .git/hooks
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.gitconfig
+          subPath: .gitconfig
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.github/workflows
+          subPath: .github/workflows
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.gitlab-ci.yml
+          subPath: .gitlab-ci.yml
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.npmrc
+          subPath: .npmrc
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.pi
+          subPath: .pi
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/.ssh
+          subPath: .ssh
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/AGENTS.md
+          subPath: AGENTS.md
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/AGENTS.override.md
+          subPath: AGENTS.override.md
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/CLAUDE.md
+          subPath: CLAUDE.md
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/Dockerfile
+          subPath: Dockerfile
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/Jenkinsfile
+          subPath: Jenkinsfile
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/azure-pipelines.yml
+          subPath: azure-pipelines.yml
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace/secrets
+          subPath: secrets
+          readOnly: true
         - name: tmp
           mountPath: /tmp
         - name: policy

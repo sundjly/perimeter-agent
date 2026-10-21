@@ -597,7 +597,12 @@ test("Durable docker：常驻执行连接不挂网关代码、不注入模型环
 	assert.deepEqual(plan.command, ["docker", "exec", "-i", "perimeter-durable-sess-1", "pi-env"]);
 	assert.ok(plan.start!.args.includes("-d"));
 	assert.ok(!plan.start!.args.some((arg) => arg.includes("/opt/perimeter/")));
-	assert.deepEqual(plan.start!.args.flatMap((arg, i, args) => arg === "-e" ? [args[i + 1]] : []), ["HOME=/home/agent"]);
+	// HOME 与 GIT_TEMPLATE_DIR 是仅有的两个带值的 -e：前者是容器 HOME，后者指向
+	// 只读空模板目录（S2 Phase B，/var/perimeter 下、不占用 /opt/perimeter 网关代码命名空间），均为固定非敏感路径
+	assert.deepEqual(plan.start!.args.flatMap((arg, i, args) => arg === "-e" ? [args[i + 1]] : []), [
+		"HOME=/home/agent",
+		"GIT_TEMPLATE_DIR=/var/perimeter/git-templates",
+	]);
 	// start.env 必须可执行：client 需 PATH 解析 docker 可执行文件（与 safeDockerCmd 同口径；
 	// 仅 host 侧 client 环境，容器内环境仍由 args 严格构造）——首次真实 probe 运行暴露的缺口
 	assert.equal(plan.start!.env?.PATH, process.env.PATH, "start.env 必须带 host PATH（否则 spawn docker ENOENT）");

@@ -1,11 +1,12 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join, normalize } from "node:path";
 import { k8sNameFragment, renderPodManifest } from "../deploy/pod-template.ts";
 import { promisify } from "node:util";
 
 import { openEnvironment, type EnvironmentHandle, type EnvironmentPlan } from "../runtime/execution-env.ts";
+import { GIT_TEMPLATE_DIR, applyProtectedMounts, deriveProtectedTargets } from "./protected-mounts.ts";
 
 const exec = promisify(execFile);
 
@@ -27,6 +28,13 @@ export interface LaunchContext {
 	policyFile: string;
 	/** 要传进沙箱的环境变量（策略上下文等） */
 	env: NodeJS.ProcessEnv;
+	/**
+	 * 会话待克隆的仓库地址（Session 从 repoUrl 透传）。非空表示容器启动后
+	 * 还有一次容器内 `git clone` —— clone 要求目标目录为空，因此受保护路径的
+	 * stub 预创建与 RO 挂载必须整体让位（否则 clone fatal），这是结构性限制，
+	 * 见 protected-mounts.ts 的流形门控与残余声明。
+	 */
+	repoUrl?: string;
 }
 
 export interface Launch {
@@ -492,7 +500,7 @@ export class DockerBackend implements ExecutionBackend {
 		args[args.indexOf("-i")] = "-d";
 		for (let i = args.length - 1; i >= 0; i--) {
 			if (args[i] === "-v" && args[i + 1]?.includes(":/opt/perimeter/")) args.splice(i, 2);
-			if (args[i] === "-e" && !args[i + 1]?.startsWith("HOME=")) args.splice(i, 2);
+			if (args[i] === "-e" && !args[i + 1]?.startsWith("HOME=") && !args[i + 1]?.startsWith("GIT_TEMPLATE_DIR=")) args.splice(i, 2);
 		}
 		args.splice(-1, 1, "/bin/sh", "-c", "while :; do sleep 3600; done");
 		return { cwd: this.#opts.workdir ?? "/workspace", command: ["docker", "exec", "-i", containerName(ctx.sessionId, this.#gatewayId), "pi-env"],
@@ -510,6 +518,27 @@ export class DockerBackend implements ExecutionBackend {
 		const home = CONTAINER_HOME;
 		const name = containerName(ctx.sessionId, this.#gatewayId);
 		const targetNetwork = this.#verifiedNetworkId ?? (this.#opts.network === "none" ? "none" : (this.#opts.network ?? "bridge"));
+
+		// S2 Phase B：受保护路径 RO 挂载。挂载参数只由服务端从 policy 派生，
+		// 客户端输入进不来。策略文件损坏（解析失败）→ fail-closed 抛错拒绝会话启动；
+		// 策略文件不存在（纯函数测试用的假路径）→ 维持现状零挂载 —— 生产启动前
+		// readyz 已强制策略在位，这条分支只为测试存在。clone 型会话整体跳过：
+		// git clone 需空目录，任何预置都会让启动后的 clone 失败（结构性残余，
+		// 见 protected-mounts.ts 模块头）。
+		let protectedMountArgs: string[] = [];
+		if (!ctx.repoUrl) {
+			let policyText = "";
+			try {
+				policyText = readFileSync(ctx.policyFile, "utf8");
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			}
+			if (policyText) {
+				const { targets } = deriveProtectedTargets(policyText);
+				const applied = applyProtectedMounts(ctx.workspace, targets, workdir);
+				protectedMountArgs = applied.mounts.flatMap((m) => ["-v", `${m.hostSource}:${m.containerTarget}:ro`]);
+			}
+		}
 
 		const mountRoot = "/opt/perimeter";
 		const args = [
@@ -535,6 +564,9 @@ export class DockerBackend implements ExecutionBackend {
 			// 只挂工作区与 HOME；宿主机其余部分在容器里不存在
 			"-v",
 			`${ctx.workspace}:${workdir}`,
+			// S2 Phase B：policy 派生的受保护路径 RO bind（见上方推导）。排在
+			// workspace 之后，嵌套 bind 由内核按挂载点深度解析，更具体的 RO 生效。
+			...protectedMountArgs,
 			...(ctx.home ? ["-v", `${ctx.home}:${home}`] : []),
 			"-v",
 			`${join(this.#opts.repoRoot, "src")}:${mountRoot}/src:ro`,
@@ -547,6 +579,11 @@ export class DockerBackend implements ExecutionBackend {
 			// tmpfs 写入直接算宿主机内存，没有 memory 上限时是一条 DoS 路径。
 			"--tmpfs",
 			"/tmp:rw,noexec,nosuid,nodev,size=512m",
+			// S2 Phase B：空的只读 git 模板目录。容器内 git init/clone 不再向
+			// .git/hooks 拷贝模板（sample hook 本就惰性），预创建的空 RO hooks
+			// 目录因此不破坏 init 流程；目录本身 ro，agent 无法经模板投毒后续 clone。
+			"--tmpfs",
+			`${GIT_TEMPLATE_DIR}:ro,nosuid,nodev,noexec,size=1m`,
 			// 没有 wiring 时不挂 HOME，而根是只读的 —— 镜像里的 /home/agent
 			// 写不进去，pi 写自身状态就失败。给一块 tmpfs 兜住。
 			...(ctx.home ? [] : ["--tmpfs", `${home}:rw,nosuid,nodev,size=64m`]),
@@ -554,6 +591,9 @@ export class DockerBackend implements ExecutionBackend {
 			workdir,
 			"-e",
 			`HOME=${home}`,
+			// 固定路径、非敏感，随 HOME 同式（KEY=VALUE）进 argv；指向上面那只 ro tmpfs
+			"-e",
+			`GIT_TEMPLATE_DIR=${GIT_TEMPLATE_DIR}`,
 		];
 
 		// 容器内的策略文件路径。ctx.env 里若带了宿主机路径，必须被覆盖掉 ——

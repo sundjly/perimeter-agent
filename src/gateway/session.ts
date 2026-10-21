@@ -117,6 +117,8 @@ export class Session {
 			const ctx = {
 				sessionId: opts.sessionId, workspace: opts.workspace, home, extensionPath: "", policyFile: opts.policyFile,
 				env: { PERIMETER_REPO: opts.repo, PERIMETER_TEAM: opts.team },
+				// 透传给后端：非空表示启动后还有一次容器内 clone，受保护挂载必须让位（git clone 需空目录）
+				repoUrl: opts.repoUrl,
 			};
 			if (this.#backend.kind !== "kubectl") await this.#backend.prepare?.(ctx);
 			if (!this.#alive) return;
