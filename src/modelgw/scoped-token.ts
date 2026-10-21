@@ -12,7 +12,8 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
  * - 签名比较用 timingSafeEqual（常量时间）；长度不等也跑一次等长比较，不用时长泄漏长度。
  * - 归属只来自凭证：x-perimeter-team / x-perimeter-actor 等请求头不参与计费归属
  *   （在 server.ts 执行；本模块只管凭证本身）。
- * - mintScopedToken() 供网关给每个会话签发（S4c 接线，不在本轮）；密钥只存在于网关进程，
+ * - mintScopedToken() 供网关按调用签发（S4c 已接线：归属三元组取服务端会话归属
+ *   owner/team/sessionId，不取客户端输入；短 TTL）；密钥只存在于网关进程，
  *   与静态网关 token、上游模型凭据互不相同。
  */
 
@@ -28,7 +29,7 @@ export interface ScopedTokenIdentity {
 	tenant: string;
 	team: string;
 	sessionId: string;
-	/** 凭证唯一 id；网关用它派生账本 operationId（<jti>:<序号>），客户端字符串不参与 */
+	/** 凭证唯一 id；网关用它派生账本 operationId（`<jti>:<服务端 UUID>`），客户端字符串不参与 */
 	jti: string;
 }
 
@@ -41,6 +42,15 @@ const ID_FIELD = /^[A-Za-z0-9._:@/|+-]{1,200}$/;
 
 /** token 总长上界：六个字段 + 签名远小于此；超长直接 malformed，不做无界解析 */
 const MAX_TOKEN_LENGTH = 4096;
+
+/**
+ * S4c：归属字段签发侧预检（与 verifyScopedToken 同一把 ID_FIELD 尺）。
+ * 网关 Session 启动期用它做可签发性校验 —— 坏归属字段在会话启动就 fail-closed，
+ * 不拖到第一次模型调用才在 resolve 里炸。
+ */
+export function isSafeScopedIdentityValue(value: unknown): value is string {
+	return typeof value === "string" && ID_FIELD.test(value);
+}
 
 export function assertScopedTokenKey(key: Buffer): void {
 	if (!Buffer.isBuffer(key) || key.length < MIN_SCOPED_KEY_BYTES) {

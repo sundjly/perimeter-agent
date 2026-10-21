@@ -47,6 +47,9 @@ const PROXY_TOKEN = process.env.PERIMETER_PROXY_TOKEN ?? "demo-proxy-token";
 // （网关 + git 代理）各持一份；每个会话的 grant 由网关签发、沙箱 .gitconfig 只见 grant 串。
 const GIT_GRANT_MASTER_KEY = randomBytes(32);
 const GIT_REGISTRY_INTERNAL_TOKEN = randomBytes(24).toString("base64url");
+// S4c：模型通道 scoped 凭证密钥 —— modelgw 验签与网关签发共用同一把（≥32B）。
+// 会话的模型调用不再上行静态 proxyToken，modelgw 按 scoped token 的 owner/team/session 归属记账。
+const MODEL_SCOPED_KEY = randomBytes(32);
 const real = process.env.PERIMETER_DEMO_REAL === "1";
 
 // 演示脚本：agent 先改一个源码文件（放行），再试图改 CI（拒绝），最后 push（审批）
@@ -86,6 +89,8 @@ if (!real) {
 		port: 0,
 		host: "127.0.0.1",
 		token: PROXY_TOKEN,
+		// S4c：接受网关按调用签发的 scoped token（静态 token 仍可用，但会话不再用它）
+		scopedTokenKey: MODEL_SCOPED_KEY,
 		upstreams: [
 			{
 				id: "upstream",
@@ -186,6 +191,8 @@ const gw = new Gateway({
 		// R-Q50-3：活会话 grant 续签（10min < 15min TTL，后台长活动会话也真有触发）
 		renewIntervalMs: 10 * 60_000,
 	},
+	// S4c：按会话/按调用签发模型 scoped 凭证（与 modelgw scopedTokenKey 同一密钥）
+	modelScopedKey: MODEL_SCOPED_KEY,
 	policyFile: join(root, "config/policy.yaml"),
 	auditFile,
 	stateRoot,
@@ -215,7 +222,7 @@ ${real ? "" : `
 
 会话启动时网关已经经凭据代理 clone 了仓库。凭据分域：
   · 网关 token（${TOKEN}）      —— 浏览器用，沙箱看不到
-  · 模型代理 token             —— 只在可信网关
+  · 模型 scoped 密钥            —— modelgw 验签 + 网关按调用签发，沙箱与浏览器都看不到
   · git 代理 token              —— 沙箱 HOME，不能访问模型/会话网关
   · 上游 API key 与 git token   —— 只在两个代理进程里，沙箱与浏览器都看不到
 沙箱只有 .gitconfig，没有 models.json 或模型 token。

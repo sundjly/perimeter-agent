@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unl
 import { join, dirname } from "node:path";
 import { AuditLog, contentHash, type AuditEntry } from "../audit/log.ts";
 import type { ClientCommand, ClientEvent, SessionView, Role } from "../protocol/types.ts";
+import { isSafeScopedIdentityValue, mintScopedToken } from "../modelgw/scoped-token.ts";
 import { HarnessHost } from "../runtime/harness-host.ts";
 import type { ModelGateway } from "../runtime/models.ts";
 import type { EnvironmentHandle } from "../runtime/execution-env.ts";
@@ -16,6 +17,13 @@ export interface SessionOptions {
 	sessionId: string; actor: string; repo: string; team: string; workspace: string; policyFile: string; audit: AuditLog;
 	stateDirectory?: string;
 	model?: ModelGateway;
+	/**
+	 * S4c：模型 scoped 凭证签发密钥（与 modelgw scopedTokenKey 同一密钥，≥32B；网关
+	 * 构造期已做强度与凭据域互异校验）。配置后本会话的模型 Authorization 改为按调用
+	 * mint 的短期 scoped token：归属三元组取服务端会话归属（owner principal/team/sessionId），
+	 * 静态 proxyToken 不再上行模型网关。密钥不进沙箱/客户端/审计/快照。
+	 */
+	modelScopedKey?: Buffer;
 	backend?: ExecutionBackend;
 	approvalTimeoutMs?: number;
 	wiring?: SandboxWiring;
@@ -39,6 +47,12 @@ export interface SessionOptions {
 }
 
 const DEFAULT_PROMPT_LEDGER_MAX_ENTRIES = 10_000;
+
+/**
+ * S4c：模型 scoped 凭证的短 TTL（10min）—— 被窃凭证的可用窗口有界；tokenProvider
+ * 每次模型调用重签，长会话无感。归属只在签发时由网关进程写入，不经任何客户端输入。
+ */
+const MODEL_SCOPED_TOKEN_TTL_MS = 10 * 60_000;
 
 export class Session {
 	#opts: SessionOptions;
@@ -145,6 +159,20 @@ export class Session {
 			}
 
 			if (!model || !model.token || !model.baseUrl || !model.model) throw new Error("缺少可信网关模型配置");
+			// S4c：scoped 模式 —— 归属三元组只取服务端会话归属（owner/team/sessionId），
+			// 不取客户端输入；每次模型调用重签。启动期先校验可签发性：坏归属字段在会话
+			// 启动就 fail-closed（固定类别），不拖到第一次模型调用才在 resolve 里炸。
+			// 未配置 modelScopedKey 时完全不走这支，行为不变。
+			if (opts.modelScopedKey) {
+				for (const [name, value] of [["tenant", opts.actor], ["team", opts.team], ["sessionId", opts.sessionId]] as const) {
+					if (!isSafeScopedIdentityValue(value)) throw new Error(`modelScopedKey 归属字段非法（${name}，固定类别），拒绝会话启动`);
+				}
+				const scopedKey = opts.modelScopedKey;
+				model = {
+					...model,
+					tokenProvider: () => mintScopedToken(scopedKey, { tenant: opts.actor, team: opts.team, sessionId: opts.sessionId, ttlMs: MODEL_SCOPED_TOKEN_TTL_MS }),
+				};
+			}
 			this.#host = await HarnessHost.open({ sessionId: opts.sessionId, file: join(opts.stateDirectory ?? join(opts.workspace, "..", ".state", opts.sessionId), "session.sqlite"),
 				workspace: opts.workspace, repo: opts.repo, team: opts.team, actor: opts.actor, policyFile: opts.policyFile, audit: opts.audit, model,
 				env: this.#env.env, guardEnv: this.#env.guardEnv, approvalTimeoutMs: opts.approvalTimeoutMs, emit: (event) => this.#emit(event),

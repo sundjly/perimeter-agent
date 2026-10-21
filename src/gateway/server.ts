@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { isValidRefGlob, newJti as newGrantJti, signGrant, type GrantClaims } from "../gitproxy/grants.ts";
-import { assertDistinctCredentialDomains, assertMasterKeyStrength } from "./credential-domains.ts";
+import { assertDistinctCredentialDomains, assertMasterKeyStrength, toDomainBytes } from "./credential-domains.ts";
 import { linkBrowserSid, peekSessionsForBrowserSid, takeSessionsForBrowserSid } from "./grant-session-mapping.ts";
 import { computeNextRenewDelayMs, computeGrantExpiry, decideRenew } from "./renew-policy.ts";
 import { OwnedRenewTimer } from "./owned-renew-timer.ts";
@@ -12,6 +12,7 @@ import type { Duplex } from "node:stream";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { type WebSocket, WebSocketServer } from "ws";
 import { AuditLog } from "../audit/log.ts";
+import { assertScopedTokenKey } from "../modelgw/scoped-token.ts";
 import type { ClientCommand, ClientEvent, Role } from "../protocol/types.ts";
 import { parseCommand } from "../protocol/validate.ts";
 import { type ExecutionBackend, LocalBackend, DockerBackend, KubectlBackend, dockerClientEnv, safeDockerCmd } from "./execution-backend.ts";
@@ -77,6 +78,15 @@ export interface GatewayConfig {
 	 * proxyToken 必须与本网关的 token 不同 —— 构造时断言，理由见 SandboxWiring。
 	 */
 	wiring?: SandboxWiring;
+	/**
+	 * S4c：模型 scoped 凭证签发密钥（与模型网关 scopedTokenKey 同一密钥，≥32 字节，
+	 * Buffer 或 hex/base64 字符串皆可，构造期统一为 Buffer）。配置后每个会话的模型
+	 * Authorization 改为按调用签发的短期 scoped token（归属=owner principal/team/sessionId，
+	 * 10min TTL，Session 内 mint），静态 proxyToken 不再上行模型网关；未配置时行为完全不变。
+	 * 密钥只存在于网关进程，凭据域必须与其他秘值互异（构造期断言）；
+	 * production 未配置时启动留固定类别态势审计（不拒启，理由见构造期注释）。
+	 */
+	modelScopedKey?: Buffer | string;
 	/**
 	 * B2 scoped git grants（合同 §A）。配置后网关在新会话创建时签发六维 grant
 	 * （session/repo/rw/writeRefs/exp≤15min/jti/epoch），并维护仅内网的
@@ -287,6 +297,8 @@ export class Gateway {
 	#hosts: ReadonlySet<string> | undefined;
 	#origins: ReadonlySet<string> | undefined;
 	#demoToken?: Buffer;
+	/** S4c：模型 scoped 凭证签发密钥（构造期已归一为 Buffer；undefined = 未配置，行为不变） */
+	#modelScopedKey?: Buffer;
 
 	constructor(cfg: GatewayConfig) {
 		this.#cfg = cfg;
@@ -357,6 +369,20 @@ export class Gateway {
 			throw new Error("模型/git 代理 token 不能等于网关 token：凭据域必须分开");
 		}
 		if (modelToken && modelToken === cfg.wiring?.gitProxyToken) throw new Error("模型 token 不能与 gitProxyToken 相同");
+		// S4c：模型 scoped 签发密钥 —— 强度与凭据域互异都在构造期 fail-fast（未配置时零影响）。
+		if (cfg.modelScopedKey !== undefined) {
+			const scopedKey = toDomainBytes(cfg.modelScopedKey);
+			assertScopedTokenKey(scopedKey); // ≥32B Buffer，与 modelgw 验签侧同一把尺
+			assertDistinctCredentialDomains([
+				{ name: "gateway token", value: cfg.token ?? "" },
+				{ name: "model token", value: modelToken ?? "" },
+				{ name: "gitProxy token", value: cfg.wiring?.gitProxyToken ?? "" },
+				{ name: "gitGrant masterKey", value: cfg.gitGrants?.masterKey ?? "" },
+				{ name: "registry internalToken", value: cfg.gitGrants?.internalToken ?? "" },
+				{ name: "model scoped key", value: scopedKey },
+			]);
+			this.#modelScopedKey = scopedKey;
+		}
 		// B2：grant masterKey / registry internalToken 加入凭据域相异校验（构造期 fail-fast）。
 		// H1（真修）：旧实现 others 含 internalToken 自身，loop 条件 t===internalToken 恒真
 		// → 任何非空 internalToken 的 gitGrants 配置都构造即抛（恒推 bug）。改用同缝纯模块
@@ -462,6 +488,18 @@ export class Gateway {
 				releaseGatewayLock(this.#lock);
 				throw err;
 			}
+		}
+		// S4c：production 缺 modelScopedKey 的态势留痕 —— 选择「明确记录」而非启动即拒，
+		// 理由：网关侧感知不到 modelgw 是否 strictBudget，静态 token 仍是 modelgw 的合法
+		// 认证面；硬失败只会打断既有 production 部署而不新增安全。§4.3 目标态在审计可见，
+		// 供部署评审处置（fixed category，不透传配置原文）。
+		if (cfg.mode === "production" && this.#modelScopedKey === undefined && (cfg.model !== undefined || cfg.wiring?.modelGatewayUrl !== undefined)) {
+			this.#tryAudit({
+				kind: "error",
+				sessionId: "-",
+				actor: "system",
+				summary: "production 未配置 modelScopedKey：模型通道沿用静态代理 token（归属=modelgw defaultTeam），不符合 §4.3 会话 scoped 凭证目标态（固定类别留痕）",
+			});
 		}
 		this.#pkceSecret = randomBytes(32);
 		// R-Q50-3：活会话 grant 续签调度（配置 renewIntervalMs 才启用；可注入 timer）
@@ -1277,6 +1315,8 @@ export class Gateway {
 			audit: this.#audit,
 			...(this.#cfg.promptLedgerMaxEntries !== undefined ? { promptLedgerMaxEntries: this.#cfg.promptLedgerMaxEntries } : {}),
 			model: this.#cfg.model,
+			// S4c：scoped 签发密钥下发到会话（Session #start 内按调用 mint；未配置时零影响）
+			...(this.#modelScopedKey !== undefined ? { modelScopedKey: this.#modelScopedKey } : {}),
 			approvalTimeoutMs: this.#cfg.approvalTimeoutMs,
 			wiring: this.#cfg.wiring,
 			// HOME 放在 workspace 之外：放在里面的话，agent 一句
@@ -2583,6 +2623,16 @@ if (process.argv[1] && import.meta.filename === process.argv[1]) {
 	if (mode !== "demo" && mode !== "production") throw new Error("必须显式设置 PERIMETER_MODE=demo|production（生产不存在默认模式）");
 	const list = (name: string) => (process.env[name] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 	const need = (name: string) => process.env[name] || (() => { throw new Error(`production 缺少 ${name}`); })();
+	// S4c：模型 scoped 凭证签发密钥（与模型网关 scopedTokenKey 同一密钥）。编码二选一：
+	// 纯 hex（偶数长度，32 字节 = 64 个 hex 字符）或 base64url；先按 hex 试，非纯 hex 按
+	// base64url 解（两字母表歧义仅存在于「偶数长度纯 hex」形态，按 hex 解释，口径固定于此）。
+	const scopedKeyEnv = process.env.PERIMETER_MODEL_SCOPED_KEY;
+	let modelScopedKey: Buffer | undefined;
+	if (scopedKeyEnv) {
+		const raw = scopedKeyEnv.trim();
+		modelScopedKey = /^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0 ? Buffer.from(raw, "hex") : Buffer.from(raw, "base64url");
+		if (modelScopedKey.length < 32) throw new Error("PERIMETER_MODEL_SCOPED_KEY 解码后不足 32 字节（接受 hex 或 base64url）");
+	}
 	mkdirSync(join(root, "audit-data"), { recursive: true });
 	const base = {
 		port: Number(process.env.PORT ?? 8787),
@@ -2595,6 +2645,7 @@ if (process.argv[1] && import.meta.filename === process.argv[1]) {
 			baseUrl: process.env.PERIMETER_MODEL_GATEWAY_URL ?? "http://127.0.0.1:8080/v1",
 			token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: process.env.PERIMETER_MODEL ?? "default",
 		},
+		...(modelScopedKey ? { modelScopedKey } : {}),
 	};
 	// S3a：SIGTERM/SIGINT → 有界有序关闭（readiness 翻红 → 拒新 → drain → 逐项收尾 → 释放锁）。
 	// 硬上限兜底：即使某个收尾步骤卡死，进程也以非零码退出，不悬挂。

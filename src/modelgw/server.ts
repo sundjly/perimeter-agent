@@ -113,7 +113,7 @@ export interface ModelGatewayConfig {
 	/**
 	 * S4b：短期 scoped 凭证的 HMAC-SHA256 验签密钥（≥32 字节 Buffer，构造期校验）。
 	 * 配置后接受 `Bearer <scoped token>`：计费归属完全取自凭证（tenant/team/sessionId）。
-	 * 密钥只存在于网关进程；签发走 mintScopedToken()（S4c 接线，不在本轮）。
+	 * 密钥只存在于网关进程；签发在网关进程内 mintScopedToken() 按调用完成（S4c）。
 	 */
 	scopedTokenKey?: Buffer;
 	/** S4b：静态 cfg.token 请求的唯一归属团队（缺省 "default"）。请求头一律不参与归属。 */
@@ -179,8 +179,6 @@ export class ModelGateway {
 	#scan: typeof scanSecrets;
 	/** S4b：持久预算账本（缺省 :memory:），usedTokens 等观测接口全部改读账本 */
 	#ledger: BudgetLedger;
-	/** S4b：scoped jti → 已发操作序号（operationId = jti:序号，服务端生成，不信客户端） */
-	#opSeq = new Map<string, number>();
 	/** close 幂等闸：http.close 二次调用会以 ERR_SERVER_NOT_RUNNING 拒绝 */
 	#closeStarted = false;
 	/** B3：生效的 DLP 模式（构造期已校验） */
@@ -551,6 +549,10 @@ export class ModelGateway {
 			// - 2xx 有 usage：按真实 usage settle（替换预留，幂等）。
 			if (upRes.status >= 400 && upRes.status < 500) {
 				this.#ledger.release(operationId, providerRequestId);
+				// S4c/note-3：4xx 到达前若已发生中止（超时/客户端断开）的竞态组合，额度口径
+				// 不变（仍按「上游明确未接受」release），但中止本身也要留一条固定类别审计 ——
+				// 此前本分支先于 abort 审计分支 return，该组合只 release 不留审计。
+				if (abort.cause !== null) this.#auditAbort(abort, sessionId, actor, team);
 				return;
 			}
 			if (abort.cause !== null && !res.writableEnded) {
@@ -634,12 +636,15 @@ export class ModelGateway {
 		};
 	}
 
-	/** S4b：operationId 服务端生成 —— scoped 凭证用 jti:序号（同凭证多请求可归因），静态用 UUID */
+	/**
+	 * S4b：operationId 服务端生成（客户端字符串零参与）。
+	 * S4c/note-1：不再依赖进程内序号 —— scoped 用 `<jti>:<服务端 UUID>`。旧实现
+	 * `<jti>:<进程内序号>` 在网关重启后序号从 1 重来，与账本里同 jti 的旧记录撞
+	 * PRIMARY KEY（fail-closed 502）；UUID 后缀跨重启唯一，jti 前缀保留归因。静态 token 仍用 UUID。
+	 */
 	#nextOperationId(identity: GatewayIdentity): string {
 		if (identity.via !== "scoped" || identity.jti === undefined) return randomUUID();
-		const seq = (this.#opSeq.get(identity.jti) ?? 0) + 1;
-		this.#opSeq.set(identity.jti, seq);
-		return `${identity.jti}:${seq}`;
+		return `${identity.jti}:${randomUUID()}`;
 	}
 
 	#pickUpstream(req: IncomingMessage, body: string): UpstreamConfig | undefined {
@@ -911,7 +916,7 @@ interface GatewayIdentity {
 	tenant: string;
 	team: string;
 	sessionId: string;
-	/** scoped 凭证唯一 id；operationId 以 jti:序号 派生（服务端生成，不信客户端） */
+	/** scoped 凭证唯一 id；operationId 以 `<jti>:<服务端 UUID>` 派生（服务端生成，不信客户端；S4c/note-1 起不再用进程内序号） */
 	jti?: string;
 }
 

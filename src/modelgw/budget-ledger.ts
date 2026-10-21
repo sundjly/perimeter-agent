@@ -13,10 +13,14 @@ import { DatabaseSync } from "node:sqlite";
  *   cached，再加一遍就是双算 —— 见 server.ts readUsage 注释与 handoff §4.3）。
  * - 同一 operationId 永不重复记账：settle/release/usage_unknown 都是
  *   「reserved|usage_unknown → 终态」的单向迁移，终态再调用是幂等 no-op；
- *   operationId 由服务端生成（scoped jti:序号 或 UUID），客户端字符串不参与。
+ *   operationId 由服务端生成（scoped `<jti>:<UUID>`，S4c/note-1 不再依赖进程内序号；静态用 UUID），客户端字符串不参与。
  * - 重启与恢复：文件账本（node:sqlite + WAL + synchronous=FULL）重开后已用量与在途
  *   预留原样还在；启动恢复把崩溃残留的 reserved 标为 usage_unknown（继续占额度、不释放，
  *   处置权在对账）—— 与 receipt-store「未终态标 unknown」同一哲学。
+ * - 部署约束（S4b 复审 note-2）：**一个 ledgerFile 只允许一个网关实例写入**。多实例共享
+ *   同一文件时，后启动实例的 recoverCrashReservations 会把在途实例的 reserved 标成
+ *   usage_unknown（额度保守冻结直至对账）。与 audit/stateRoot 的单写入者口径一致，
+ *   由部署面保证（单实例独占 stateRoot）；本层不做跨进程锁，也不放宽该假设。
  * - 未配置 ledgerFile 时用 :memory:（同一代码路径，只是不跨进程存活），保持 demo 与
  *   既有测试行为；strictBudget=true 必须显式配 ledgerFile（server.ts 构造期强制）。
  * - 价格版本字段先落库（本轮模型目录价格全 0，MODELGW_PRICE_VERSION="0"）；
@@ -37,7 +41,7 @@ export interface UsageRecord {
 }
 
 export interface ReserveRequest {
-	/** 服务端生成（scoped jti:序号 或 UUID）；PRIMARY KEY —— 重复预留是程序错误，直接抛 */
+	/** 服务端生成（scoped `<jti>:<UUID>` 或 UUID，跨重启唯一）；PRIMARY KEY —— 重复预留是程序错误，直接抛 */
 	operationId: string;
 	tenant: string;
 	team: string;
