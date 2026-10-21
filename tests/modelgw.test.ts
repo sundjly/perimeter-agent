@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
@@ -8,6 +8,7 @@ import { after, test } from "node:test";
 import { AuditLog } from "../src/audit/log.ts";
 import { ModelGateway, assertAllowed } from "../src/modelgw/server.ts";
 import { decodeStrictUtf8, redact, scanJsonDecoded, scanSecrets } from "../src/modelgw/secrets.ts";
+import { mintScopedToken } from "../src/modelgw/scoped-token.ts";
 import { GCP_TOKEN_HOST, clearTokenCache } from "../src/modelgw/upstream-auth.ts";
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -67,6 +68,11 @@ function call(url: string, body: unknown, headers: Record<string, string> = {}) 
 		headers: { authorization: "Bearer gw-token", "content-type": "application/json", ...headers },
 		body: JSON.stringify(body),
 	});
+}
+
+/** S4b：签发测试用 scoped token（归属三元组 + 60s 有效期） */
+function mint(key: Buffer, team: string, sessionId = "s"): string {
+	return mintScopedToken(key, { tenant: "tenant-1", team, sessionId, ttlMs: 60_000 });
 }
 
 // ── 出口 allowlist ──────────────────────────────────────────
@@ -144,30 +150,67 @@ test("Azure 风格的 api-key 认证头", async () => {
 
 // ── 流式与计量 ──────────────────────────────────────────────
 
-test("流式转发上游 SSE 并按 usage 计量", async () => {
-	const { url, gw } = await startGateway();
-	const res = await call(url, { model: "azure/gpt-4o", messages: [] }, { "x-perimeter-team": "platform" });
+test("流式转发上游 SSE 并按 usage 计量（S4b：归属取自 scoped token）", async () => {
+	const key = randomBytes(32);
+	const { url, gw } = await startGateway({ scopedTokenKey: key });
+	// 改动理由（原用例用 x-perimeter-team 头归属）：S4b 后请求头不参与归属，
+	// 计量归属一律来自 scoped token；守护性质不变 —— SSE 透传 + 按 usage 计量到团队。
+	const res = await call(url, { model: "azure/gpt-4o", messages: [] }, { authorization: `Bearer ${mint(key, "platform")}` });
 	const text = await res.text();
 	assert.match(text, /上游回复/);
 	assert.match(text, /\[DONE\]/);
 	assert.equal(gw.usedTokens("platform"), 120);
+	assert.equal(gw.settledTokens("platform"), 120, "完整成功流按真实 usage 结算（替换预留）");
 });
 
-test("计量按团队累计", async () => {
-	const { url, gw } = await startGateway();
-	await (await call(url, { messages: [] }, { "x-perimeter-team": "a" })).text();
-	await (await call(url, { messages: [] }, { "x-perimeter-team": "a" })).text();
-	await (await call(url, { messages: [] }, { "x-perimeter-team": "b" })).text();
+test("计量按团队累计（S4b：scoped token 归属）", async () => {
+	const key = randomBytes(32);
+	const { url, gw } = await startGateway({ scopedTokenKey: key });
+	// 改动理由：同上 —— 头归属改 scoped token 归属；守护性质不变：按团队隔离累计。
+	const a = mint(key, "a");
+	const b = mint(key, "b");
+	await (await call(url, { messages: [] }, { authorization: `Bearer ${a}` })).text();
+	await (await call(url, { messages: [] }, { authorization: `Bearer ${a}` })).text();
+	await (await call(url, { messages: [] }, { authorization: `Bearer ${b}` })).text();
 	assert.equal(gw.usedTokens("a"), 240);
 	assert.equal(gw.usedTokens("b"), 120);
 });
 
-test("配额用尽后拒绝，且留下审计", async () => {
-	const { url, auditFile } = await startGateway({ quotas: [{ team: "small", maxTotalTokens: 100 }] });
-	const first = await call(url, { messages: [] }, { "x-perimeter-team": "small" });
+test("S4b 负控：伪造 x-perimeter-team / x-perimeter-actor 头不能切换计费团队", async () => {
+	const key = randomBytes(32);
+	const { url, gw } = await startGateway({ scopedTokenKey: key, defaultTeam: "ops" });
+	// scoped token 归属 team-a：带上伪造头，用量必须仍记在 team-a
+	const token = mint(key, "team-a");
+	await (await call(url, { messages: [] }, {
+		authorization: `Bearer ${token}`,
+		"x-perimeter-team": "team-b",
+		"x-perimeter-actor": "mallory",
+	})).text();
+	assert.equal(gw.usedTokens("team-a"), 120);
+	assert.equal(gw.usedTokens("team-b"), 0);
+	// 静态 token 归属 defaultTeam（ops）：伪造头同样无效
+	await (await call(url, { messages: [] }, { "x-perimeter-team": "team-b" })).text();
+	assert.equal(gw.usedTokens("team-b"), 0);
+	assert.equal(gw.usedTokens("ops"), 120);
+	assert.equal(gw.usedTokens("default"), 0);
+});
+
+test("配额用尽后拒绝，且留下审计（S4b：按预留占额度，超额不转发）", async () => {
+	const key = randomBytes(32);
+	// 改动理由：原用例靠「完成后才扣 usage」凑出同样结局；S4b 配额按在途预留占额度
+	// （防并发超卖）。预留估算 = ceil(15/4)=4 + maxOutputTokens(50) = 54 ≤ 150 放行；
+	// 首请求结算 120 后，第二请求 120+54 > 150 → 429。守护性质不变：超额拒绝 + 审计留痕。
+	const { url, auditFile } = await startGateway({
+		scopedTokenKey: key,
+		quotas: [{ team: "small", maxTotalTokens: 150 }],
+		maxOutputTokens: 50,
+	});
+	const token = mint(key, "small");
+	const first = await call(url, { messages: [] }, { authorization: `Bearer ${token}` });
 	await first.text();
-	const second = await call(url, { messages: [] }, { "x-perimeter-team": "small" });
+	const second = await call(url, { messages: [] }, { authorization: `Bearer ${token}` });
 	assert.equal(second.status, 429);
+	assert.match(await second.text(), /团队 token 配额已用尽/);
 
 	const entries = [];
 	for await (const e of AuditLog.replay(auditFile)) entries.push(e);
@@ -724,9 +767,13 @@ test("签名覆盖的头集合 ⊆ 实际发出的头集合，且取值相同", 
 });
 
 test("缓存亲和头与 cache_control 请求体原样转发，审计使用 sessionId", async () => {
-	const env = await startGateway();
+	const key = randomBytes(32);
+	const env = await startGateway({ scopedTokenKey: key });
 	const body = { model: "azure/model", prompt_cache_key: "stable", messages: [{ role: "user", content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] }] };
-	const response = await call(env.url, body, { session_id: "stable", "x-session-affinity": "stable" });
+	// 改动理由：审计 sessionId 现在取自 scoped token 声明（头不参与归属）；
+	// session_id / x-session-affinity 头继续作为 cache 亲和诊断原样转发上游，守护性质不变。
+	const token = mintScopedToken(key, { tenant: "tenant-1", team: "affinity", sessionId: "stable", ttlMs: 60_000 });
+	const response = await call(env.url, body, { authorization: `Bearer ${token}`, session_id: "stable", "x-session-affinity": "stable" });
 	await response.text();
 	assert.deepEqual(JSON.parse(env.up.seen[0]!.body), body);
 	assert.equal(env.up.seen[0]!.headers.session_id, "stable");

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import {
 	createServer,
@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { AuditLog } from "../src/audit/log.ts";
 import { ModelGateway } from "../src/modelgw/server.ts";
+import { mintScopedToken } from "../src/modelgw/scoped-token.ts";
 import { GCP_TOKEN_HOST, clearTokenCache } from "../src/modelgw/upstream-auth.ts";
 
 // S4a：模型网关四段 deadline（connect/首 token/idle/总时长）、写回背压、断流取消上游。
@@ -293,7 +294,10 @@ test("S4a：connect/header 超时 → 504 固定文案、上游连接被中止�
 	const hit = entries.find((e) => e.summary.includes("segment=connect"));
 	assert.ok(hit, "应有 connect 段超时审计");
 	assert.ok(hit.summary.includes("usage_unknown"), "中止时计量必须标注 usage_unknown");
-	assert.equal(gw.usedTokens("default"), 0, "中止不得计费");
+	// S4b 语义更新（守护性质不变：中止不得按 0 假成功结算）：usage_unknown 保守保留
+	// 预留、等待对账；结算口径 settledTokens 必须为 0。
+	assert.equal(gw.settledTokens("default"), 0, "中止不得按 0 假成功结算");
+	assert.ok(gw.usedTokens("default") > 0, "usage_unknown 保守保留预留（额度仍被占）");
 });
 
 // ── 四段 deadline：首 token ────────────────────────────────
@@ -419,7 +423,7 @@ test("S4a：慢读客户端触发背压 → 网关暂停读上游（缓冲有界
 
 // ── 客户端断开 → 取消上游 ──────────────────────────────────
 
-test("S4a：客户端中途断开 → 上游请求立即被 abort（无僵尸上游）、审计 usage_unknown、不计费", async () => {
+test("S4a：客户端中途断开 → 上游请求立即被 abort（无僵尸上游）、审计 usage_unknown（S4b：预留保守保留，不写 0）", async () => {
 	const up = await startFake((_req, res) => {
 		res.writeHead(200, SSE_HEADERS);
 		res.write("data: first\n\n");
@@ -436,7 +440,9 @@ test("S4a：客户端中途断开 → 上游请求立即被 abort（无僵尸上
 	const hit = await waitForAudit(auditFile, (e) => e.summary.includes("客户端断开"));
 	assert.ok(hit, "应有断开的固定类别审计");
 	assert.ok(hit.summary.includes("usage_unknown"));
-	assert.equal(gw.usedTokens("default"), 0);
+	// S4b 语义更新（守护性质不变：不按 0 假成功 + 无僵尸上游）：断开 → usage_unknown 保留预留
+	assert.equal(gw.settledTokens("default"), 0);
+	assert.ok(gw.usedTokens("default") > 0);
 });
 
 // ── 正控：正常流不受影响 ───────────────────────────────────
@@ -448,10 +454,15 @@ test("S4a 正控：正常流在 deadline 内完整通过，计量与既有行为
 		res.write(`data: ${JSON.stringify({ choices: [{}], usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 } })}\n\n`);
 		res.end("data: [DONE]\n\n");
 	});
+	const key = randomBytes(32);
 	const { url, gw, auditFile } = await startGateway(up, {
+		scopedTokenKey: key,
 		deadlines: { connectMs: 1000, firstTokenMs: 1000, idleMs: 1000, totalMs: 5000 },
 	});
-	const res = await call(url, { model: "azure/gpt-4o", messages: [] }, { "x-perimeter-team": "plat" });
+	// 改动理由：x-perimeter-team 头不再参与归属，计量归属改 scoped token；
+	// 守护性质不变：正常流完整通过 + 按真实 usage 计量到团队。
+	const token = mintScopedToken(key, { tenant: "tenant-1", team: "plat", sessionId: "s", ttlMs: 60_000 });
+	const res = await call(url, { model: "azure/gpt-4o", messages: [] }, { authorization: `Bearer ${token}` });
 	const text = await res.text();
 	assert.match(text, /上游回复/);
 	assert.match(text, /\[DONE\]/);
