@@ -11,17 +11,59 @@ const url = new URL(arg("--url") ?? "http://127.0.0.1:8787");
 if (!["http:", "https:", "ws:", "wss:"].includes(url.protocol)) throw new Error("不支持的连接协议");
 if (url.protocol === "http:") url.protocol = "ws:";
 if (url.protocol === "https:") url.protocol = "wss:";
-url.searchParams.set("token", arg("--token") ?? process.env.PERIMETER_TOKEN ?? "dev-token");
+const bearerToken = arg("--bearer");
+const explicitToken = arg("--token");
+const explicitActor = arg("--actor");
+
+if (bearerToken !== undefined && explicitToken !== undefined) {
+	console.error("冲突参数：不能同时指定 --bearer 与 --token");
+	process.exit(1);
+}
+if (bearerToken !== undefined && explicitActor !== undefined) {
+	console.error("冲突参数：使用 --bearer 生产身份时禁止指定 --actor");
+	process.exit(1);
+}
+
 url.searchParams.set("session", arg("--session") ?? "");
-url.searchParams.set("actor", arg("--actor") ?? "demo@local");
+const headers: Record<string, string> = {};
+
+if (bearerToken) {
+	headers["Authorization"] = `Bearer ${bearerToken}`;
+} else {
+	const rawToken = explicitToken ?? process.env.PERIMETER_TOKEN;
+	const queryToken = rawToken ?? "dev-token";
+	url.searchParams.set("token", queryToken);
+	url.searchParams.set("actor", explicitActor ?? "demo@local");
+	if (rawToken) headers["Authorization"] = `Bearer ${rawToken}`;
+}
 let state = initialState();
 const shownMessages = new Map<string, string>();
 const shownApprovals = new Set<string>();
 const shownTools = new Map<string, string>();
 let attached = "";
-const ws = new WebSocket(url);
+const ws = new WebSocket(url, { headers });
 const input = createInterface({ input: process.stdin, output: process.stdout });
-ws.on("open", () => print(labels.connected, "输入消息；/steer 文本；/approve id allow|deny；/abort；/share actor editor|viewer；/unshare actor"));
+// R76：连接建立前从 stdin 读到的命令排队（原缺陷：WS 未 OPEN 直接 return 丢弃，
+// 首次 /share 无效），open 后按序发送。
+const pendingLines: string[] = [];
+let wsOpen = false;
+let pendingCloseAfterFlush = false;
+const handleLine = (line: string): void => {
+	if (!wsOpen) { pendingLines.push(line); return; }
+	if (ws.readyState !== ws.OPEN) return;
+	if (line === "/abort") ws.send(JSON.stringify({ type: "abort" }));
+	else if (line.startsWith("/share ")) { const [, actor, role] = line.split(" "); ws.send(JSON.stringify({ type: "share", actor, role })); }
+	else if (line.startsWith("/unshare ")) ws.send(JSON.stringify({ type: "unshare", actor: line.slice(9) }));
+	else if (line.startsWith("/approve ")) { const [, approvalId, decision] = line.split(" "); ws.send(JSON.stringify({ type: "approve", approvalId, decision })); }
+	else ws.send(JSON.stringify({ type: line.startsWith("/steer ") ? "steer" : "prompt", text: line.replace(/^\/steer /, ""), requestId: randomUUID() }));
+};
+input.on("line", handleLine);
+ws.on("open", () => {
+	wsOpen = true;
+	print(labels.connected, "输入消息；/steer 文本；/approve id allow|deny；/abort；/share actor editor|approver|viewer；/unshare actor");
+	for (const line of pendingLines.splice(0)) handleLine(line); // open 后按序补发排队命令
+	if (pendingCloseAfterFlush) ws.close(); // stdin 已结束：补发完再关（管道输入时序）
+});
 ws.on("message", (raw) => {
 	const frame = JSON.parse(String(raw)) as { event?: ClientEvent; message?: string };
 	if (!frame.event) { if (frame.message) print(frame.message); return; }
@@ -42,14 +84,11 @@ ws.on("message", (raw) => {
 	}
 	if (frame.event.type === "error") print(frame.event.message);
 });
-input.on("line", (line) => {
-	if (ws.readyState !== ws.OPEN) return;
-	if (line === "/abort") ws.send(JSON.stringify({ type: "abort" }));
-	else if (line.startsWith("/share ")) { const [, actor, role] = line.split(" "); ws.send(JSON.stringify({ type: "share", actor, role })); }
-	else if (line.startsWith("/unshare ")) ws.send(JSON.stringify({ type: "unshare", actor: line.slice(9) }));
-	else if (line.startsWith("/approve ")) { const [, approvalId, decision] = line.split(" "); ws.send(JSON.stringify({ type: "approve", approvalId, decision })); }
-	else ws.send(JSON.stringify({ type: line.startsWith("/steer ") ? "steer" : "prompt", text: line.replace(/^\/steer /, ""), requestId: randomUUID() }));
-});
 ws.on("close", () => input.close());
-input.on("close", () => ws.close());
+input.on("close", () => {
+	// R76：stdin 关闭时若 WS 尚未 open（管道输入 echo '/share …' | attach），排队命令
+	// 还没发出——标记待关闭，open 并补发完排队命令后再关；已 open 时行为不变。
+	if (!wsOpen) pendingCloseAfterFlush = true;
+	else ws.close();
+});
 ws.on("error", (error) => { console.error(error.message); process.exitCode = 1; input.close(); });

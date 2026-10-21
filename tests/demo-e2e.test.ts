@@ -23,15 +23,14 @@ import type { ClientEvent } from "../src/protocol/types.ts";
  *   git-http-server.mjs(本地上游，子进程) → GitCredentialProxy(registry 真实轮询
  *   Gateway 的 /internal/git/registry，listen 后回填 url，同 demo)
  *
- * 全链路：会话启动经代理 clone → 模型 write 源码文件（放行）→ bash git push 被
- * 审批门拦下 → approver 批准 → 推送真的到达上游 → 审计 identity 来自 grant →
- * 沙箱（workspace + HOME）全树零凭据泄漏。
+ * 两个用例：
+ * ① approver 由会话元数据**预置**（生产里成员配置同样是带外动作），链路 clone→write→
+ *    push 审批→批准→上游。
+ * ② R74 主流程：不预置 approver——owner 运行中 share 新增 approver（acl 变更撤旧 grant
+ *    并以新 aclVersion 重签，方案 a），approver 再接入批准，push 真达上游。
  *
- * 与 scripts/demo.ts 的唯一差异：session 元数据**预置** approver 角色（生产里成员
- * 配置同样是带外动作）。这是刻意的，不是绕过：B2 设计是「acl 变更即撤销旧 grant」，
- * 而审批命令只认 approver 角色——若在运行中 share 一个 approver，grant 恰在 push
- * 之前被撤销，C3 流程自相矛盾。成员带外预置不触发 ACL 变更，链路其余接线与 demo
- * 完全一致（真实轮询、真实子进程、真实 git 二进制）。
+ * 全链路断言：clone 经代理、push 真达上游、审计 identity 来自 grant、沙箱（workspace +
+ * HOME）全树零凭据泄漏。全部清理（Gateway/代理/模型网关 close、kill 子进程、ws close）。
  */
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
@@ -101,7 +100,15 @@ function readAllFiles(dir: string, out: { path: string; text: string }[] = []): 
 	return out;
 }
 
-test("C3：demo 双进程拓扑真实跑通 —— 会话启动经代理 clone、审批后 push 到达上游、grant 身份留痕、零凭据泄漏", async () => {
+/** 按 scripts/demo.ts 拓扑组装双进程环境；approverPreseeded=true 时元数据预置 approver 成员 */
+async function startC3Topology(opts: { approverPreseeded?: boolean } = {}): Promise<{
+	dir: string;
+	workspaceRoot: string;
+	upstreamRepo: string;
+	headBefore: string;
+	gwPort: number;
+	gitAuditPath: string;
+}> {
 	// ① mock 模型（子进程）：一次 write 源码文件 + 一次 bash git add/commit/push + 结尾文本
 	const script = [
 		{ tool: "write", args: { path: "src/timeout.ts", content: "export const TIMEOUT_MS = 30_000;\n" } },
@@ -168,21 +175,24 @@ test("C3：demo 双进程拓扑真实跑通 —— 会话启动经代理 clone�
 	const gitProxyPort = await gitProxy.listen();
 
 	// ⑤ Gateway（gitGrants 开；wiring 指向代理）。
-	// 会话元数据预置 approver（成员带外预置，不触发 ACL 变更撤销 grant，见文件头说明）。
 	// stateRoot 显式指定：默认值是 workspaceRoot+".state" 的字符串拼接（无路径分隔符），
-	// 预置路径必须与之完全一致才能被网关读到（R72-v5 教训：路径不一致则成员预置被静默忽略）。
+	// 预置路径必须与之完全一致才能被网关读到（R72-v5 教训）。
+	// approverPreseeded 时会话元数据预置 approver 成员（成员带外预置，不触发 ACL 变更撤销
+	// grant）；share 用例不预置——运行中 share 新增 approver（R74 重签机制）。
 	const workspaceRoot = join(dir, "workspaces");
 	const stateRoot = join(dir, "state");
-	const metaDir = join(stateRoot, "sessions", SID);
-	mkdirSync(metaDir, { recursive: true });
-	// 网关把 stateRoot/sessions 的存在视为「已初始化实例」：revocations.json 缺失即
-	// fail-closed 拒启动（正确的生产保护，勿改生产）。预置空吊销表，格式与
-	// #loadRevocations 的解析一致（revoked 数组）。
-	writeFileSync(join(stateRoot, "revocations.json"), JSON.stringify({ revoked: [], updatedAt: new Date().toISOString() }), { mode: 0o600 });
-	writeFileSync(join(metaDir, "meta.json"), JSON.stringify({
-		id: SID, owner: OWNER, repo: "git.internal/app.git", team: "platform", createdAt: new Date().toISOString(),
-		members: { [OWNER]: "owner", [APPROVER]: "approver" }, aclVersion: 1,
-	}));
+	if (opts.approverPreseeded) {
+		const metaDir = join(stateRoot, "sessions", SID);
+		mkdirSync(metaDir, { recursive: true });
+		// 网关把 stateRoot/sessions 的存在视为「已初始化实例」：revocations.json 缺失即
+		// fail-closed 拒启动（正确的生产保护，勿改生产）。预置空吊销表，格式与
+		// #loadRevocations 的解析一致（revoked 数组）。
+		writeFileSync(join(stateRoot, "revocations.json"), JSON.stringify({ revoked: [], updatedAt: new Date().toISOString() }), { mode: 0o600 });
+		writeFileSync(join(metaDir, "meta.json"), JSON.stringify({
+			id: SID, owner: OWNER, repo: "git.internal/app.git", team: "platform", createdAt: new Date().toISOString(),
+			members: { [OWNER]: "owner", [APPROVER]: "approver" }, aclVersion: 1,
+		}));
+	}
 	const gateway = new Gateway({
 		mode: "demo",
 		port: 0,
@@ -209,6 +219,8 @@ test("C3：demo 双进程拓扑真实跑通 —— 会话启动经代理 clone�
 		},
 		repoUrl: "https://git.internal/app.git",
 		approvalTimeoutMs: 120_000,
+		// 同 demo.ts：策略作用域由服务端推导（share 例不预置元数据时，team 落 platform）
+		resolveScope: () => ({ repo: "demo-app", team: "platform" }),
 	});
 	cleanups.push(() => gateway.close());
 	const gwPort = await gateway.listen();
@@ -236,24 +248,26 @@ test("C3：demo 双进程拓扑真实跑通 —— 会话启动经代理 clone�
 			await new Promise((r) => setTimeout(r, 100));
 		}
 	}
+	return { dir, workspaceRoot, upstreamRepo, headBefore, gwPort, gitAuditPath: join(dir, "gitproxy.jsonl") };
+}
 
-	// ⑥ 双 WS 连接：owner 发任务，approver 审批。非 event 帧（control 错误/close）全部
-	// 收集进 frames —— 否则 attach 被拒/命令被拒时无任何可见证据（R72-v4 教训）
-	const events: ClientEvent[] = [];
-	const frames: string[] = [];
-	const owner = new WebSocket(`ws://127.0.0.1:${gwPort}/?token=${GATEWAY_TOKEN}&actor=${OWNER}&session=${SID}`);
-	owner.on("message", (raw) => {
-		const m = JSON.parse(String(raw));
-		if (m.type === "control") frames.push(`owner control: ${JSON.stringify(m)}`);
-		else if (m.event) events.push(m.event);
-	});
-	owner.on("close", (code, reason) => frames.push(`owner close: ${code} ${String(reason)}`));
-	await new Promise((r) => owner.once("open", r));
-	cleanups.push(() => void owner.close());
+const SECRETS = [GATEWAY_TOKEN, PROXY_TOKEN, UPSTREAM_GIT_TOKEN, UPSTREAM_AUTH, INTERNAL_TOKEN, MASTER_KEY.toString("hex"), MASTER_KEY.toString("base64")];
+const mask = (s: string): string => SECRETS.reduce((acc, t) => (t ? acc.split(t).join("***") : acc), s);
 
-	// 超时诊断：error 事件 + 全部 control/close 帧（已知秘密值替换为 ***，截断到 500 字符）
-	const SECRETS = [GATEWAY_TOKEN, PROXY_TOKEN, UPSTREAM_GIT_TOKEN, UPSTREAM_AUTH, INTERNAL_TOKEN, MASTER_KEY.toString("hex"), MASTER_KEY.toString("base64")];
-	const mask = (s: string): string => SECRETS.reduce((acc, t) => (t ? acc.split(t).join("***") : acc), s);
+/** 会话连接 + 事件/控制帧收集（超时诊断用）+ 有界 waitFor（不得 sleep 轮询无上限） */
+function makeSessionTools(gwPort: number, events: ClientEvent[], frames: string[]) {
+	const connect = async (actor: string): Promise<WebSocket> => {
+		const ws = new WebSocket(`ws://127.0.0.1:${gwPort}/?token=${GATEWAY_TOKEN}&actor=${actor}&session=${SID}`);
+		ws.on("message", (raw) => {
+			const m = JSON.parse(String(raw));
+			if (m.type === "control") frames.push(`${actor} control: ${JSON.stringify(m)}`);
+			else if (m.event) events.push(m.event);
+		});
+		ws.on("close", (code, reason) => frames.push(`${actor} close: ${code} ${String(reason)}`));
+		await new Promise((r) => ws.once("open", r));
+		cleanups.push(() => void ws.close());
+		return ws;
+	};
 	const errorDump = (): string => {
 		const errs = events.filter((e) => e.type === "error").map((e) => JSON.stringify(e));
 		return mask(([...errs, ...frames].join(" | ") || "(无 error/控制帧)").slice(0, 500));
@@ -261,55 +275,16 @@ test("C3：demo 双进程拓扑真实跑通 —— 会话启动经代理 clone�
 	const waitFor = async (pred: () => boolean, ms = 30_000): Promise<void> => {
 		const deadline = Date.now() + ms;
 		while (!pred()) {
-			if (Date.now() > deadline) throw new Error(`超时；已收到事件：${events.map((e) => e.type).join(",")}；error 内容：${errorDump()}`);
+			if (Date.now() > deadline) throw new Error(`超时；已收到事件：${events.map((e) => e.type).join(",")}；error/帧：${errorDump()}`);
 			await new Promise((r) => setTimeout(r, 20));
 		}
 	};
+	return { connect, waitFor, errorDump };
+}
 
-	// 会话启动完成 = clone 已经经代理发生（#start 内 clone 先于 session.ready）
-	await waitFor(() => events.some((e) => e.type === "session.ready"));
-	assert.ok(existsSync(join(workspaceRoot, SID, ".git")), "会话启动必须经凭据代理完成 clone");
-	assert.match(readFileSync(join(workspaceRoot, SID, "README.md"), "utf8"), /C3 upstream seed/, "clone 的必须是上游种子内容");
-
-	const approver = new WebSocket(`ws://127.0.0.1:${gwPort}/?token=${GATEWAY_TOKEN}&actor=${APPROVER}&session=${SID}`);
-	approver.on("message", (raw) => {
-		const m = JSON.parse(String(raw));
-		if (m.type === "control") frames.push(`approver control: ${JSON.stringify(m)}`);
-		else if (m.event) events.push(m.event);
-	});
-	approver.on("close", (code, reason) => frames.push(`approver close: ${code} ${String(reason)}`));
-	await new Promise((r) => approver.once("open", r));
-	cleanups.push(() => void approver.close());
-	await waitFor(() => events.some((e) => e.type === "session.snapshot"));
-
-	owner.send(JSON.stringify({ type: "prompt", requestId: randomUUID(), text: "修复登录超时并推送到 main" }));
-
-	// write 放行 → bash git push 被审批门拦下（policy: git push* require_approval）
-	await waitFor(() => events.some((e) => e.type === "approval.request"));
-	const approval = events.find((e) => e.type === "approval.request") as { approvalId: string };
-	approver.send(JSON.stringify({ type: "approve", approvalId: approval.approvalId, decision: "allow" }));
-
-	await waitFor(() => events.some((e) => e.type === "agent.end" && !e.willRetry));
-
-	// 审批后上游 main 真的出现该提交
-	const log = (await git(["log", "--oneline", "-3", "refs/heads/main"], upstreamRepo)).stdout;
-	assert.match(log, /fix: raise login timeout/, "审批后的 push 必须真实到达上游");
-	const headAfter = (await git(["rev-parse", "refs/heads/main"], upstreamRepo)).stdout.trim();
-	assert.notEqual(headAfter, headBefore, "上游 main HEAD 必须因 push 前进");
-	// 源码文件也真实写进了沙箱工作区
-	assert.match(readFileSync(join(workspaceRoot, SID, "src", "timeout.ts"), "utf8"), /TIMEOUT_MS/);
-
-	// 审计：git.push allow，identity 来自 grant claims（session/principal/tenant），非客户端自报
-	const gitEntries = [];
-	for await (const e of AuditLog.replay(join(dir, "gitproxy.jsonl"))) gitEntries.push(e);
-	const push = gitEntries.find((e) => e.kind === "git.push" && e.verdict === "allow");
-	assert.ok(push, "push 必须留痕");
-	assert.equal(push!.sessionId, SID, "审计 sessionId 必须来自 grant claims.session");
-	assert.equal(push!.actor, OWNER, "审计 actor 必须来自 grant claims.principal");
-	assert.equal(push!.team, "platform", "审计 team 必须来自 grant claims.tenant");
-
-	// 沙箱侧（workspace + 沙箱 HOME）全树零凭据泄漏
-	const files = [...readAllFiles(join(workspaceRoot, SID)), ...readAllFiles(join(workspaceRoot, ".homes", SID))];
+/** 沙箱（workspace + HOME）全树六类秘密零泄漏 */
+function assertSandboxClean(workspaceRoot: string, sid: string): void {
+	const files = [...readAllFiles(join(workspaceRoot, sid)), ...readAllFiles(join(workspaceRoot, ".homes", sid))];
 	assert.ok(files.length > 3, "应当扫到成组文件，否则这条断言是空转");
 	for (const f of files) {
 		assert.ok(!f.text.includes(UPSTREAM_GIT_TOKEN), `上游 git 凭据泄漏到 ${f.path}`);
@@ -319,4 +294,109 @@ test("C3：demo 双进程拓扑真实跑通 —— 会话启动经代理 clone�
 		assert.ok(!f.text.includes(GATEWAY_TOKEN), `网关 token 泄漏到 ${f.path} —— agent 读到就能批准自己的审批`);
 		assert.ok(!f.text.includes(PROXY_TOKEN), `模型代理 token 泄漏到 ${f.path}`);
 	}
+}
+
+test("C3：demo 双进程拓扑真实跑通 —— 会话启动经代理 clone、审批后 push 到达上游、grant 身份留痕、零凭据泄漏（approver 预置）", async () => {
+	const { dir, workspaceRoot, upstreamRepo, headBefore, gwPort, gitAuditPath } = await startC3Topology({ approverPreseeded: true });
+	const events: ClientEvent[] = [];
+	const frames: string[] = [];
+	const { connect, waitFor, errorDump } = makeSessionTools(gwPort, events, frames);
+
+	const ownerWs = await connect(OWNER);
+	// 会话启动完成 = clone 已经经代理发生（#start 内 clone 先于 session.ready）
+	await waitFor(() => events.some((e) => e.type === "session.ready"));
+	assert.ok(existsSync(join(workspaceRoot, SID, ".git")), "会话启动必须经凭据代理完成 clone");
+	assert.match(readFileSync(join(workspaceRoot, SID, "README.md"), "utf8"), /C3 upstream seed/, "clone 的必须是上游种子内容");
+
+	const approverWs = await connect(APPROVER);
+	await waitFor(() => events.some((e) => e.type === "session.snapshot"));
+
+	ownerWs.send(JSON.stringify({ type: "prompt", requestId: randomUUID(), text: "修复登录超时并推送到 main" }));
+
+	// write 放行 → bash git push 被审批门拦下（policy: git push* require_approval）
+	await waitFor(() => events.some((e) => e.type === "approval.request"));
+	const approval = events.find((e) => e.type === "approval.request") as { approvalId: string };
+	approverWs.send(JSON.stringify({ type: "approve", approvalId: approval.approvalId, decision: "allow" }));
+
+	await waitFor(() => events.some((e) => e.type === "agent.end" && !e.willRetry));
+
+	// 审批后上游 main 真的出现该提交
+	const log = (await git(["log", "--oneline", "-3", "refs/heads/main"], upstreamRepo)).stdout;
+	assert.match(log, /fix: raise login timeout/, "审批后的 push 必须真实到达上游");
+	const headAfter = (await git(["rev-parse", "refs/heads/main"], upstreamRepo)).stdout.trim();
+	assert.notEqual(headAfter, headBefore, "上游 main HEAD 必须因 push 前进");
+	assert.match(readFileSync(join(workspaceRoot, SID, "src", "timeout.ts"), "utf8"), /TIMEOUT_MS/);
+
+	// 审计：git.push allow，identity 来自 grant claims（session/principal/tenant），非客户端自报
+	const gitEntries = [];
+	for await (const e of AuditLog.replay(gitAuditPath)) gitEntries.push(e);
+	const push = gitEntries.find((e) => e.kind === "git.push" && e.verdict === "allow");
+	assert.ok(push, "push 必须留痕");
+	assert.equal(push!.sessionId, SID, "审计 sessionId 必须来自 grant claims.session");
+	assert.equal(push!.actor, OWNER, "审计 actor 必须来自 grant claims.principal");
+	assert.equal(push!.team, "platform", "审计 team 必须来自 grant claims.tenant");
+
+	assertSandboxClean(workspaceRoot, SID);
+	void errorDump;
+});
+
+test("C3：运行中 share 新增 approver 后审批 push 到达上游（R74 重签：share 即撤旧签新）", async () => {
+	// 不预置 approver 成员——真实四眼流：owner 运行中 share approver → acl 变更撤旧 grant
+	// 并以新 aclVersion 重签（R74 方案 a，agent 无感）→ approver 接入批准 → push 真达上游。
+	const { dir, workspaceRoot, upstreamRepo, headBefore, gwPort, gitAuditPath } = await startC3Topology({ approverPreseeded: false });
+	const events: ClientEvent[] = [];
+	const frames: string[] = [];
+	const { connect, waitFor, errorDump } = makeSessionTools(gwPort, events, frames);
+
+	const ownerWs = await connect(OWNER);
+	await waitFor(() => events.some((e) => e.type === "session.ready"));
+	assert.ok(existsSync(join(workspaceRoot, SID, ".git")), "会话启动必须经凭据代理完成 clone");
+
+	// owner 运行中 share 新增 approver（防自批：share 人 ≠ 被分享人，规则未放宽）
+	ownerWs.send(JSON.stringify({ type: "share", actor: APPROVER, role: "approver" }));
+
+	// R74：share 即撤旧 grant 并以新 aclVersion 重签——沙箱 HOME .gitconfig 的 grant 随即更换
+	const home = join(workspaceRoot, ".homes", SID);
+	const grantFromHome = (): string => {
+		const m = readFileSync(join(home, ".gitconfig"), "utf8").match(/x-session:([^@\s]+)@/);
+		assert.ok(m, "沙箱 HOME .gitconfig 必须携带 grant");
+		return m[1]!;
+	};
+	const grant0 = grantFromHome();
+	const deadline = Date.now() + 5_000;
+	while (grantFromHome() === grant0) {
+		if (Date.now() > deadline) throw new Error("share 后 grant 未重签（HOME .gitconfig 未更换）");
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	const grant1 = grantFromHome();
+	assert.notEqual(grant1, grant0, "重签后的 grant 必须是新串");
+
+	// approver 接入并批准
+	const approverWs = await connect(APPROVER);
+	await waitFor(() => events.some((e) => e.type === "session.snapshot"));
+
+	ownerWs.send(JSON.stringify({ type: "prompt", requestId: randomUUID(), text: "修复登录超时并推送到 main" }));
+	await waitFor(() => events.some((e) => e.type === "approval.request"));
+	const approval = events.find((e) => e.type === "approval.request") as { approvalId: string };
+	approverWs.send(JSON.stringify({ type: "approve", approvalId: approval.approvalId, decision: "allow" }));
+
+	await waitFor(() => events.some((e) => e.type === "agent.end" && !e.willRetry));
+
+	// push 用的是重签后的 grant（旧 jti 已吊销）——上游真到达
+	const log = (await git(["log", "--oneline", "-3", "refs/heads/main"], upstreamRepo)).stdout;
+	assert.match(log, /fix: raise login timeout/, "share 后审批的 push 必须真实到达上游");
+	const headAfter = (await git(["rev-parse", "refs/heads/main"], upstreamRepo)).stdout.trim();
+	assert.notEqual(headAfter, headBefore);
+
+	// 审计：push allow 且 identity 来自重签 grant（session/tenant 真值）
+	const gitEntries = [];
+	for await (const e of AuditLog.replay(gitAuditPath)) gitEntries.push(e);
+	const push = gitEntries.find((e) => e.kind === "git.push" && e.verdict === "allow");
+	assert.ok(push, "push 必须留痕");
+	assert.equal(push!.sessionId, SID);
+	assert.equal(push!.actor, OWNER);
+	assert.equal(push!.team, "platform");
+
+	assertSandboxClean(workspaceRoot, SID);
+	void errorDump;
 });

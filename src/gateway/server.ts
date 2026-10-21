@@ -768,6 +768,56 @@ export class Gateway {
 		}
 	}
 
+	/** R74：owner 在途连接的服务端验证 principal（生产 authorizeResource/resolveScope 判定用；demo 无 principal） */
+	#livePrincipal(actor: string): Principal | undefined {
+		for (const c of this.#conns) {
+			if (c.actor === actor && !c.closed && !c.revoked && c.principal) return c.principal;
+		}
+		return undefined;
+	}
+
+	/** R74（方案 a）：acl 变更撤销后的合法补救——以新 aclVersion 重签并投递（renew 同缝事务：
+	 * plan/apply/save 先于投递 → writeGitCredentialConfig；save/writer 失败回滚
+	 * retireUndeliveredNew/rollbackRotation——旧不复活、新不可用），失败抛出由回调侧
+	 * 固定类别审计。调用前提：旧 jti 已全撤销并持久化、会话存活、owner 已过授权判定。 */
+	#remintGitGrant(sessionId: string, owner: string, scope: { principal: string; tenant: string; repo: string; maxExpAt: number | null }, aclVersion: number): void {
+		if (!this.#cfg.gitGrants) throw new Error("gitGrants 未配置，不能签发");
+		let entry = this.#gitGrantActive.get(sessionId);
+		const freshEntry = !entry;
+		if (!entry) {
+			// R74-v4：撤销后新建的 entry 必须登记回 map——否则快照里无该会话，代理永不放行
+			//（真实缺陷：签发+写 HOME 成功但 registry 无 session）。
+			entry = { sessionId, principal: scope.principal, tenant: scope.tenant, repo: scope.repo, aclVersion, jtis: new Set(), maxExpAt: scope.maxExpAt, currentExpAt: 0 };
+			this.#gitGrantActive.set(sessionId, entry);
+		} else {
+			entry.aclVersion = aclVersion;
+		}
+		const oldCurrentExpAt = entry.currentExpAt;
+		const signed = this.#signGrantClaims(sessionId, entry.principal, entry.tenant, entry.repo, aclVersion, entry.maxExpAt ?? null);
+		const plan = planRotation(entry.jtis, (j) => this.#gitGrantRevoked.has(j), signed.jti);
+		try {
+			applyRotation(entry, this.#gitGrantRevoked, plan);
+			entry.maxExpAt = signed.cap ?? entry.maxExpAt ?? null;
+			entry.currentExpAt = signed.exp;
+			this.#saveGitGrantRegistry(); // persist 先于投递
+			const home = join(this.#cfg.workspaceRoot, ".homes", sessionId);
+			writeGitCredentialConfig(home, { ...(this.#cfg.wiring ?? { proxyToken: "" }), gitProxyToken: signed.token, authorEmail: this.#owners.get(sessionId) });
+		} catch (err) {
+			retireUndeliveredNew(this.#gitGrantRevoked, plan);
+			rollbackRotation(entry, this.#gitGrantRevoked, plan);
+			entry.currentExpAt = oldCurrentExpAt;
+			if (freshEntry) this.#gitGrantActive.delete(sessionId); // 回滚连同移除：不留无 token 的半登记
+			try { this.#saveGitGrantRegistry(); } catch {
+				try { this.#audit.append({ kind: "error", sessionId, actor: entry.principal, summary: "git grant 重签回滚保存失败（磁盘状态 unknown，固定类别）" }); } catch { /* 审计也失败 */ }
+			}
+			throw err;
+		}
+		try { this.#flushPendingLogoutPersistence(); } catch { /* 固定类别已由 flush 内部审计 */ }
+		try { this.#scheduleNextRenew(); } catch {
+			try { this.#audit.append({ kind: "error", sessionId, actor: entry.principal, summary: "git grant 重签后调度刷新失败（固定类别）" }); } catch { /* 审计也失败 */ }
+		}
+	}
+
 	#nowMs(): number {
 		return Date.now();
 	}
@@ -1016,9 +1066,20 @@ export class Gateway {
 			...(this.#cfg.gitGrants ? {
 				onDisposed: () => this.#revokeGitGrantSession(sessionId),
 				onAclChanged: (v: number) => {
-					const entry = this.#gitGrantActive.get(sessionId);
-					if (entry) entry.aclVersion = v;
-					this.#revokeGitGrantSession(sessionId); // acl 变更即撤销旧 grant（代理 ≤pollMs 生效）
+					// R74（round-12 §3 方案 a）：acl 变更先撤销旧 grant（A6 fail-closed 不可放宽：
+					// 旧 aclVersion 必须失效），会话仍存活且 owner 仍被授权时立即以新 aclVersion
+					// 重签并投递沙箱 HOME（复用 renew 同缝事务）——「运行中 share 新增审批人」后
+					// push 不再必然 403。任一步失败：旧不复活、新不可用 + 回调侧固定类别审计。
+					// owner 被吊销/无权/会话已死：只撤销不重签（纵深防御）。
+					const prior = this.#gitGrantActive.get(sessionId);
+					const scope = prior ? { principal: prior.principal, tenant: prior.tenant, repo: prior.repo, maxExpAt: prior.maxExpAt ?? null } : null;
+					this.#revokeGitGrantSession(sessionId); // 旧 jti 全撤 + 持久化（先于重签）
+					if (!scope) return; // 本就无 grant：无旧可撤也无从重签
+					const session = this.#sessions.get(sessionId);
+					const owner = this.#owners.get(sessionId);
+					if (!session || !session.alive || !owner || this.#revoked.has(owner) || this.#revoked.has(scope.principal)) return;
+					if (!this.#isAuthorized(owner, this.#livePrincipal(owner), metas.get(session)!.data)) return;
+					this.#remintGitGrant(sessionId, owner, scope, v);
 				},
 				// R51 H4：初始 aclVersion 在 mint/构造时正确建立；attach 重建同值重设不触发 revoke
 				aclVersion: metadata.aclVersion ?? 1,
@@ -1096,9 +1157,55 @@ export class Gateway {
 			res.end(JSON.stringify(this.#gitRegistrySnapshot()));
 			return;
 		}
+		// R76-R3：demo 浏览器入口 —— hash token 经 /auth/session 换与生产同形态的会话 Cookie
+		//（静态网关 token 换 Cookie 仅限 demo；production 走下方 IdP 验签流程，行为不变）
+		if (this.#cfg.mode === "demo" && url.pathname === "/auth/session") {
+			await this.#demoSessionRoute(req, res, url);
+			return;
+		}
 		if (this.#cfg.mode === "production" && url.pathname.startsWith("/auth/")) { await this.#authRoute(req, res, url); return; }
 		if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405, { allow: "GET, HEAD" }).end("method not allowed"); return; }
 		this.#serveStatic(req, res, url);
+	}
+
+	/** R76-R3：demo 专用 —— 静态网关 token（+ 自报 actor）换与生产同形态的会话 Cookie。
+	 * app.js 既有「hash token → POST /auth/session → Cookie → WS」流程因此可在 demo 跑通；
+	 * production 的 /auth/session 仍走 IdP 验签（#authRoute），静态 token 不被接受。 */
+	async #demoSessionRoute(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+		const send = (status: number, headers: Record<string, string> = {}) => {
+			if (!res.headersSent) res.writeHead(status, { "cache-control": "no-store", ...headers }).end();
+		};
+		if (req.method !== "POST") return send(405, { allow: "POST" });
+		const origin = req.headers.origin;
+		if (typeof origin !== "string" || !this.#originOk(origin)) return send(403);
+		if (url.search) return send(400);
+		let hasBody = false;
+		req.on("data", () => {
+			hasBody = true;
+			req.destroy();
+			send(400);
+		});
+		if (hasBody) return;
+		if (!this.#authRateLimiter.allow()) return send(429);
+		const credential = bearer(req.headers.authorization);
+		if (!credential || !timingSafeEqual(createHash("sha256").update(credential).digest(), this.#demoToken!)) return send(401);
+		const actorHeader = req.headers["x-perimeter-actor"];
+		const actor = (typeof actorHeader === "string" ? actorHeader : Array.isArray(actorHeader) ? actorHeader[0] : undefined) ?? "demo@local";
+		if (actor.length === 0 || actor.length > 256) return send(401);
+		if (this.#revoked.has(actor)) return send(401);
+		let session: { id: string; expiresAt: number };
+		try {
+			const expiresAt = Date.now() + (this.#cfg.browserSessionMaxMs ?? 8 * 3600_000);
+			const principal: Principal = { id: actor, issuer: "demo", subject: actor, groups: [], expiresAt };
+			// 与生产同形态的会话 Cookie（__Host- 前缀 + HttpOnly + Secure + SameSite=Strict；
+			// 127.0.0.1 属浏览器 trustworthy origin，Secure 可写入）
+			session = this.#browser.create(principal, this.#cfg.browserSessionMaxMs ?? 8 * 3600_000);
+			this.#saveSessions();
+		} catch {
+			return send(503);
+		}
+		const maxAge = Math.max(0, Math.floor((session.expiresAt - Date.now()) / 1000));
+		return send(204, { "set-cookie": `${SESSION_COOKIE}=${session.id}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Strict` });
 	}
 
 	/**
@@ -1561,13 +1668,24 @@ export class Gateway {
 		const header = bearer(req.headers.authorization);
 		if (this.#cfg.mode === "demo") {
 			const token = url.searchParams.get("token") ?? header;
-			if (!token || !timingSafeEqual(createHash("sha256").update(token).digest(), this.#demoToken!)) {
-				return { ok: false, reason: "unauthorized" };
+			if (token && timingSafeEqual(createHash("sha256").update(token).digest(), this.#demoToken!)) {
+				// demo：actor 由客户端自报，仅用于演示多人协作，不是身份
+				const actor = url.searchParams.get("actor") ?? "demo@local";
+				if (actor.length > 256) return { ok: false, reason: "unauthorized" };
+				return { ok: true, val: { actor, expiresAt: Infinity } };
 			}
-			// demo：actor 由客户端自报，仅用于演示多人协作，不是身份
-			const actor = url.searchParams.get("actor") ?? "demo@local";
-			if (actor.length > 256) return { ok: false, reason: "unauthorized" };
-			return { ok: true, val: { actor, expiresAt: Infinity } };
+			// R76-R3：demo 会话 Cookie（/auth/session 以静态网关 token 换得，与生产同形态）——
+			// app.js「hash token → 换 Cookie → 带 Cookie 的 WS」流程在 demo 可用；identity 不带
+			// principal（与 query 路径同为自报 actor 口径，重连身份一致）。Cookie 无效 → 401。
+			const sid = cookieOf(req.headers.cookie, SESSION_COOKIE);
+			if (sid) {
+				const principal = this.#browser.get(sid);
+				if (!principal || this.#revoked.has(principal.id) || principal.expiresAt <= Date.now()) {
+					return { ok: false, reason: "unauthorized" };
+				}
+				return { ok: true, val: { actor: principal.id, expiresAt: principal.expiresAt } };
+			}
+			return { ok: false, reason: "unauthorized" };
 		}
 		// production：query 里出现凭据或身份一律拒绝，不忽略、不降级
 		if (url.searchParams.has("token") || url.searchParams.has("actor")) return { ok: false, reason: "unauthorized" };

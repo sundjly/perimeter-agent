@@ -39,10 +39,14 @@ function waitForPort(proc: { stdout: NodeJS.ReadableStream | null }, what: strin
 	});
 }
 
+import { randomBytes } from "node:crypto";
 const TOKEN = process.env.PERIMETER_TOKEN ?? "demo-token";
 // 模型、git 与浏览器凭据分域；模型 token 只在可信网关。
 const PROXY_TOKEN = process.env.PERIMETER_PROXY_TOKEN ?? "demo-proxy-token";
-const GIT_PROXY_TOKEN = "demo-git-proxy-token";
+// B2：共享静态 git token 已废除。masterKey/internalToken 随机生成一次，demo 双进程
+// （网关 + git 代理）各持一份；每个会话的 grant 由网关签发、沙箱 .gitconfig 只见 grant 串。
+const GIT_GRANT_MASTER_KEY = randomBytes(32);
+const GIT_REGISTRY_INTERNAL_TOKEN = randomBytes(24).toString("base64url");
 const real = process.env.PERIMETER_DEMO_REAL === "1";
 
 // 演示脚本：agent 先改一个源码文件（放行），再试图改 CI（拒绝），最后 push（审批）
@@ -56,7 +60,12 @@ const script = [
 mkdirSync(join(root, "audit-data"), { recursive: true });
 const auditFile = join(root, "audit-data/demo.jsonl");
 const workspaceRoot = mkdtempSync(join(tmpdir(), "perimeter-demo-"));
+// R72-v5 教训：默认 stateRoot 是 workspaceRoot+".state" 的字符串拼接（无路径分隔符）。
+// demo 显式配置并自建目录（网关不代建），会话元数据/吊销表/注册表落位确定。
+const stateRoot = join(root, "audit-data/state");
+mkdirSync(stateRoot, { recursive: true });
 
+let gitProxyRef: GitCredentialProxy | undefined;
 let wiring:
 	| { gitProxyToken: string; proxyToken: string; modelGatewayUrl: string; model: string; gitProxyUrl: string; scmHosts: string[] }
 	| undefined;
@@ -120,7 +129,17 @@ if (!real) {
 	const gitProxy = new GitCredentialProxy({
 		port: 0,
 		host: "127.0.0.1",
-		token: GIT_PROXY_TOKEN,
+		mode: "dev", // demo 双进程：显式 dev 模式
+		masterKey: GIT_GRANT_MASTER_KEY,
+		// 真实轮询网关 internal registry 端点（C3：禁止内存 stub 替代轮询路径）。
+		// gwPort 在下方 Gateway listen 后可得——用 late-bound 占位对象在 listen 后回填。
+		registry: {
+			url: "",
+			internalToken: GIT_REGISTRY_INTERNAL_TOKEN,
+			// R76/R2：pollMs 真实驱动轮询节奏（interval=min(pollMs, maxAuthAge−1s)）；
+			// dev maxAuthAge 30s 配 4s → 吊销/轮换 ≤4s 生效（合同 C2 ≤5s）。
+			pollMs: 4_000,
+		},
 		audit: gitAudit,
 		repos: [
 			{
@@ -135,11 +154,14 @@ if (!real) {
 		],
 	});
 	const gitProxyPort = await gitProxy.listen();
+	gitProxyRef = gitProxy;
 	process.on("exit", () => void gitProxy.close());
 
 	// ⑤ 接线：沙箱只看到两个代理的地址 + 代理 token
 	wiring = {
-		gitProxyToken: GIT_PROXY_TOKEN,
+		// B2：wiring.gitProxyToken 最终值由网关在会话接入（#acceptConnection）时用
+		// gitGrants 签发的 per-session grant 覆盖（见下方 Gateway gitGrants 接线）。
+		gitProxyToken: "",
 		proxyToken: PROXY_TOKEN,
 		modelGatewayUrl: `http://127.0.0.1:${modelPort}/v1`,
 		model: "mock-model",
@@ -150,11 +172,23 @@ if (!real) {
 }
 
 const gw = new Gateway({
+	mode: "demo",
 	port: Number(process.env.PORT ?? 8787),
 	host: "127.0.0.1",
 	token: TOKEN,
+	// B2：会话级 scoped git grant 签发（C3 真实双进程接线）——网关持 masterKey 与
+	// internal 端点，代理轮询消费；grant 只经 wiring 进沙箱 HOME 外 .gitconfig。
+	gitGrants: {
+		masterKey: GIT_GRANT_MASTER_KEY,
+		internalToken: GIT_REGISTRY_INTERNAL_TOKEN,
+		writeRefs: ["refs/heads/*"],
+		repos: [{ name: "git.internal/app.git", allowPush: true }],
+		// R-Q50-3：活会话 grant 续签（10min < 15min TTL，后台长活动会话也真有触发）
+		renewIntervalMs: 10 * 60_000,
+	},
 	policyFile: join(root, "config/policy.yaml"),
 	auditFile,
+	stateRoot,
 	workspaceRoot,
 	webRoot: join(root, "web"),
 	model: real ? { baseUrl: process.env.PERIMETER_MODEL_GATEWAY_URL ?? "http://127.0.0.1:8080/v1", token: process.env.PERIMETER_MODEL_PROXY_TOKEN ?? "", model: process.env.PERIMETER_MODEL ?? "default" } : undefined,
@@ -165,10 +199,14 @@ const gw = new Gateway({
 });
 
 const port = await gw.listen();
+// B2：网关端口就绪后回填代理 registry url（dev 模式启动窗口；下一轮询拍生效）
+gitProxyRef?.setRegistryUrl(`http://127.0.0.1:${port}/internal/git/registry`);
 console.log(`
 演示环境就绪（Pi Durable 1.1.0${real ? "，真实模型" : "，mock 模型，无需凭据"}）
 
-  打开：http://127.0.0.1:${port}/?token=${TOKEN}
+  打开（owner）：http://127.0.0.1:${port}/#token=${TOKEN}&actor=demo@local
+  审批人（第二窗口，<会话ID> 见下方流程①）：
+    http://127.0.0.1:${port}/?session=<会话ID>#token=${TOKEN}&actor=approver@local
   工作区：${workspaceRoot}
   审计日志：${auditFile}
 ${real ? "" : `
@@ -189,7 +227,14 @@ HOME 在 workspace 之外，agent 的 git commit 带不走它。
 试着发一句「修复登录超时的 bug」，会看到：
   1. 改源码 → 放行，审计里出现 policy.verdict allow
   2. 改 .github/workflows/ → 被策略拒绝，界面上出现红色条目
-  3. git push → 审批门拦下，等你点批准或拒绝（超时按拒绝）
+  3. git push → 审批门拦下（审批需要 approver 角色，防自批）。双人流程：
+     ① owner 连上后，从地址栏复制会话地址（含 ?session=<会话ID>）
+     ② 给会话加审批人（网页无此入口，用 attach CLI 另开一个终端）：
+        npm run attach -- --url http://127.0.0.1:${port} --session <会话ID> --actor demo@local --token ${TOKEN}
+        连接后输入：/share approver@local approver
+     ③ 审批人打开第二个浏览器窗口（上方「审批人」模板，替换 <会话ID>），
+        对审批点「允许」。share 即刻以新 aclVersion 重签 git grant（agent 无感）；
+        批准后推送真的到达上游仓库（审批超时按拒绝）。
 
 校验审计链完整性：
   node -e "import('./src/audit/log.ts').then(async m => console.log(await m.AuditLog.verify('${auditFile}')))"

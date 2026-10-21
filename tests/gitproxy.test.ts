@@ -675,3 +675,166 @@ test("B4：gzip + >64KiB PACK（合法命令区）推送 200 且解压字节与�
 	await up.bodyDone;
 	assert.ok(up.getBody().equals(raw), "解压后字节必须与原始 body 完全一致");
 });
+
+test("R74：aclVersion 落后的快照——高 version grant 触发单飞重拉后放行；低 version 直接拒且不重拉", async () => {
+	const up = await startRecordingUpstream();
+	let snapshotAcl = 1;
+	let registryFetches = 0;
+	const snapshot = {
+		epoch: "epoch-r74",
+		activeSessions: { sessR74: { principal: PRINCIPAL, tenant: TENANT, repo: "app.git", aclVersion: 1 } } as Record<string, { principal: string; tenant: string; repo: string; aclVersion: number }>,
+		revokedJtis: [] as string[],
+	};
+	const registryFetchImpl = (async () => {
+		registryFetches += 1;
+		snapshot.activeSessions.sessR74 = { principal: PRINCIPAL, tenant: TENANT, repo: "app.git", aclVersion: snapshotAcl };
+		return new Response(JSON.stringify(snapshot), { status: 200 });
+	}) as unknown as typeof fetch;
+	const auditFile = join(mkdtempSync(join(tmpdir(), "gp-")), "audit.jsonl");
+	const audit = AuditLog.open(auditFile);
+	cleanups.push(() => audit.close());
+	const proxy = new GitCredentialProxy({
+		port: 0, host: "127.0.0.1", mode: "production", masterKey: MASTER_KEY,
+		registry: { url: "http://127.0.0.1:1/internal/git/registry", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+		registryFetchImpl, audit,
+		repos: [{ name: "app.git", upstream: `http://127.0.0.1:${up.port}/app.git` }],
+	});
+	cleanups.push(() => proxy.close());
+	const base = `http://127.0.0.1:${await proxy.listen()}`;
+	// 等 startPolling 首拍落地（pollMs 5s 内无后台拍，计数稳定）
+	const deadline0 = Date.now() + 2_000;
+	while (registryFetches === 0 && Date.now() < deadline0) await new Promise((r) => setTimeout(r, 25));
+	assert.ok(registryFetches > 0, "轮询首拍必须已发生");
+	const signWithAcl = (aclVersion: number, jti: string): string =>
+		signGrant({ v: 1, tenant: TENANT, principal: PRINCIPAL, session: "sessR74", repo: "app.git", caps: { read: true, write: false, writeRefs: [] }, exp: Date.now() + 60_000, jti, epoch: "epoch-r74", aclVersion } as never, MASTER_KEY, Date.now());
+	const status = async (grant: string): Promise<number> =>
+		(await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${grant}` } })).status;
+
+	// A：快照 v1 + v2 grant（网关已 bump、代理未及轮询）→ 触发立即重拉后放行
+	snapshotAcl = 2;
+	const beforeA = registryFetches;
+	assert.equal(await status(signWithAcl(2, "jti-r74-v2")), 200, "高 version grant 重拉后放行");
+	assert.ok(registryFetches > beforeA, "aclVersion 高于快照必须触发立即重拉");
+
+	// B：快照 v2 + v1 grant（旧 grant）→ mayFlip=false：直接 403 且不重拉（A6：旧 grant 必须失效）。
+	// 不触发重拉由 deny 类别证明：「旧 grant 失效」结尾 = 未走重拉路径（重拉路径带「（重拉后复核）」后缀）。
+	// 后台轮询拍（4s 周期）可能落在断言窗口内：拉取计数差值 ≤1 视为后台拍，≥2 才是请求路径重拉。
+	const beforeB = registryFetches;
+	assert.equal(await status(signWithAcl(1, "jti-r74-v1")), 403, "低 version grant 直接拒");
+	let lastDeny = "";
+	for await (const e of AuditLog.replay(auditFile)) if (e.verdict === "deny") lastDeny = e.summary;
+	assert.match(lastDeny, /（旧 grant 失效）$/); // 全角括号结尾=未带「（重拉后复核）」后缀，未走重拉
+	assert.ok(registryFetches - beforeB <= 1, `仅后台拍允许（实际 ${registryFetches - beforeB}）`);
+
+	// C：1s 限流窗内的第二次需重拉请求 → 等待窗口后重拉放行（全局 ≤1 次/秒）
+	snapshotAcl = 3;
+	const beforeC = registryFetches;
+	const tC = Date.now();
+	assert.equal(await status(signWithAcl(3, "jti-r74-v3")), 200, "限流窗内的重拉请求应等待后放行");
+	const elapsedC = Date.now() - tC;
+	assert.ok(elapsedC >= 500, `限流等待应真实发生（${elapsedC}ms）`);
+	assert.ok(registryFetches - beforeC <= 2, `拉取频率不得超过 1 次/秒（实际 ${registryFetches - beforeC} 次）`);
+});
+
+test("R1：重拉快照后按新快照重走全部 A6 检查 —— 重拉失败/jti 吊销/epoch 变化均 fail-closed", async () => {
+	// 可控 registry（每例独立代理+状态；fetch 计数证明首拍已发生）
+	const startCase = async (state: { epoch: string; acl: number; revoked: string[]; hasSession: boolean; fail: boolean; fetches: number }) => {
+		const up = await startRecordingUpstream();
+		const registryFetchImpl = (async () => {
+			state.fetches += 1;
+			if (state.fail) throw new Error("registry down");
+			return new Response(JSON.stringify({
+				epoch: state.epoch,
+				activeSessions: state.hasSession ? { sessR1: { principal: PRINCIPAL, tenant: TENANT, repo: "app.git", aclVersion: state.acl } } : {},
+				revokedJtis: state.revoked,
+			}), { status: 200 });
+		}) as unknown as typeof fetch;
+		const auditFile = join(mkdtempSync(join(tmpdir(), "gp-")), "audit.jsonl");
+		const audit = AuditLog.open(auditFile);
+		cleanups.push(() => audit.close());
+		const proxy = new GitCredentialProxy({
+			port: 0, host: "127.0.0.1", mode: "production", masterKey: MASTER_KEY,
+			registry: { url: "http://127.0.0.1:1/r", internalToken: INTERNAL_TOKEN, pollMs: 5_000 },
+			registryFetchImpl, audit,
+			repos: [{ name: "app.git", upstream: `http://127.0.0.1:${up.port}/app.git` }],
+		});
+		cleanups.push(() => proxy.close());
+		const base = `http://127.0.0.1:${await proxy.listen()}`;
+		const deadline = Date.now() + 2_000;
+		while (state.fetches === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+		const sign = (jti: string, acl: number, epoch: string): string =>
+			signGrant({ v: 1, tenant: TENANT, principal: PRINCIPAL, session: "sessR1", repo: "app.git", caps: { read: true, write: false, writeRefs: [] }, exp: Date.now() + 60_000, jti, epoch, aclVersion: acl } as never, MASTER_KEY, Date.now());
+		const denySummary = async (): Promise<string> => {
+			let out = "";
+			for await (const e of AuditLog.replay(auditFile)) if (e.verdict === "deny") out = e.summary;
+			return out;
+		};
+		return { state, base, sign, denySummary, up };
+	};
+
+	// (a) 首判 session 未登记（miss）触发重拉，重拉失败 → 「快照缺失或过期」拒绝（绝不依据超龄快照放行）
+	{
+		const c = await startCase({ epoch: "E1", acl: 1, revoked: [], hasSession: false, fail: true, fetches: 0 });
+		const res = await fetch(`${c.base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${c.sign("jti-a", 1, "E1")}` } });
+		assert.equal(res.status, 403);
+		assert.match(await c.denySummary(), /快照缺失或超过 maxStale/);
+		assert.equal(c.up.seen.length, 0);
+	}
+	// (b) 首判 session 未登记触发重拉，新快照中该 jti 已吊销 → 403（冷启动 miss + 窗口内轮换的组合缝）
+	{
+		const c = await startCase({ epoch: "E1", acl: 1, revoked: [], hasSession: false, fail: false, fetches: 0 });
+		c.state.hasSession = true;
+		c.state.revoked = ["jti-b"];
+		const res = await fetch(`${c.base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${c.sign("jti-b", 1, "E1")}` } });
+		assert.equal(res.status, 403);
+		assert.match(await c.denySummary(), /已吊销（jti）/);
+		assert.equal(c.up.seen.length, 0);
+	}
+	// (c) 重拉后快照 epoch 变化 → 403（旧 epoch grant 必须失效）
+	{
+		const c = await startCase({ epoch: "E1", acl: 1, revoked: [], hasSession: false, fail: false, fetches: 0 });
+		c.state.epoch = "E2";
+		c.state.hasSession = true;
+		const res = await fetch(`${c.base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${c.sign("jti-c", 1, "E1")}` } });
+		assert.equal(res.status, 403);
+		assert.match(await c.denySummary(), /epoch 与 registry 快照不一致/);
+		assert.equal(c.up.seen.length, 0);
+	}
+});
+
+test("R76/R2：dev pollMs 真实生效 —— 吊销在轮询间隔内生效（合同 C2 ≤5s）", async () => {
+	const up = await startRecordingUpstream();
+	const state = { revoked: [] as string[] };
+	const registryFetchImpl = (async () => {
+		return new Response(JSON.stringify({
+			epoch: "E",
+			activeSessions: { sessR76: { principal: PRINCIPAL, tenant: TENANT, repo: "app.git", aclVersion: 1 } },
+			revokedJtis: [...state.revoked],
+		}), { status: 200 });
+	}) as unknown as typeof fetch;
+	// dev 模式（maxAuthAge 30s）+ pollMs 300：R76/R2 后实际轮询间隔 = min(300, 30s−1s) ≈ 300ms
+	const auditFile = join(mkdtempSync(join(tmpdir(), "gp-")), "audit.jsonl");
+	const audit = AuditLog.open(auditFile);
+	cleanups.push(() => audit.close());
+	const proxy = new GitCredentialProxy({
+		port: 0, host: "127.0.0.1", mode: "dev", masterKey: MASTER_KEY,
+		registry: { url: "http://127.0.0.1:1/r", internalToken: INTERNAL_TOKEN, pollMs: 300 },
+		registryFetchImpl, audit,
+		repos: [{ name: "app.git", upstream: `http://127.0.0.1:${up.port}/app.git` }],
+	});
+	cleanups.push(() => proxy.close());
+	const base = `http://127.0.0.1:${await proxy.listen()}`;
+	const grant = signGrant({ v: 1, tenant: TENANT, principal: PRINCIPAL, session: "sessR76", repo: "app.git", caps: { read: true, write: false, writeRefs: [] }, exp: Date.now() + 60_000, jti: "j1", epoch: "E", aclVersion: 1 } as never, MASTER_KEY, Date.now());
+	const status = async (): Promise<number> =>
+		(await fetch(`${base}/app.git/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${grant}` } })).status;
+	const deadline = Date.now() + 3_000;
+	while ((await status()) !== 200 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+	assert.equal(await status(), 200, "基线：吊销前 grant 可用");
+
+	state.revoked = ["j1"]; // 登出/吊销落 registry（C2：acl/吊销/销毁都在 ≤5s 窗口内全拒）
+	const t = Date.now();
+	const deadline2 = Date.now() + 2_500; // ≤轮询间隔 300ms×若干 + 余量；远小于 C2 的 5s
+	while ((await status()) !== 403 && Date.now() < deadline2) await new Promise((r) => setTimeout(r, 50));
+	assert.equal(await status(), 403, "吊销必须在 pollMs 间隔内生效");
+	assert.ok(Date.now() - t < 5_000, `吊销生效必须 ≤5s（实际 ${Date.now() - t}ms）`);
+});

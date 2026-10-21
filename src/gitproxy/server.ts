@@ -17,6 +17,8 @@ import { ByteBudget } from "./byte-budget.ts";
 
 /** R72-c：session-miss 立即重拉快照的最小间隔（另有单飞在途锁）——防未登记 grant 放大打 registry */
 const MISS_REFRESH_MIN_INTERVAL_MS = 1_000;
+/** R74-v3：限流窗内等待上限（复用单飞收敛后重拉；单请求最多额外等待约 1s） */
+const MISS_REFRESH_MAX_WAIT_MS = 1_200;
 
 export interface RepoMapping {
 	/** 沙箱侧使用的名字，出现在 git remote 里 */
@@ -127,8 +129,9 @@ const ZERO_SHA = "0".repeat(40);
  * **客户端请求头（x-perimeter-*）不进入任何授权判定，也不进入审计 identity**。
  *
  * 能力凭证的诚实边界（措辞合同）：grant 串可被盗用，本层没有 PoP；承诺的是
- * scope 最小化、jti+活会话登记拒跨用、吊销在 ≤pollMs（默认 5s，轮询失败最长
- * maxStale 30s）有界窗口内失效。禁止“无 token/不可盗用/立即失效”类措辞。
+ * scope 最小化、jti+活会话登记拒跨用、吊销在 ≤min(pollMs, maxAuthAge−1s)（R76/R2：
+ * pollMs 必填且真实驱动轮询节奏，无默认；轮询失败旧快照沿用最长 maxStale 30s）有界窗口内
+ * 失效。禁止“无 token/不可盗用/立即失效”类措辞。
  *
  * 写面授权依据 = receive-pack 命令区自描述（B6：上游写之前全量预校验）；
  * 读面 = repo 级全 refs 透传（B5①：ref 级读控制代理层不可安全交付，不做）。
@@ -232,7 +235,9 @@ export class GitCredentialProxy {
 		// age 锚 = 每轮 pull **起始** mono 时点（网络+读体+解析都消费 age）；晚到过窗不发布；
 		// 调度间隔早于 age 到期（留真实裕量给 fetch），不产生每轮 dt 空窗。
 		const maxAge = this.#maxAuthAgeMs;
-		const pollEvery = Math.max(250, maxAge - REGISTRY_FETCH_MARGIN_MS); // prod: 4000ms（≤5s age）
+		// R76/R2：registry.pollMs 真正生效——实际轮询间隔 = min(pollMs, maxAuthAge−1s)，下限 250ms。
+		// dev/demo（maxAuthAge 30s）配 pollMs 4000 → 吊销/轮换 ≤4s 生效（合同 C2 ≤5s）；prod 仍 4s。
+		const pollEvery = Math.max(250, Math.min(this.#cfg.registry!.pollMs, maxAge - REGISTRY_FETCH_MARGIN_MS));
 		const retrySoon = 250;
 		const tick = async (): Promise<boolean> => {
 			if (this.#closed || this.#polling) return true;
@@ -370,6 +375,67 @@ export class GitCredentialProxy {
 		res.end("拒绝");
 	}
 
+	/** R72/R74：快照落后于签发方时的立即重拉（单飞 + 最小间隔 1s 限流）；返回是否实际重拉成功。
+	 * 拉取失败沿用旧快照（fail-closed 不变）。 */
+	async #refreshSnapshotOnce(): Promise<boolean> {
+		const now = this.#mono();
+		if (this.#missRefreshInFlight || now < this.#missRefreshNotBeforeMono) return false;
+		this.#missRefreshInFlight = true;
+		try {
+			const fresh = await this.#pullRegistry();
+			this.#snapshot = fresh;
+			this.#snapshotAtMono = this.#mono();
+			return true;
+		} catch {
+			return false;
+		} finally {
+			this.#missRefreshInFlight = false;
+			this.#missRefreshNotBeforeMono = this.#mono() + MISS_REFRESH_MIN_INTERVAL_MS;
+		}
+	}
+
+	/** R74-v3：限流窗内不直接按旧快照拒——等待窗/在途拉取收敛（≤1s）后再重拉一次。
+	 * 全局拉取频率仍 ≤1 次/秒（notBefore+单飞），单请求最多额外等待约 1s+拉取预算。 */
+	async #refreshSnapshotAwaited(): Promise<boolean> {
+		const deadline = this.#mono() + MISS_REFRESH_MAX_WAIT_MS;
+		for (;;) {
+			if (this.#closed) return false;
+			const now = this.#mono();
+			if (!this.#missRefreshInFlight && now >= this.#missRefreshNotBeforeMono) {
+				return await this.#refreshSnapshotOnce();
+			}
+			if (now >= deadline) return false;
+			await new Promise((r) => setTimeout(r, 25));
+		}
+	}
+
+	/** R1：A6 判定唯一实现（首判与重拉后复判同缝）。mayFlip=该失败是否可能经重拉翻转为放行：
+	 * 仅 session 未登记（冷启动 miss：登记未及轮询）与 claims.aclVersion 高于快照（网关已 bump
+	 * 未及轮询）成立；epoch 不一致/jti 已吊销/aclVersion 低于快照/五 scope 不一致均不可能。 */
+	#checkGrantAgainstSnapshot(claims: GrantClaims, snap: RegistrySnapshot): { ok: true } | { ok: false; reason: string; mayFlip: boolean } {
+		// epoch 比对（A6 补项）：签发方重启换 epoch 后，旧 epoch grant 一律拒（新快照 epoch 只会更新）
+		if (claims.epoch !== snap.epoch) {
+			return { ok: false, reason: "拒绝：grant epoch 与 registry 快照不一致（签发方重启/轮换）", mayFlip: false };
+		}
+		if (snap.revokedJtis.includes(claims.jti)) {
+			return { ok: false, reason: "拒绝：grant 已吊销（jti）", mayFlip: false };
+		}
+		const registered = snap.activeSessions[claims.session];
+		if (!registered) {
+			return { ok: false, reason: "拒绝：session 未在活会话登记表（已销毁/未登记/他网关签发）", mayFlip: true };
+		}
+		// H53-c/O-8：全五 scope+epoch/acl——不漏 tenant/repo 两轴（登记身份不会变，不可翻转）
+		if (registered.principal !== claims.principal || registered.tenant !== claims.tenant || registered.repo !== claims.repo) {
+			return { ok: false, reason: "拒绝：registry 登记与 grant claims 不一致", mayFlip: false };
+		}
+		// aclVersion 可对比字段（A6 补项）：签发方变更/撤销后条目失配即拒；
+		// 仅 claims 更高（网关已 bump 未及轮询）可能经重拉翻转，claims 更旧=旧 grant 必须失效
+		if (registered.aclVersion !== claims.aclVersion) {
+			return { ok: false, reason: "拒绝：aclVersion 已变更（旧 grant 失效）", mayFlip: claims.aclVersion > registered.aclVersion };
+		}
+		return { ok: true };
+	}
+
 	async #route(req: IncomingMessage, res: ServerResponse, requestStartMono: number): Promise<void> {
 		// B1：raw url 先查（new URL 的规范化会抹掉 // 与 .. 的字面形态）
 		const rawUrl = req.url ?? "/";
@@ -436,48 +502,31 @@ export class GitCredentialProxy {
 			deny(403, "拒绝：registry 快照缺失或超过 maxStale（fail-closed）", claims);
 			return;
 		}
-		const snap = this.#snapshot!;
-		// epoch 比对（A6 补项）：签发方重启换 epoch 后，旧 epoch grant 一律拒
-		if (claims.epoch !== snap.epoch) {
-			deny(403, "拒绝：grant epoch 与 registry 快照不一致（签发方重启/轮换）", claims);
-			return;
-		}
-		if (snap.revokedJtis.includes(claims.jti)) {
-			deny(403, "拒绝：grant 已吊销（jti）", claims);
-			return;
-		}
-		let registered = snap.activeSessions[claims.session];
-		if (!registered) {
-			// R72-C3 冷启动缝：grant 在会话接入时才 mint+登记，代理快照要等下一轮 pollMs
-			// 才包含它——clone 紧随接入发生，会撞上旧快照「session 未登记」。
-			// miss 时重拉一次快照再判，但必须限流（R72-c）：单飞（同时只一个在途拉取）
-			// + 最小间隔 1s——持合法签名但未登记 grant 的请求不得放大打 registry。
-			// 限流窗内/拉取失败：沿用旧快照结论（miss → deny，fail-closed 不变）。
-			const now = this.#mono();
-			if (!this.#missRefreshInFlight && now >= this.#missRefreshNotBeforeMono) {
-				this.#missRefreshInFlight = true;
-				try {
-					const fresh = await this.#pullRegistry();
-					this.#snapshot = fresh;
-					this.#snapshotAtMono = this.#mono();
-					registered = fresh.activeSessions[claims.session];
-				} catch { /* 拉取失败：沿用旧快照结论（miss → deny，与 maxStale 口径一致） */ } finally {
-					this.#missRefreshInFlight = false;
-					this.#missRefreshNotBeforeMono = this.#mono() + MISS_REFRESH_MIN_INTERVAL_MS;
-				}
+		// R1+R76b：判定抽唯一实现；首判失败时仅当「结果可能翻转为放行」（session 未登记/
+		// claims.aclVersion 高于快照）才等待并重拉一次，随后按**新快照重走同一实现**并复查
+		// 新鲜度；重拉失败/等待超时/仍失败 → 「快照缺失或过期」fail-closed，绝不依据超龄
+		// 快照放行；不可能翻转的失败（epoch/jti 吊销/低 acl/scope）直接拒，不消耗重拉额度。
+		let check = this.#checkGrantAgainstSnapshot(claims, this.#snapshot!);
+		if (!check.ok && check.mayFlip) {
+			if (!await this.#refreshSnapshotAwaited()) {
+				deny(403, "拒绝：registry 快照缺失或超过 maxStale（fail-closed）", claims);
+				return;
+			}
+			const fresh = this.#snapshot!;
+			if (!this.#snapshotFresh()) {
+				deny(403, "拒绝：registry 快照缺失或超过 maxStale（fail-closed）", claims);
+				return;
+			}
+			check = this.#checkGrantAgainstSnapshot(claims, fresh);
+			if (!check.ok) {
+				// 固定类别后缀区分：带「（重拉后复核）」= 走过重拉路径；不带 = 未重拉直接拒
+				deny(403, `${check.reason}（重拉后复核）`, claims);
+				return;
 			}
 		}
-		if (!registered) {
-			deny(403, "拒绝：session 未在活会话登记表（已销毁/未登记/他网关签发）", claims);
-			return;
-		}
-		if (registered.principal !== claims.principal || registered.tenant !== claims.tenant || registered.repo !== claims.repo) {
-			deny(403, "拒绝：registry 登记与 grant claims 不一致", claims);
-			return;
-		}
-		// aclVersion 可对比字段（A6 补项）：签发方变更/撤销后条目失配即拒
-		if (registered.aclVersion !== claims.aclVersion) {
-			deny(403, "拒绝：aclVersion 已变更（旧 grant 失效）", claims);
+		if (!check.ok) {
+			// 不可翻转的失败（epoch/jti 吊销/低 aclVersion/scope 不一致）：未重拉直接拒，原文案
+			deny(403, check.reason, claims);
 			return;
 		}
 
