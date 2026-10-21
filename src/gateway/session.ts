@@ -1,7 +1,8 @@
 import { initialState, reduce, type ViewState } from "../../web/view-model.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { AuditLog, contentHash } from "../audit/log.ts";
 import type { ClientCommand, ClientEvent, SessionView, Role } from "../protocol/types.ts";
 import { HarnessHost } from "../runtime/harness-host.ts";
@@ -47,10 +48,15 @@ export class Session {
 	#stream?: Awaited<ReturnType<HarnessHost["watch"]>>;
 	#audit: SessionView["audit"] = [];
 	#queued: { cmd: ClientCommand; actor: string }[] = [];
+	/** S3b：prompt 幂等账本（key=actor+requestId → 内容 hash），随 durable 提交前落盘，跨重启有效 */
+	#promptLedger?: Map<string, string>;
+	#ledgerFile: string;
 	constructor(opts: SessionOptions) {
 		this.#opts = opts;
 		this.#aclVersion = opts.aclVersion ?? 1;
 		this.#backend = opts.backend ?? new LocalBackend();
+		// 与 HarnessHost 的 sqlite 默认目录同一推导，保证账本与转录同生命周期
+		this.#ledgerFile = join(opts.stateDirectory ?? join(opts.workspace, "..", ".state", opts.sessionId), "prompt-ledger.json");
 		mkdirSync(opts.workspace, { recursive: true });
 	}
 	get sessionId(): string { return this.#opts.sessionId; }
@@ -251,9 +257,59 @@ export class Session {
 			});
 		} else if (cmd.type === "prompt" || cmd.type === "steer") {
 			if (role && role !== "owner" && role !== "editor") throw new Error(`无权执行命令：角色 ${role} 禁止发起任务`);
+			// S3b 消息幂等：同 actor 同 requestId 不同内容 → 固定类别拒绝；同键同内容重复 →
+			// 不再提交，不重复模型生成。账本在 durable 提交前落盘（先记账再副作用），跨重启有效；
+			// durable 侧 scopedId 幂等仍是第二道（见 durable-runtime 测试）。
+			this.#checkPromptIdempotency(actor, cmd.requestId, contentHash(cmd.text));
 			await this.#host!.submit(cmd.text, cmd.requestId, cmd.type === "steer" ? "steer" : "followUp", actor);
 		}
 	}
+	/** S3b：prompt 幂等账本（stateDirectory 下 0600）。损坏即 fail-closed 拒绝新任务，不静默重建 */
+	#loadPromptLedger(): Map<string, string> {
+		if (this.#promptLedger) return this.#promptLedger;
+		if (!existsSync(this.#ledgerFile)) {
+			this.#promptLedger = new Map();
+			return this.#promptLedger;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(readFileSync(this.#ledgerFile, "utf8"));
+		} catch {
+			throw new Error("prompt 幂等账本损坏，拒绝新任务（固定类别）");
+		}
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("prompt 幂等账本损坏，拒绝新任务（固定类别）");
+		const map = new Map<string, string>();
+		for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+			if (typeof value !== "string") throw new Error("prompt 幂等账本损坏，拒绝新任务（固定类别）");
+			map.set(key, value);
+		}
+		this.#promptLedger = map;
+		return map;
+	}
+
+	/** 先记账再提交：同键异内容拒绝、同键同内容不重复提交。账本写入失败回滚内存并拒绝（不留无账本的提交） */
+	#checkPromptIdempotency(actor: string, requestId: string, hash: string): void {
+		const ledger = this.#loadPromptLedger();
+		const key = `${actor}\u0000${requestId}`;
+		const prev = ledger.get(key);
+		if (prev !== undefined) {
+			if (prev !== hash) throw new Error("requestId 已用于不同内容，拒绝重复使用（固定类别）");
+			throw new Error("重复请求：同 requestId 同内容已受理，不重复生成（固定类别）");
+		}
+		ledger.set(key, hash);
+		const tmp = `${this.#ledgerFile}.${process.pid}.${randomUUID()}.tmp`;
+		try {
+			mkdirSync(dirname(this.#ledgerFile), { recursive: true });
+			writeFileSync(tmp, JSON.stringify(Object.fromEntries(ledger)), { mode: 0o600 });
+			renameSync(tmp, this.#ledgerFile);
+			try { chmodSync(this.#ledgerFile, 0o600); } catch { /* 刚以 0600 写入；chmod 兜底失败不影响语义 */ }
+		} catch {
+			ledger.delete(key);
+			try { unlinkSync(tmp); } catch { /* 未写出或已清理 */ }
+			throw new Error("prompt 幂等账本写入失败，拒绝新任务（固定类别）");
+		}
+	}
+
 	#emit(event: ClientEvent): void {
 		if (this.#view) this.#view = reduce(this.#view, event);
 		if (event.type === "session.snapshot") event.view = { ...event.view, audit: [...this.#audit] };

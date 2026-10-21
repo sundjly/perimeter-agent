@@ -12,7 +12,7 @@ import type { Duplex } from "node:stream";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { type WebSocket, WebSocketServer } from "ws";
 import { AuditLog } from "../audit/log.ts";
-import type { ClientEvent, Role } from "../protocol/types.ts";
+import type { ClientCommand, ClientEvent, Role } from "../protocol/types.ts";
 import { parseCommand } from "../protocol/validate.ts";
 import { type ExecutionBackend, LocalBackend, DockerBackend, KubectlBackend, dockerClientEnv, safeDockerCmd } from "./execution-backend.ts";
 import { type SandboxWiring, writeGitCredentialConfig } from "./sandbox-config.ts";
@@ -21,6 +21,7 @@ import { type Authenticator, BrowserSessions, JwtAuthenticator, type Principal, 
 import { DEFAULT_LIMITS, type Limits, Outbox, RateLimiter, hostAllowed, originAllowed, validateLimits } from "./transport.ts";
 import { Session } from "./session.ts";
 import { acquireGatewayLock, type HeldLock, lockStillHeld, releaseGatewayLock } from "./state-lock.ts";
+import { DEFAULT_RECEIPT_TTL_MS, ReceiptStore, type CreateReceipt, type ReceiptOutcome, type ReceiptStage } from "./receipt-store.ts";
 
 export interface OidcConfig {
 	issuer: string;
@@ -109,6 +110,14 @@ export interface GatewayConfig {
 	backend?: ExecutionBackend;
 	/** 生产模式可选的 OIDC Authorization Code + PKCE S256 配置 */
 	oidc?: OidcConfig;
+	/** S3b：创建收据保留期 ms；默认 24h（DEFAULT_RECEIPT_TTL_MS）。过期收据清理后，同键 create 视为新创建 */
+	receiptTtlMs?: number;
+	/**
+	 * S3b：显式创建在各 stage 收据落盘后的回调（await）。仅供测试/故障注入：
+	 * 抛错 → 收据 failed；挂起 → 可在窗口内 kill -9 模拟中途崩溃。
+	 * 生产不配置；只对显式 create 生效，隐式创建不经过它。
+	 */
+	createStageProbe?: (stage: "accepted" | "workspace_ready", sessionId: string) => Promise<void> | void;
 }
 
 const MIME: Record<string, string> = {
@@ -182,6 +191,14 @@ class AuthWorkGate {
 	}
 }
 
+/** S3b：创建被服务端固定拒绝（scope 无权 / grant 拒绝）。message 面向客户端，可直接回显 */
+export class CreateDeniedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "CreateDeniedError";
+	}
+}
+
 export async function verifyDockerNetworkInternal(net: string): Promise<string> {
 	if (net === "none") return "none";
 	try {
@@ -229,6 +246,14 @@ export class Gateway {
 	/** sessionId → 创建它的身份。别人拿到 id 也接不进来 */
 	#owners = new Map<string, string>();
 	#reaper: NodeJS.Timeout;
+	/** S3b：创建收据存储（按 principal 哈希目录隔离；构造期启动恢复 + TTL 周期清理） */
+	#receipts!: ReceiptStore;
+	#receiptSweeper?: NodeJS.Timeout;
+	/** S3b：同键并发显式创建的单飞表（进程内互斥；跨进程由 S3a stateRoot 独占锁保证） */
+	#createInflight = new Map<string, Promise<CreateReceipt>>();
+	/** S3b：readyz 短时缓存（≥1s 复用上次结果，限频）；draining/close 永远即时翻红不走缓存 */
+	#readyCacheAt = 0;
+	#readyCacheOk = false;
 	/** close 之后审计 fd 已关，在途的 reap 不能再写 */
 	#closed = false;
 	/** S3a：stateRoot 独占锁（构造期取得，close 时释放） */
@@ -261,6 +286,9 @@ export class Gateway {
 		this.#webRoot = resolve(cfg.webRoot);
 		this.#limits = { ...DEFAULT_LIMITS, ...cfg.limits };
 		validateLimits(this.#limits);
+		if (cfg.receiptTtlMs !== undefined && (!Number.isSafeInteger(cfg.receiptTtlMs) || cfg.receiptTtlMs <= 0)) {
+			throw new Error("配置非法：receiptTtlMs 必须为正整数");
+		}
 
 		if (cfg.mode === "production") {
 			// 生产不允许任何形式的静默降级：缺任何一项都拒绝启动，而不是回落到共享 token
@@ -436,10 +464,24 @@ export class Gateway {
 			this.#startGitGrantRenewTimer();
 			this.#loadRevocations();
 			this.#loadSessions();
+			// S3b：创建收据存储。先恢复（上次进程留下的未终态收据标 outcome_unknown：
+			// 不当成功、不自动重做外部副作用），再启动 TTL 周期清理（只删收据，不碰活会话）。
+			this.#receipts = new ReceiptStore(this.#stateRoot, this.#cfg.receiptTtlMs ?? DEFAULT_RECEIPT_TTL_MS);
+			for (const stale of this.#receipts.recoverNonTerminal()) {
+				this.#tryAudit({ kind: "session.create", sessionId: stale.sessionId, actor: stale.principalId, summary: `重启恢复：收据 ${stale.operationId} 未到终态，标记 outcome_unknown（不当成功、不自动重做外部副作用）` });
+			}
+			const receiptTtl = this.#cfg.receiptTtlMs ?? DEFAULT_RECEIPT_TTL_MS;
+			this.#receiptSweeper = setInterval(() => {
+				let removed = 0;
+				try { removed = this.#receipts.sweepExpired(); } catch { /* 清理失败不中断，下轮重试 */ }
+				if (removed > 0) this.#tryAudit({ kind: "session.create", sessionId: "-", actor: "system", summary: `TTL 清理 ${removed} 条过期创建收据（不影响活会话）` });
+			}, Math.max(1_000, Math.min(60_000, Math.floor(receiptTtl / 2))));
+			this.#receiptSweeper.unref();
 			wss = new WebSocketServer({ noServer: true, maxPayload: this.#limits.maxInboundBytes });
 			this.#wss = wss;
 		} catch (err) {
 			this.#stopGitGrantRenewTimer();
+			if (this.#receiptSweeper) clearInterval(this.#receiptSweeper);
 			try { wss?.close(); } catch { /* 未创建不遮原错误 */ }
 			this.#audit.close();
 			releaseGatewayLock(this.#lock); // S3a：构造失败不留锁
@@ -910,6 +952,7 @@ export class Gateway {
 		this.#closed = true;
 		clearInterval(this.#reaper);
 		this.#stopGitGrantRenewTimer();
+		if (this.#receiptSweeper) clearInterval(this.#receiptSweeper);
 		try { this.#authGate.close(); } catch (err) { this.#auditLeak("system", "authGate-close", err); }
 		for (const ctrl of this.#authControllers) ctrl.abort();
 		this.#authControllers.clear();
@@ -1031,6 +1074,7 @@ export class Gateway {
 			isAuthorized: (a, meta) => this.#isAuthorized(a, identity.principal, meta),
 			isPrincipalId: this.#cfg.auth?.isPrincipalId?.bind(this.#cfg.auth),
 			gatewayDraining: () => this.#draining || this.#closed,
+			handleCreate: (conn, cmd, actor) => this.#handleCreateCommand(conn, cmd, actor),
 		};
 
 		if (requested !== null && !SESSION_ID.test(requested)) {
@@ -1082,16 +1126,64 @@ export class Gateway {
 		}
 
 		const sessionId = requested ?? randomUUID();
-		const ownerDir = join(this.#cfg.stateRoot ?? this.#cfg.workspaceRoot + ".state", "sessions", sessionId);
-		const metaFile = join(ownerDir, "meta.json");
-		// 策略作用域由服务端决定：客户端自选 repo/team 等于自选适用规则。
-		// production 由 principal（组映射）推导，推导不出来就拒绝创建，不回落到默认 scope
-		let scope = { repo: "default", team: "default" };
-		if (!existsSync(metaFile)) {
-			const resolved = this.#cfg.resolveScope ? this.#cfg.resolveScope(actor, identity.principal) : this.#cfg.mode === "demo" ? scope : undefined;
-			if (!resolved) { closeWith(ws, "无权创建会话", this.#limits); return; }
-			scope = resolved;
+		// S3b：隐式【首次创建】同样写 receipt（operationId 由服务器生成，auto- 前缀）——崩溃后同样能判
+		// outcome_unknown，不把「目录已存在」误当成功。重启后 re-attach 到既有会话不是创建，不写收据。
+		// scope 解析是纯服务端计算、不是外部副作用，先于收据落盘完成 —— 收据与审计从首条起就带归属。
+		const metaFilePath = join(this.#stateRoot, "sessions", sessionId, "meta.json");
+		const freshCreation = !existsSync(metaFilePath);
+		let scope: { repo: string; team: string };
+		try {
+			scope = this.#resolveCreationScope(actor, identity.principal, metaFilePath);
+		} catch (err) {
+			closeWith(ws, err instanceof CreateDeniedError ? err.message : "会话接入失败", this.#limits);
+			return;
 		}
+		const autoReceipt = freshCreation
+			? this.#newReceipt(`auto-${randomUUID()}`, "", actor,
+				identity.principal ? `${identity.principal.issuer}|${identity.principal.subject}` : actor, sessionId)
+			: undefined;
+		if (autoReceipt) {
+			this.#receipts.save(autoReceipt);
+			this.#tryAudit({ kind: "session.create", sessionId, actor, repo: scope.repo, team: scope.team, summary: `创建受理 ${autoReceipt.operationId} stage=accepted` });
+		}
+		let built: { session: Session; metadata: Meta };
+		try {
+			built = this.#buildSession(sessionId, actor, identity, scope);
+		} catch (err) {
+			if (autoReceipt) this.#failReceipt(autoReceipt, err, scope);
+			closeWith(ws, err instanceof CreateDeniedError ? err.message : "会话接入失败", this.#limits);
+			return;
+		}
+		const session = built.session;
+		if (autoReceipt) {
+			this.#stampReceipt(autoReceipt, "workspace_ready");
+			this.#tryAudit({ kind: "session.create", sessionId, actor, repo: scope.repo, team: scope.team, summary: `创建 ${autoReceipt.operationId} stage=workspace_ready` });
+		}
+		attach(ws, session, actor, attachOpts);
+		// **必须接住**：start() 的失败路径里会 await this.stop()，而 stop 在
+		// 清理失败时会 throw。不接的话一个会话的清理失败会打死整个多租户网关
+		// —— 那比静默泄漏一个容器严重得多。
+		const started = session.start().then(
+			() => {
+				if (autoReceipt) {
+					this.#stampReceipt(autoReceipt, "harness_ready", "created");
+					this.#tryAudit({ kind: "session.create", sessionId, actor, repo: scope.repo, team: scope.team, summary: `创建 ${autoReceipt.operationId} stage=harness_ready` });
+				}
+			},
+			(err) => { if (autoReceipt) this.#failReceipt(autoReceipt, err, scope); throw err; },
+		);
+		void started.catch((err: unknown) => this.#auditLeak(sessionId, "gateway-start", err));
+	}
+
+	/**
+	 * S3b：会话创建核心（scope 落盘 → meta 落盘 → git grant → Session 构造 + 登记）。
+	 * 从隐式 attach 创建路径原样抽出，显式 create 复用同一条流水线。
+	 * 不 attach、不 start。固定拒绝抛 CreateDeniedError（message 面向客户端，可直接回显）；
+	 * 其余异常向调用方传播。原 closeWith 拒绝点改为抛错，由调用方按各自通道拒绝。
+	 */
+	#buildSession(sessionId: string, actor: string, identity: { principal?: Principal; expiresAt: number; sid?: string }, scope: { repo: string; team: string }): { session: Session; metadata: Meta } {
+		const ownerDir = join(this.#stateRoot, "sessions", sessionId);
+		const metaFile = join(ownerDir, "meta.json");
 		mkdirSync(ownerDir, { recursive: true });
 		const metadata: Meta = existsSync(metaFile) ? JSON.parse(readFileSync(metaFile, "utf8")) : {
 			id: sessionId, owner: actor, ...scope, createdAt: new Date().toISOString(), members: { [actor]: "owner" },
@@ -1107,8 +1199,7 @@ export class Gateway {
 			// 策略作用域标签（metadata.repo）不是 SCM 仓库，不得混用（demo-app ≠ 代理名）。
 			const scmRepo = scmGrantRepo(this.#cfg.repoUrl, this.#cfg.gitGrants.repos);
 			if (!scmRepo) {
-				closeWith(ws, "git grant 签发拒绝：repoUrl 未配置或未在 gitGrants.repos 登记（fail-closed，固定类别）", this.#limits);
-				return;
+				throw new CreateDeniedError("git grant 签发拒绝：repoUrl 未配置或未在 gitGrants.repos 登记（fail-closed，固定类别）");
 			}
 			gitGrantToken = this.#issueGitGrant(sessionId, identity.principal ? `${identity.principal.issuer}|${identity.principal.subject}` : actor, metadata.team, scmRepo, metadata.aclVersion ?? 1, identity.expiresAt);
 			// R-Q52-2：登记服务端验证得到的 browser sid ↔ agent session 关联（logout 撤权依据）
@@ -1176,12 +1267,139 @@ export class Gateway {
 		metas.set(session, { file: metaFile, data: metadata });
 		this.#sessions.set(sessionId, session);
 		this.#owners.set(sessionId, actor);
-		attach(ws, session, actor, attachOpts);
-		// **必须接住**：start() 的失败路径里会 await this.stop()，而 stop 在
-		// 清理失败时会 throw。不接的话一个会话的清理失败会打死整个多租户网关
-		// —— 那比静默泄漏一个容器严重得多。
-		void session.start().catch((err: unknown) => this.#auditLeak(sessionId, "gateway-start", err));
+		return { session, metadata };
 	}
+
+	// ── S3b：显式创建收据（handoff §3.1）──
+
+	/**
+	 * 策略作用域由服务端决定：客户端自选 repo/team 等于自选适用规则。
+	 * production 由 principal（组映射）推导，推导不出来就拒绝创建，不回落到默认 scope。
+	 * scope 解析是纯计算，先于收据落盘与一切外部副作用完成（解析失败 = 从未受理，无收据）。
+	 */
+	#resolveCreationScope(actor: string, principal: Principal | undefined, metaFile: string): { repo: string; team: string } {
+		const fallback = { repo: "default", team: "default" };
+		if (existsSync(metaFile)) return fallback; // 既有会话：归属以磁盘 meta 为准，不需要 scope
+		const resolved = this.#cfg.resolveScope ? this.#cfg.resolveScope(actor, principal) : this.#cfg.mode === "demo" ? fallback : undefined;
+		if (!resolved) throw new CreateDeniedError("无权创建会话");
+		return resolved;
+	}
+
+	#newReceipt(operationId: string, requestHash: string, actor: string, principalId: string, sessionId: string): CreateReceipt {
+		const now = new Date().toISOString();
+		return { operationId, principalId, requestId: `req-${randomUUID()}`, requestHash, sessionId, stage: "accepted", outcome: "pending", createdAt: now, updatedAt: now };
+	}
+
+	/** stage 推进落盘；写失败不阻断主线（磁盘 unknown，内存态已推进，审计可见） */
+	#stampReceipt(receipt: CreateReceipt, stage: ReceiptStage, outcome: ReceiptOutcome = "pending"): void {
+		receipt.stage = stage;
+		receipt.outcome = outcome;
+		receipt.updatedAt = new Date().toISOString();
+		try { this.#receipts.save(receipt); } catch { /* 磁盘 unknown；固定类别审计不在这里重复 */ }
+	}
+
+	/** 终态 failed：固定类别审计可见。幂等重放会原样返回它，不自动重做外部副作用 */
+	#failReceipt(receipt: CreateReceipt, err: unknown, scope?: { repo: string; team: string }): void {
+		this.#stampReceipt(receipt, "failed", "failed");
+		this.#tryAudit({ kind: "session.create", sessionId: receipt.sessionId, actor: receipt.principalId, repo: scope?.repo, team: scope?.team, summary: `创建失败 ${receipt.operationId} stage=failed（固定类别）`, verdict: "deny" });
+		void err;
+	}
+
+	/** 定向应答帧（不广播、不带 seq，与 attach 内 sendError 同缝）：创建方连接自行消费 */
+	#replyCreated(conn: Conn, receipt: CreateReceipt, replayed: boolean): void {
+		conn.outbox.send(JSON.stringify({ event: {
+			type: "session.created", operationId: receipt.operationId, requestId: receipt.requestId,
+			sessionId: receipt.sessionId, stage: receipt.stage, outcome: receipt.outcome, replayed,
+		} }));
+	}
+
+	#replyCreateError(conn: Conn, message: string): void {
+		conn.outbox.send(JSON.stringify({ event: { type: "error", code: "command_failed", message } }));
+	}
+
+	/**
+	 * S3b：显式创建命令（WS {type:"create", operationId, requestHash?}）。
+	 * 幂等语义：同 principal+operationId+requestHash → 返回原收据（审计标 replay，不新建资源）；
+	 * 同键不同内容 → 固定类别拒绝；不同 principal 即使同键也不共用收据（按 principal 哈希目录隔离）。
+	 * 同键并发的显式创建单飞（进程内互斥）：所有等待者拿同一 sessionId；跨进程由 S3a stateRoot 独占锁保证。
+	 * 非终态收据（崩溃残留已恢复为 outcome_unknown）原样返回：不当成功、不自动重做外部副作用。
+	 */
+	#handleCreateCommand(conn: Conn, cmd: Extract<ClientCommand, { type: "create" }>, actor: string): void {
+		if (this.#draining || this.#closed) { this.#replyCreateError(conn, "网关正在关闭，拒绝新任务"); return; }
+		const principalId = conn.principal ? `${conn.principal.issuer}|${conn.principal.subject}` : actor;
+		const requestHash = cmd.requestHash ?? "";
+		let existing: CreateReceipt | undefined;
+		try {
+			existing = this.#receipts.load(principalId, cmd.operationId);
+		} catch (err) {
+			// 损坏收据绝不能按「不存在」处理 —— 那会为同一键创建第二个会话
+			void err;
+			this.#replyCreateError(conn, "创建收据损坏，拒绝创建（固定类别；交运维处理）");
+			return;
+		}
+		if (existing) {
+			if (existing.requestHash !== requestHash) {
+				this.#tryAudit({ kind: "session.create", sessionId: existing.sessionId, actor, summary: `创建冲突：operationId ${cmd.operationId} 已用于不同内容，拒绝（固定类别）`, verdict: "deny" });
+				this.#replyCreateError(conn, "operationId 已用于不同内容，拒绝（固定类别）");
+				return;
+			}
+			this.#tryAudit({ kind: "session.create", sessionId: existing.sessionId, actor, summary: `创建重放（replay）：${cmd.operationId} 返回原收据` });
+			this.#replyCreated(conn, existing, true);
+			return;
+		}
+		if (this.#sessions.size >= (this.#cfg.maxSessions ?? 50)) { this.#replyCreateError(conn, "会话数已达上限"); return; }
+		const key = `${createHash("sha256").update(principalId).digest("hex")}\u0000${cmd.operationId}`;
+		const inflight = this.#createInflight.get(key);
+		if (inflight) {
+			// 同键并发：跟随在途创建，所有等待者得到同一 sessionId/收据
+			void inflight.then(
+				(receipt) => {
+					this.#tryAudit({ kind: "session.create", sessionId: receipt.sessionId, actor, summary: `创建重放（replay）：${cmd.operationId} 并发等待同一结果` });
+					this.#replyCreated(conn, receipt, true);
+				},
+				() => this.#replyCreateError(conn, "会话创建失败（固定类别）"),
+			);
+			return;
+		}
+		const run = this.#runCreate(cmd.operationId, requestHash, actor, principalId, conn);
+		this.#createInflight.set(key, run);
+		// 双分支都接住：清理单飞表的同时避免未处理 rejection
+		void run.then(() => this.#createInflight.delete(key), () => this.#createInflight.delete(key));
+		void run.then(
+			(receipt) => this.#replyCreated(conn, receipt, false),
+			(err) => this.#replyCreateError(conn, err instanceof CreateDeniedError ? err.message : "会话创建失败（固定类别）"),
+		);
+	}
+
+	/** S3b：显式创建执行体。先落 accepted 收据，再做外部副作用（工作区、harness）；任一步
+	 * 失败收据终态 failed。createStageProbe 仅供测试故障注入（生产不配置），隐式创建不经过它。 */
+	async #runCreate(operationId: string, requestHash: string, actor: string, principalId: string, conn: Conn): Promise<CreateReceipt> {
+		const sessionId = randomUUID();
+		// scope 解析（纯计算）先于收据与副作用；解析失败 = 从未受理（无收据，固定拒绝）
+		const scope = this.#resolveCreationScope(actor, conn.principal, join(this.#stateRoot, "sessions", sessionId, "meta.json"));
+		const receipt = this.#newReceipt(operationId, requestHash, actor, principalId, sessionId);
+		this.#receipts.save(receipt); // 先落身份与 stage，再做任何外部副作用（写失败即拒绝创建）
+		this.#tryAudit({ kind: "session.create", sessionId, actor, repo: scope.repo, team: scope.team, summary: `创建受理 ${operationId} stage=accepted` });
+		try {
+			const probe = this.#cfg.createStageProbe;
+			if (probe) await probe("accepted", sessionId);
+			const { session } = this.#buildSession(sessionId, actor, { principal: conn.principal, expiresAt: conn.expiresAt, sid: conn.sid }, scope);
+			this.#stampReceipt(receipt, "workspace_ready");
+			this.#tryAudit({ kind: "session.create", sessionId, actor, repo: scope.repo, team: scope.team, summary: `创建 ${operationId} stage=workspace_ready` });
+			if (probe) await probe("workspace_ready", sessionId);
+			const settled = session.start().then(
+				() => this.#stampReceipt(receipt, "harness_ready", "created"),
+				(err) => { this.#failReceipt(receipt, err, scope); throw err; },
+			);
+			await settled;
+			this.#tryAudit({ kind: "session.create", sessionId, actor, repo: scope.repo, team: scope.team, summary: `创建 ${operationId} stage=harness_ready` });
+			return receipt;
+		} catch (err) {
+			if (receipt.stage !== "failed") this.#failReceipt(receipt, err, scope);
+			throw err;
+		}
+	}
+
 
 	/** 实际监听端口上的默认回环 Host（仅 demo 且未显式配置 allowedHosts 时使用） */
 	#loopbackHost(host: string): boolean {
@@ -1250,19 +1468,34 @@ export class Gateway {
 		this.#serveStatic(req, res, url);
 	}
 
-	/** S3a：readiness 判定。只返回布尔；失败细节不进响应（固定类别短文本，不泄露路径/配置/错误原文） */
+	/** S3a：readiness 判定。只返回布尔；失败细节不进响应（固定类别短文本，不泄露路径/配置/错误原文）
+	 * S3b（复审 note-1/2/3）：draining/close 即时翻红不走缓存；其余结果 ≥1s 复用（限频）；
+	 * 探针文件名唯一（并发探测互不覆盖、不误报 503），失败路径清理自己产生的全部文件不残留 */
 	#isReady(): boolean {
 		if (this.#draining || this.#closed) return false;
+		const now = Date.now();
+		if (now - this.#readyCacheAt < 1_000) return this.#readyCacheOk;
+		const ok = this.#computeReady();
+		this.#readyCacheAt = now;
+		this.#readyCacheOk = ok;
+		return ok;
+	}
+
+	#computeReady(): boolean {
 		if (!lockStillHeld(this.#lock)) return false; // 锁仍由本实例持有
 		// 策略可加载的前提：配置在位（策略本体由会话启动时经 runtime 加载，网关层只验在位）
 		if (!existsSync(this.#cfg.policyFile)) return false;
-		// stateRoot 可写：探针走 tmp+rename+unlink，与既有持久化同一写路径
+		// stateRoot 可写：探针走 tmp+rename+unlink，与既有持久化同一写路径；
+		// 探针与 tmp 名都带 pid+随机后缀 —— 固定名下 A.unlink 与 B.unlink 的竞争会瞬时假 503
+		const probe = join(this.#stateRoot, `.readyz-probe-${process.pid}-${randomUUID()}`);
+		const tmp = `${probe}.tmp`;
 		try {
-			const probe = join(this.#stateRoot, ".readyz-probe");
-			writeFileSync(probe + ".tmp", "1", { mode: 0o600 });
-			renameSync(probe + ".tmp", probe);
+			writeFileSync(tmp, "1", { mode: 0o600 });
+			renameSync(tmp, probe);
 			unlinkSync(probe);
 		} catch {
+			// 失败探针不残留：清理本次产生的两个文件（各自唯一名，不误删他人）
+			for (const leftover of [tmp, probe]) { try { unlinkSync(leftover); } catch { /* 不存在或不可删 */ } }
 			return false;
 		}
 		try { this.#audit.checkWritable(); } catch { return false; }
@@ -2031,6 +2264,8 @@ interface AttachOpts {
 	isPrincipalId?: (id: string) => boolean;
 	/** S3a：网关正在关闭（drain/close）—— 新 prompt/steer 在网关门上被拒，abort/approve 不受限 */
 	gatewayDraining?: () => boolean;
+	/** S3b：显式 create 是网关级操作（收据幂等），不属于当前会话；由网关判定并定向应答 */
+	handleCreate?: (conn: Conn, cmd: Extract<ClientCommand, { type: "create" }>, actor: string) => void;
 }
 
 function attach(ws: WebSocket, session: Session, actor: string, opts: AttachOpts): void {
@@ -2088,6 +2323,13 @@ function attach(ws: WebSocket, session: Session, actor: string, opts: AttachOpts
 				conn.ws.close(4003, "资源权限已撤销");
 				void session.expirePending(actor);
 				session.publish({ type: "session.presence", participants: participants(session) });
+				return;
+			}
+			if (cmd.type === "create") {
+				// S3b：显式创建是网关级操作（收据幂等），不写当前会话的命令审计；viewer/approver 无创建权
+				const role = roleOf(meta.data, actor);
+				if (!role || role === "viewer" || role === "approver") { sendError("无权创建会话：只有 owner 与 editor 可创建"); return; }
+				opts.handleCreate?.(conn, cmd, actor);
 				return;
 			}
 			session.auditCommand(actor, cmd.type);

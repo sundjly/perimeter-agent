@@ -3,6 +3,10 @@ import type { ClientCommand } from "./types.ts";
 /** 入站命令的运行时校验。`as ClientCommand` 不是校验：类型、长度、枚举、未知字段都在这里拒绝 */
 export const PROMPT_MAX_BYTES = 64 * 1024;
 const ID_MAX = 256;
+/** S3b：operationId 直接参与收据文件名，限死字符集（不含点/斜杠，路径不可由客户端字符串构造） */
+const OPERATION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+/** S3b：requestHash 是不透明指纹（客户端自选摘要算法），只限字符集与长度 */
+const REQUEST_HASH = /^[A-Za-z0-9_-]{1,128}$/;
 const KEYS: Record<string, string[]> = {
 	prompt: ["type", "text", "requestId"],
 	steer: ["type", "text", "requestId"],
@@ -10,6 +14,7 @@ const KEYS: Record<string, string[]> = {
 	unshare: ["type", "actor"],
 	abort: ["type"],
 	approve: ["type", "approvalId", "decision"],
+	create: ["type", "operationId", "requestHash"],
 };
 
 const str = (v: unknown, max: number): v is string => typeof v === "string" && v.length > 0 && v.length <= max;
@@ -29,6 +34,9 @@ export function parseCommand(raw: unknown, maxPromptBytes = PROMPT_MAX_BYTES): {
 		if (c.type === "share" && c.role !== "editor" && c.role !== "approver" && c.role !== "viewer") return { ok: false, error: "共享角色无效" };
 	} else if (c.type === "approve") {
 		if (!str(c.approvalId, ID_MAX) || (c.decision !== "allow" && c.decision !== "deny")) return { ok: false, error: "审批命令无效" };
+	} else if (c.type === "create") {
+		if (typeof c.operationId !== "string" || !OPERATION_ID.test(c.operationId)) return { ok: false, error: "operationId 无效" };
+		if (c.requestHash !== undefined && (typeof c.requestHash !== "string" || !REQUEST_HASH.test(c.requestHash))) return { ok: false, error: "requestHash 无效" };
 	}
 	return { ok: true, cmd: c as unknown as ClientCommand };
 }

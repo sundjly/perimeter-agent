@@ -26,7 +26,9 @@ const REPO = fileURLToPath(new URL("..", import.meta.url));
 
 /** 明确不需要前端处理的事件，每条都要写明理由 */
 const EXEMPT: Record<string, string> = {
-	
+	// S3b：显式创建的定向应答帧，只发回发起连接（不广播、不带 seq），CLI/API 消费；
+	// 网页 UI 不切换会话，无需进共享状态
+	"session.created": "定向应答：创建方连接自行消费，UI 不切换会话",
 };
 
 /** 只取 reduce() 函数体内的 case —— 别处的 switch 不算前端对协议的处理 */
@@ -51,7 +53,7 @@ function handledInRender(): string[] {
 
 test("解析假设成立 —— 否则下面几条会静默通过", () => {
 	// 协议侧数量由编译期保证，这里钉住它别在重构中被削掉
-	assert.equal(CLIENT_EVENT_TYPES.length, 22, "事件数变了：确认是有意增删，再改这个数字");
+	assert.equal(CLIENT_EVENT_TYPES.length, 23, "事件数变了：确认是有意增删，再改这个数字");
 	assert.ok(handledInRender().length >= 15, `reduce() 里只解析到 ${handledInRender().length} 个 case`);
 });
 

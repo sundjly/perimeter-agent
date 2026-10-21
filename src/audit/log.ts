@@ -17,6 +17,7 @@ import { createInterface } from "node:readline";
 export type AuditKind =
 	| "session.start"
 	| "session.end"
+	| "session.create"
 	| "prompt"
 	| "tool.call"
 	| "tool.result"

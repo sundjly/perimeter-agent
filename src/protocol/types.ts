@@ -28,12 +28,15 @@ export type ClientEvent =
 	/** output：累计快照，前端 replace（不是增量） */
 	| { type: "tool.progress"; callId: string; output: string }
 	| { type: "tool.end"; callId: string; ok: boolean; output: string; action?: ActionDescriptor; order?: number }
-	| { type: "approval.request"; approvalId: string; action: ActionDescriptor; reason: string; expiresAt: number; actor?: string }
+	| { type: "approval.request"; approvalId: string; action: ActionDescriptor; reason: string; expiresAt: number; actor?: string; argsHash?: string }
 	| { type: "approval.resolved"; approvalId: string; decision: Decision; actor: string }
 	| { type: "policy.denied"; action: ActionDescriptor; rule: string; reason: string; callId?: string }
 	| { type: "audit.entry"; entry: AuditEntryView }
 	/** 累计快照，前端 replace（不是增量，累加会得到天文数字） */
 	| { type: "usage"; usage: Usage }
+	/** S3b：显式创建的定向应答（只发回发起连接，不广播、不带 seq）。replayed=true 表示
+	 * 命中既有收据原样返回；stage/outcome 如实透传收据（outcome_unknown 不当成功） */
+	| { type: "session.created"; operationId: string; requestId: string; sessionId: string; stage: string; outcome: string; replayed: boolean }
 	| { type: "error"; code: ErrorCode; message: string };
 
 /**
@@ -69,6 +72,7 @@ export const CLIENT_EVENT_TYPES = [
 	"policy.denied",
 	"audit.entry",
 	"usage",
+	"session.created",
 	"error",
 ] as const;
 
@@ -88,10 +92,13 @@ export type ErrorCode = "aborted" | "agent_error" | "extension_error" | "command
 export type ClientCommand =
 	| { type: "prompt"; text: string; requestId: string }
 	| { type: "steer"; text: string; requestId: string }
-	| { type: "share"; actor: string; role: "editor" | "viewer" }
+	| { type: "share"; actor: string; role: "editor" | "approver" | "viewer" }
 	| { type: "unshare"; actor: string }
 	| { type: "abort" }
 	| { type: "approve"; approvalId: string; decision: Decision }
+	/** S3b：显式创建会话。operationId 是幂等键（按 principal 作用域隔离）；requestHash
+	 * 是客户端对创建内容的指纹（缺省按空内容记账），同键不同内容固定拒绝 */
+	| { type: "create"; operationId: string; requestHash?: string }
 	;;
 
 export type Decision = "allow" | "deny";
@@ -136,12 +143,12 @@ export interface AuditEntryView {
 	approver?: string;
 }
 
-export type Role = "owner" | "editor" | "viewer";
+export type Role = "owner" | "editor" | "approver" | "viewer";
 export interface Participant { actor: string; role: Role; clients: number }
 export interface MessageView { id: string; order?: number; role: "user" | "assistant"; text: string; thinking: string; actor?: string }
 export interface ToolView { callId: string; order?: number; action: ActionDescriptor; output: string; ok?: boolean }
 export interface SessionView {
 	sessionId: string; model: string | null; streaming: boolean; messages: MessageView[]; tools: ToolView[];
-	inbox: { id: string; mode: string }[]; approvals: { approvalId: string; action: ActionDescriptor; reason: string; actor?: string; expiresAt: number }[];
+	inbox: { id: string; mode: string }[]; approvals: { approvalId: string; action: ActionDescriptor; reason: string; actor?: string; expiresAt: number; argsHash?: string }[];
 	participants: Participant[]; usage: Usage; audit: AuditEntryView[]; role: Role;
 }

@@ -92,6 +92,8 @@ function eventType(entry: AuditEntry): string {
 const CATEGORY: Record<AuditKind, string> = {
 	"session.start": "session",
 	"session.end": "session",
+	// S3b：创建收据（受理/重放/冲突/恢复标记）也是会话生命周期事件
+	"session.create": "session",
 	prompt: "web",
 	"tool.call": "process",
 	"tool.result": "process",
