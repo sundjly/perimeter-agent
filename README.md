@@ -75,4 +75,4 @@ Docker 参考镜像只装 pi-env daemon。`docker build -t perimeter-sandbox:tes
 
 ## 交接与实现记录
 
-[handoff.md](docs/handoff.md) 记录铁律、坑和同步修改纪律；[重构规格 §9](docs/durable-rearchitecture.md#9-实现记录实现者填写) 记录 API 差异与取舍；[review-log.md](docs/review-log.md) 记录提交前审查。流程为实现 → subagent review → 修复 → 测试全绿 → 独立 commit；不 push。
+[docs/README.md](docs/README.md) 是全部文档索引与各阶段最终评审入口；[handoff.md](docs/handoff.md) 记录铁律、坑和同步修改纪律；[重构规格 §9](docs/durable-rearchitecture.md#9-实现记录实现者填写) 记录 API 差异与取舍；[review-log.md](docs/review-log.md) 记录提交前审查。流程为实现 → subagent review → 修复 → 测试全绿 → 独立 commit；不 push。

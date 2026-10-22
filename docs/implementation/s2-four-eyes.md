@@ -1,6 +1,6 @@
 # S2 四眼审批（Four-Eyes Approval / Two-Person Rule）实现与验证报告
 
-> **状态**：已完成 (Completed)，待评审 (In Review)
+> **状态**：已完成；最终复审见 `docs/reviews/grok-s2-four-eyes-round-5.md`
 > **依据**：`docs/handoff.md §5.2` P0 四眼安全检查单及 `coverage s2-four-eyes`；本版含 Grok S2 四眼第一审（`docs/reviews/grok-s2-four-eyes-round-1.md`，request_changes）的最小加固修复
 > **最近更新**：2026-10-15（R1 修复轮）
 
