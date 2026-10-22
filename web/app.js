@@ -40,7 +40,9 @@ function render(state) {
 		const card = node("details", "", `tool ${tool.ok === false ? "deny" : "info"}`);
 		card.open = expanded.has(tool.callId);
 		card.ontoggle = () => { if (card.open) expanded.add(tool.callId); else expanded.delete(tool.callId); };
-		card.append(node("summary", `${tool.action.tool}: ${tool.action.command ?? tool.action.path ?? ""}`), node("pre", tool.output));
+		// S5b：截断标记走 textContent 拼接（CSP 约束不变）；originalBytes 缺省时只报截断
+		const clipNote = tool.truncated ? `\n（已截断${tool.originalBytes ? `，原始 ${tool.originalBytes} 字节` : ""}）` : "";
+		card.append(node("summary", `${tool.action.tool}: ${tool.action.command ?? tool.action.path ?? ""}`), node("pre", tool.output + clipNote));
 		children.push({ order: tool.order ?? Number.MAX_SAFE_INTEGER, element: card });
 	}
 	for (const approval of state.approvals) {

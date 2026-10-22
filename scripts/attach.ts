@@ -88,7 +88,9 @@ ws.on("message", (raw) => {
 	}
 	if (frame.event.type === "session.snapshot") {
 		for (const tool of state.tools) if (shownTools.get(tool.callId) !== tool.output) {
-			print(tool.action.tool, tool.action.command ?? tool.action.path, tool.ok === false ? labels.deny : "", tool.output);
+			// S5b：截断的工具带原始字节长度，与网页同一文案
+			const clipNote = tool.truncated ? `（已截断${tool.originalBytes ? `，原始 ${tool.originalBytes} 字节` : ""}）` : "";
+			print(tool.action.tool, tool.action.command ?? tool.action.path, tool.ok === false ? labels.deny : "", tool.output, clipNote);
 			shownTools.set(tool.callId, tool.output);
 		}
 	}

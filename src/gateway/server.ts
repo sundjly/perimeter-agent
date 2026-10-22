@@ -126,6 +126,9 @@ export interface GatewayConfig {
 	promptLedgerMaxEntries?: number;
 	/** S5a：初始快照 tail 与每页历史的上限（项数/序列化字节；默认 200 项 / 1MiB，handoff §3.2）。透传给每个 Session */
 	historyTail?: { maxItems?: number; maxBytes?: number };
+	/** S5b：快照 tools 数组的出口上限（项数/序列化字节；默认 200 项 / 512KiB）。透传给每个 Session。
+	 * 与 historyTail 分账：两者默认值之和 + 单项余量留有 < maxFrameBytes 的余量；同时调大两者时需自行保证 */
+	toolsTail?: { maxItems?: number; maxBytes?: number };
 	/** S5a2：会话构造后的探针（仅供测试/故障注入：拿到 Session 实例以注入重构快照等；
 	 * 生产不配置，零行为影响；先例 createStageProbe） */
 	sessionProbe?: (session: Session) => void;
@@ -324,6 +327,17 @@ export class Gateway {
 			}
 			if (cfg.historyTail.maxBytes !== undefined && cfg.historyTail.maxBytes > this.#limits.maxFrameBytes - 256 * 1024) {
 				throw new Error("配置非法：historyTail.maxBytes 过大：必须小于 maxFrameBytes 减去单项截断余量（256KiB）");
+			}
+		}
+		// S5b：tools 出口上限同尺校验。预算与 messages 分账：默认 messages 1MiB + tools 512KiB
+		// + 单项截断余量（单项各字段 ≤64KiB）+ 固定字段合计 < maxFrameBytes；这里按同一条
+		// 256KiB 余量公式单项封顶，两处同时调大时的合计预算由配置者保证（注释即约定）
+		if (cfg.toolsTail !== undefined) {
+			for (const [name, value] of Object.entries(cfg.toolsTail)) {
+				if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`配置非法：toolsTail.${name} 必须为正整数`);
+			}
+			if (cfg.toolsTail.maxBytes !== undefined && cfg.toolsTail.maxBytes > this.#limits.maxFrameBytes - 256 * 1024) {
+				throw new Error("配置非法：toolsTail.maxBytes 过大：必须小于 maxFrameBytes 减去单项截断余量（256KiB）");
 			}
 		}
 
@@ -1331,6 +1345,8 @@ export class Gateway {
 			...(this.#cfg.promptLedgerMaxEntries !== undefined ? { promptLedgerMaxEntries: this.#cfg.promptLedgerMaxEntries } : {}),
 			// S5a：有界 tail/分页上限透传（未配置时用 Session 默认 200 项 / 1MiB）
 			...(this.#cfg.historyTail !== undefined ? { historyTail: this.#cfg.historyTail } : {}),
+			// S5b：tools 出口上限透传（未配置时用 Session 默认 200 项 / 512KiB）
+			...(this.#cfg.toolsTail !== undefined ? { toolsTail: this.#cfg.toolsTail } : {}),
 			model: this.#cfg.model,
 			// S4c：scoped 签发密钥下发到会话（Session #start 内按调用 mint；未配置时零影响）
 			...(this.#modelScopedKey !== undefined ? { modelScopedKey: this.#modelScopedKey } : {}),

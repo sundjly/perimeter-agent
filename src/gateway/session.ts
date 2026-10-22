@@ -4,7 +4,7 @@ import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { AuditLog, contentHash, type AuditEntry } from "../audit/log.ts";
-import type { ClientCommand, ClientEvent, SessionView, Role, MessageView } from "../protocol/types.ts";
+import type { ClientCommand, ClientEvent, SessionView, Role, MessageView, ToolView } from "../protocol/types.ts";
 import { HISTORY_MAX_PAGE_ITEMS } from "../protocol/validate.ts";
 import { isSafeScopedIdentityValue, mintScopedToken } from "../modelgw/scoped-token.ts";
 import { HarnessHost } from "../runtime/harness-host.ts";
@@ -48,6 +48,11 @@ export interface SessionOptions {
 	/** S5a：初始快照 tail 与每页历史的上限（项数与序列化字节，取更严）。默认 200 项 / 1MiB
 	 * （handoff §3.2）。配置需保证 maxBytes + 单项截断余量 < 网关 maxFrameBytes，否则快照帧必超限 */
 	historyTail?: { maxItems?: number; maxBytes?: number };
+	/** S5b：快照 tools 数组的出口上限（项数与序列化字节，取更严）。默认 200 项 / 512KiB。
+	 * 字节预算与 messages 分账：默认帧预算 = messages 1MiB + tools 512KiB + 单项截断余量与
+	 * 固定字段（audit/approvals/participants 等） < maxFrameBytes(2MiB)。配置两处时需自行
+	 * 保证两者之和留有余量，否则快照帧必超限 */
+	toolsTail?: { maxItems?: number; maxBytes?: number };
 }
 
 const DEFAULT_PROMPT_LEDGER_MAX_ENTRIES = 10_000;
@@ -57,6 +62,10 @@ const DEFAULT_HISTORY_TAIL_ITEMS = 200;
 const DEFAULT_HISTORY_TAIL_BYTES = 1024 * 1024;
 /** S5a：单项展示上限（text/thinking 各自按 UTF-8 字节裁剪，码点边界对齐），超限带 truncated 标记与原始长度 */
 export const HISTORY_MAX_ITEM_BYTES = 64 * 1024;
+/** S5b：快照 tools 出口的默认上限。字节预算与 messages（1MiB）分账，512KiB + 单项余量
+ * （单个工具各展示字段 ≤64KiB）+ 固定字段合计仍留有 < maxFrameBytes(2MiB) 的余量 */
+const DEFAULT_TOOLS_TAIL_ITEMS = 200;
+const DEFAULT_TOOLS_TAIL_BYTES = 512 * 1024;
 
 /**
  * S4c：模型 scoped 凭证的短 TTL（10min）—— 被窃凭证的可用窗口有界；tokenProvider
@@ -84,6 +93,9 @@ export class Session {
 	#tailItems: number;
 	#tailBytes: number;
 	#historyCursorKey: Buffer;
+	/** S5b：快照 tools 出口上限（项数/序列化字节，取更严） */
+	#toolsItems: number;
+	#toolsBytes: number;
 	constructor(opts: SessionOptions) {
 		this.#opts = opts;
 		this.#aclVersion = opts.aclVersion ?? 1;
@@ -99,6 +111,15 @@ export class Session {
 		}
 		this.#tailItems = tail?.maxItems ?? DEFAULT_HISTORY_TAIL_ITEMS;
 		this.#tailBytes = tail?.maxBytes ?? DEFAULT_HISTORY_TAIL_BYTES;
+		// S5b：tools 出口上限同尺 fail-fast
+		const toolsTail = opts.toolsTail;
+		if (toolsTail !== undefined) {
+			for (const [name, value] of Object.entries(toolsTail)) {
+				if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`配置非法：toolsTail.${name} 必须为正整数`);
+			}
+		}
+		this.#toolsItems = toolsTail?.maxItems ?? DEFAULT_TOOLS_TAIL_ITEMS;
+		this.#toolsBytes = toolsTail?.maxBytes ?? DEFAULT_TOOLS_TAIL_BYTES;
 		// S5a/S5a2：游标 HMAC 密钥。签名覆盖 sessionId+idx+锚消息 id：伪造/篡改/跨会话
 		// 一律验签失败；权威数组重构（durable 压缩 splice 前缀）由锚点核对检出、固定失效。
 		// 网关重启或会话回收后旧游标同样失效（客户端重新 attach 取新尾页），不持久化 —— 导航态不值得密钥管理
@@ -301,23 +322,41 @@ export class Session {
 		return { ...view, audit: [...this.#audit] };
 	}
 
-	// ── S5a：有界快照与历史分页（handoff §3.2：初始 tail 200 项且 ≤1MiB，超限返回分页游标）──
+	// ── S5a/S5b：有界快照与历史分页（handoff §3.2：初始 tail 200 项且 ≤1MiB，超限返回分页游标；
+	// S5b：tools 数组同一出口裁剪，单项展示字段 ≤64KiB）──
 
-	/** 单条超大消息按确定性规则裁剪（每字段 ≤HISTORY_MAX_ITEM_BYTES，UTF-8 码点边界对齐），
+	/** 单个展示字段按 UTF-8 码点边界确定性截断（≤limit 字节）。未超限原样返回；
+	 * originalBytes 是未裁前字节长度（已含在返回值里，调用方按需取用） */
+	#clipField(s: string, limit: number): { text: string; originalBytes: number; clipped: boolean } {
+		const bytes = Buffer.byteLength(s, "utf8");
+		if (bytes <= limit) return { text: s, originalBytes: bytes, clipped: false };
+		const buf = Buffer.from(s, "utf8");
+		let end = limit;
+		while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+		return { text: buf.subarray(0, end).toString("utf8"), originalBytes: bytes, clipped: true };
+	}
+
+	/** 单条超大消息按确定性规则裁剪（每字段 ≤HISTORY_MAX_ITEM_BYTES），
 	 * 带 truncated 标记与原始字节长度 —— 不让单项撑爆 tail 预算与帧上限 */
 	#clipMessage(message: MessageView): MessageView {
-		const textBytes = Buffer.byteLength(message.text, "utf8");
-		const thinkingBytes = Buffer.byteLength(message.thinking, "utf8");
-		if (textBytes <= HISTORY_MAX_ITEM_BYTES && thinkingBytes <= HISTORY_MAX_ITEM_BYTES) return message;
-		const clip = (s: string, bytes: number): string => {
-			if (bytes <= HISTORY_MAX_ITEM_BYTES) return s;
-			const buf = Buffer.from(s, "utf8");
-			let end = HISTORY_MAX_ITEM_BYTES;
-			while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
-			return buf.subarray(0, end).toString("utf8");
-		};
-		return { ...message, text: clip(message.text, textBytes), thinking: clip(message.thinking, thinkingBytes),
-			truncated: true, originalBytes: textBytes + thinkingBytes };
+		const text = this.#clipField(message.text, HISTORY_MAX_ITEM_BYTES);
+		const thinking = this.#clipField(message.thinking, HISTORY_MAX_ITEM_BYTES);
+		if (!text.clipped && !thinking.clipped) return message;
+		return { ...message, text: text.text, thinking: thinking.text,
+			truncated: true, originalBytes: text.originalBytes + thinking.originalBytes };
+	}
+
+	/** S5b：单个工具展示视图裁剪：output/command/path 各 ≤HISTORY_MAX_ITEM_BYTES，任一超限
+	 * 带 truncated/originalBytes（原始字节=各展示字段未裁前之和，与 MessageView 同口径）。
+	 * 只裁出口：服务端权威状态与模型上下文不变 */
+	#clipTool(tool: ToolView): ToolView {
+		const output = this.#clipField(tool.output, HISTORY_MAX_ITEM_BYTES);
+		const command = tool.action.command !== undefined ? this.#clipField(tool.action.command, HISTORY_MAX_ITEM_BYTES) : undefined;
+		const path = tool.action.path !== undefined ? this.#clipField(tool.action.path, HISTORY_MAX_ITEM_BYTES) : undefined;
+		if (!output.clipped && !command?.clipped && !path?.clipped) return tool;
+		return { ...tool, output: output.text,
+			action: { ...tool.action, ...(command?.clipped ? { command: command.text } : {}), ...(path?.clipped ? { path: path.text } : {}) },
+			truncated: true, originalBytes: output.originalBytes + (command?.originalBytes ?? 0) + (path?.originalBytes ?? 0) };
 	}
 
 	/** 从数组尾部向前收集：条数与序列化字节双上限（取更严）；最新一项始终保留，
@@ -337,11 +376,32 @@ export class Session {
 		return { items: clipped.slice(start), oldestIncluded: start };
 	}
 
-	/** 对外快照视图：内部 #view 保持全量（权威历史留在服务端），只有出口被裁成有界尾页并附历史元信息 */
+	/** S5b：tools 数组同一出口裁剪（尾部=最新；进行中的工具以 MAX_SAFE_INTEGER order 排在
+	 * 末位，天然保留）。返回 oldestIncluded 是首项在原数组中的下标，供快照元信息 */
+	#boundedTools(tools: ToolView[]): { items: ToolView[]; oldestIncluded: number } {
+		const clipped = tools.map((tool) => this.#clipTool(tool));
+		let start = tools.length;
+		let count = 0;
+		let bytes = 0;
+		for (let i = tools.length - 1; i >= 0; i--) {
+			const size = Buffer.byteLength(JSON.stringify(clipped[i]), "utf8");
+			if (count > 0 && (count + 1 > this.#toolsItems || bytes + size > this.#toolsBytes)) break;
+			count++;
+			bytes += size;
+			start = i;
+		}
+		return { items: clipped.slice(start), oldestIncluded: start };
+	}
+
+	/** 对外快照视图：内部 #view 保持全量（权威历史留在服务端），只有出口被裁成有界尾页并附
+	 * 历史与 tools 元信息。注入形快照（测试/容错）允许缺 messages/tools，按空数组处理 */
 	#outboundView(view: SessionView): SessionView {
-		const { items, oldestIncluded } = this.#boundedTail(view.messages, this.#tailItems, this.#tailBytes);
-		return { ...view, messages: items,
-			history: { total: view.messages.length, oldestIncluded, cursor: oldestIncluded > 0 ? this.#mintCursor(oldestIncluded) : null } };
+		const messages = view.messages ?? [];
+		const { items, oldestIncluded } = this.#boundedTail(messages, this.#tailItems, this.#tailBytes);
+		const tools = this.#boundedTools(view.tools ?? []);
+		return { ...view, messages: items, tools: tools.items,
+			history: { total: messages.length, oldestIncluded, cursor: oldestIncluded > 0 ? this.#mintCursor(oldestIncluded) : null },
+			toolsHistory: { total: (view.tools ?? []).length, oldestIncluded: tools.oldestIncluded } };
 	}
 
 	/** S5a2：游标 v2 —— 语义是「messages[idx] 之前的全部条目」，签名与锚点绑定：anchor
@@ -531,7 +591,23 @@ export class Session {
 			this.#opts.send({ type: "session.snapshot", view: this.#outboundView({ ...event.view, audit: [...this.#audit] }) }, ++this.#seq);
 			return;
 		}
+		// S5b：增量工具事件的单工具大输出按 64KiB 截断 —— progress 是累计快照，一个多 MiB
+		// 的 bash 输出会让单帧撞 maxFrameBytes 被 1009 断连。内部 #view 已在上面吃全量，
+		// 这里只裁出口；不依赖 vendor 的输出窗口默认值（handoff §3.2 在本层接线）
+		if (event.type === "tool.progress" || event.type === "tool.end") {
+			this.#opts.send(this.#clipToolEvent(event), ++this.#seq);
+			return;
+		}
 		this.#opts.send(event, ++this.#seq);
+	}
+
+	/** S5b：增量工具事件的 output 超 64KiB 时确定性截断并带 truncated/originalBytes；
+	 * 未超限原样返回（不添加字段，保持帧内容与既有行为逐字不变）。事件级标记只描述
+	 * 本事件被裁的 output 字段；快照 ToolView 级标记覆盖全部展示字段（见 types.ts） */
+	#clipToolEvent(event: Extract<ClientEvent, { type: "tool.progress" | "tool.end" }>): ClientEvent {
+		const output = this.#clipField(event.output, HISTORY_MAX_ITEM_BYTES);
+		if (!output.clipped) return event;
+		return { ...event, output: output.text, truncated: true, originalBytes: output.originalBytes };
 	}
 	publish(event: ClientEvent): void { this.#emit(event); }
 	auditCommand(actor: string, summary: string): void {

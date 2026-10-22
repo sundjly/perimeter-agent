@@ -3,6 +3,13 @@ export function initialState() {
 	return { sessionId: "", model: null, streaming: false, messages: [], tools: [], inbox: [], approvals: [], participants: [],
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "viewer", errors: [], phase: "", history: null };
 }
+/** S5b：增量工具事件携带的截断标记同步到工具卡上。事件不带标记时清除残留 ——
+ * 大输出的 progress（已截断）之后跟小输出的 end，不得留下过期标记。删除键而非置
+ * undefined，保证深度相等断言与 JSON 序列化都不出现幽灵字段 */
+function applyToolClip(tool, event) {
+	if (event.truncated === undefined) { delete tool.truncated; delete tool.originalBytes; }
+	else { tool.truncated = event.truncated; tool.originalBytes = event.originalBytes; }
+}
 /** @param {import("./view-model.js").ViewState} state @param {import("../src/protocol/types.ts").ClientEvent} event */
 export function reduce(state, event) {
 	const next = { ...state, messages: state.messages.map((item) => ({ ...item })), tools: state.tools.map((item) => ({ ...item })) };
@@ -39,17 +46,28 @@ export function reduce(state, event) {
 			} break; }
 		case "tool.start": {
 			const tool = next.tools.find((item) => item.callId === event.callId);
-			if (tool) tool.action = event.action;
-			else next.tools.push({ callId: event.callId, order: Number.MAX_SAFE_INTEGER, action: event.action, output: "" });
+			if (tool) { tool.action = event.action; applyToolClip(tool, event); }
+			else {
+				next.tools.push({ callId: event.callId, order: Number.MAX_SAFE_INTEGER, action: event.action, output: "" });
+				// S5b：新工具进入视图时同步 tools 元信息（与 message.start 同步 history.total 同一
+				// 语义：替换同 callId 不计新增），否则客户端持有的 total 在下一次快照前是陈旧的
+				if (next.toolsHistory) next.toolsHistory = { ...next.toolsHistory, total: next.toolsHistory.total + 1 };
+			}
 			break;
 		}
-		case "tool.progress": { const tool = next.tools.find((item) => item.callId === event.callId); if (tool) tool.output = event.output; break; }
+		case "tool.progress": { const tool = next.tools.find((item) => item.callId === event.callId); if (tool) { tool.output = event.output; applyToolClip(tool, event); } break; }
 		case "tool.end": {
 			let tool = next.tools.find((item) => item.callId === event.callId);
-			if (!tool && event.action) { tool = { callId: event.callId, action: event.action, output: "" }; next.tools.push(tool); }
+			if (!tool && event.action) {
+				tool = { callId: event.callId, action: event.action, output: "" };
+				next.tools.push(tool);
+				// 错过 tool.start 时（同上）：新建工具卡也算新增
+				if (next.toolsHistory) next.toolsHistory = { ...next.toolsHistory, total: next.toolsHistory.total + 1 };
+			}
 			if (tool) {
 				tool.output = event.output; tool.ok = event.ok;
 				if (event.action) tool.action = event.action;
+				applyToolClip(tool, event);
 				if (event.order !== undefined) { tool.order = event.order; next.tools.sort((a, b) => (a.order ?? 0) - (b.order ?? 0)); }
 			}
 			break;

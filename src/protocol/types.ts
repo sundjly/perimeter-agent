@@ -25,9 +25,10 @@ export type ClientEvent =
 	| { type: "message.thinking"; messageId: string; delta: string }
 	| { type: "message.end"; messageId: string; text: string; thinking?: string; entryId?: string; order?: number }
 	| { type: "tool.start"; callId: string; action: ActionDescriptor; summary: string }
-	/** output：累计快照，前端 replace（不是增量） */
-	| { type: "tool.progress"; callId: string; output: string }
-	| { type: "tool.end"; callId: string; ok: boolean; output: string; action?: ActionDescriptor; order?: number }
+	/** output：累计快照，前端 replace（不是增量）。S5b：超过单项上限时服务端截断并带标记；
+	 * 事件上的 originalBytes 只指本事件 output 字段的原始字节（快照 ToolView 上是各展示字段之和） */
+	| { type: "tool.progress"; callId: string; output: string; truncated?: boolean; originalBytes?: number }
+	| { type: "tool.end"; callId: string; ok: boolean; output: string; action?: ActionDescriptor; order?: number; truncated?: boolean; originalBytes?: number }
 	| { type: "approval.request"; approvalId: string; action: ActionDescriptor; reason: string; expiresAt: number; actor?: string; argsHash?: string }
 	| { type: "approval.resolved"; approvalId: string; decision: Decision; actor: string }
 	| { type: "policy.denied"; action: ActionDescriptor; rule: string; reason: string; callId?: string }
@@ -158,11 +159,20 @@ export interface MessageView { id: string; order?: number; role: "user" | "assis
  * 重构数组，此时旧游标按锚点核对固定失效，不静默错位）；cursor 指向「比它更早」
  * 的一页，由服务端签发并绑定 sessionId+边界锚点，客户端只能原样回传 */
 export interface SessionHistoryMeta { total: number; oldestIncluded: number; cursor: string | null }
-export interface ToolView { callId: string; order?: number; action: ActionDescriptor; output: string; ok?: boolean }
+/** S5b：快照 tools 出口裁剪的元信息（与 SessionHistoryMeta 同构）。本轮不做 tools 分页：
+ * 游标机制绑定 messages 数组结构（锚点=消息 id），tools 语义不同（含进行中的
+ * MAX_SAFE_INTEGER order 项、与 durable 压缩的交互不同），元信息先行、分页待需要时另设计 */
+export interface SessionToolsMeta { total: number; oldestIncluded: number }
+/** S5b：单条工具视图的截断标记 —— output/command/path 各展示字段 ≤64KiB，任一超限
+ * 确定性截断；originalBytes 是各展示字段未裁前的字节和（与 MessageView 同口径） */
+export interface ToolView { callId: string; order?: number; action: ActionDescriptor; output: string; ok?: boolean; truncated?: boolean; originalBytes?: number }
 export interface SessionView {
 	sessionId: string; model: string | null; streaming: boolean; messages: MessageView[]; tools: ToolView[];
 	inbox: { id: string; mode: string }[]; approvals: { approvalId: string; action: ActionDescriptor; reason: string; actor?: string; expiresAt: number; argsHash?: string }[];
 	participants: Participant[]; usage: Usage; audit: AuditEntryView[]; role: Role;
 	/** S5a：快照为有界尾页时必带；全量快照（旧服务端）缺省 */
 	history?: SessionHistoryMeta;
+	/** S5b：tools 出口裁剪元信息（total=权威 tools 总数，oldestIncluded=尾页首项下标）。
+	 * 旧服务端缺省；客户端不得假设每次快照都携带（与 history 同一漂移语义） */
+	toolsHistory?: SessionToolsMeta;
 }
