@@ -46,12 +46,13 @@ export interface SessionOptions {
 	 * 变成无提示窗口）；默认 10_000，需运维归档轮替。网关构造期校验正整数 */
 	promptLedgerMaxEntries?: number;
 	/** S5a：初始快照 tail 与每页历史的上限（项数与序列化字节，取更严）。默认 200 项 / 1MiB
-	 * （handoff §3.2）。配置需保证 maxBytes + 单项截断余量 < 网关 maxFrameBytes，否则快照帧必超限 */
+	 * （handoff §3.2）。单项校验（S5a：maxBytes ≤ maxFrameBytes-256KiB）与合计校验（S5c：
+	 * 与 toolsTail.maxBytes 之和 +256KiB ≤ maxFrameBytes）都在网关构造期 fail-fast，超限启动即报错 */
 	historyTail?: { maxItems?: number; maxBytes?: number };
 	/** S5b：快照 tools 数组的出口上限（项数与序列化字节，取更严）。默认 200 项 / 512KiB。
 	 * 字节预算与 messages 分账：默认帧预算 = messages 1MiB + tools 512KiB + 单项截断余量与
-	 * 固定字段（audit/approvals/participants 等） < maxFrameBytes(2MiB)。配置两处时需自行
-	 * 保证两者之和留有余量，否则快照帧必超限 */
+	 * 固定字段（audit/approvals/participants 等） < maxFrameBytes(2MiB)。S5c：网关构造期按
+	 * 实际生效值校验两者之和（+256KiB 余量 ≤ maxFrameBytes），合计超限启动即报错 */
 	toolsTail?: { maxItems?: number; maxBytes?: number };
 }
 
@@ -59,13 +60,15 @@ const DEFAULT_PROMPT_LEDGER_MAX_ENTRIES = 10_000;
 
 /** S5a：初始 tail 与单页的默认上限（handoff §3.2：初始 tail 200 项且 ≤1MiB） */
 const DEFAULT_HISTORY_TAIL_ITEMS = 200;
-const DEFAULT_HISTORY_TAIL_BYTES = 1024 * 1024;
+/** S5c：导出默认字节预算，供网关构造期按「实际生效值」做 historyTail+toolsTail 合计校验 */
+export const DEFAULT_HISTORY_TAIL_BYTES = 1024 * 1024;
 /** S5a：单项展示上限（text/thinking 各自按 UTF-8 字节裁剪，码点边界对齐），超限带 truncated 标记与原始长度 */
 export const HISTORY_MAX_ITEM_BYTES = 64 * 1024;
 /** S5b：快照 tools 出口的默认上限。字节预算与 messages（1MiB）分账，512KiB + 单项余量
- * （单个工具各展示字段 ≤64KiB）+ 固定字段合计仍留有 < maxFrameBytes(2MiB) 的余量 */
+ * （单个工具各展示字段 ≤64KiB）+ 固定字段合计仍留有 < maxFrameBytes(2MiB) 的余量。
+ * S5c：导出同上，供网关构造期合计校验 */
 const DEFAULT_TOOLS_TAIL_ITEMS = 200;
-const DEFAULT_TOOLS_TAIL_BYTES = 512 * 1024;
+export const DEFAULT_TOOLS_TAIL_BYTES = 512 * 1024;
 
 /**
  * S4c：模型 scoped 凭证的短 TTL（10min）—— 被窃凭证的可用窗口有界；tokenProvider
@@ -322,8 +325,9 @@ export class Session {
 		return { ...view, audit: [...this.#audit] };
 	}
 
-	// ── S5a/S5b：有界快照与历史分页（handoff §3.2：初始 tail 200 项且 ≤1MiB，超限返回分页游标；
-	// S5b：tools 数组同一出口裁剪，单项展示字段 ≤64KiB）──
+	// ── S5a/S5b/S5c：有界快照、历史分页与工具分页（handoff §3.2：初始 tail 200 项且 ≤1MiB，
+	// 超限返回分页游标；S5b：tools 数组同一出口裁剪、单项展示字段 ≤64KiB；S5c：被裁旧工具经
+	// tools.page+t2 游标回看，合计字节预算构造期校验）──
 
 	/** 单个展示字段按 UTF-8 码点边界确定性截断（≤limit 字节）。未超限原样返回；
 	 * originalBytes 是未裁前字节长度（已含在返回值里，调用方按需取用） */
@@ -377,7 +381,8 @@ export class Session {
 	}
 
 	/** S5b：tools 数组同一出口裁剪（尾部=最新；进行中的工具以 MAX_SAFE_INTEGER order 排在
-	 * 末位，天然保留）。返回 oldestIncluded 是首项在原数组中的下标，供快照元信息 */
+	 * 末位，最新一项恒保留，常态下整体随尾页保留）。返回 oldestIncluded 是首项在原数组
+	 * 中的下标，供快照元信息 */
 	#boundedTools(tools: ToolView[]): { items: ToolView[]; oldestIncluded: number } {
 		const clipped = tools.map((tool) => this.#clipTool(tool));
 		let start = tools.length;
@@ -401,7 +406,9 @@ export class Session {
 		const tools = this.#boundedTools(view.tools ?? []);
 		return { ...view, messages: items, tools: tools.items,
 			history: { total: messages.length, oldestIncluded, cursor: oldestIncluded > 0 ? this.#mintCursor(oldestIncluded) : null },
-			toolsHistory: { total: (view.tools ?? []).length, oldestIncluded: tools.oldestIncluded } };
+			toolsHistory: { total: (view.tools ?? []).length, oldestIncluded: tools.oldestIncluded,
+				// S5c：被裁掉的旧工具可经 tools.page 回看；cursor 与 history 游标同构但按种类区分（t2）
+				cursor: tools.oldestIncluded > 0 ? this.#mintToolsCursor(tools.oldestIncluded) : null } };
 	}
 
 	/** S5a2：游标 v2 —— 语义是「messages[idx] 之前的全部条目」，签名与锚点绑定：anchor
@@ -430,9 +437,38 @@ export class Session {
 		return { state: "ok", idx, anchor };
 	}
 
+	/** S5c：tools 游标 —— 与 history 游标同一密钥、同一构造（idx+锚），但 HMAC 域分隔为
+	 * "tools" 且格式前缀 t2：跨种类游标在形状层（parseCommand 的 v2/t2 互斥）就被拒，
+	 * 绕过形状校验也要过域分隔验签这一关。锚取 tools[idx-1].callId（被游标覆盖范围的
+	 * 最新一个工具）。常态（尾页容量 ≥ 并发进行中工具数）下：已完结工具 order 单调递增、
+	 * 前缀只增不移，进行中工具以 MAX_SAFE_INTEGER order 恒排尾部、只随尾页下发，锚不
+	 * 漂移。但这非不变量 —— 尾页容量不足（如 maxItems=1 或字节预算 < 单项）时进行中
+	 * 工具可被裁出尾页并成为锚；并行完结（更早 live 工具先完结插入前缀末端）可能使
+	 * 锚后移失配（锚工具自身先完结则恰落回原位、游标仍有效）。任何失配由锚点核对
+	 * 检出、固定 stale 要求重新接入，无静默错位；durable 压缩等前缀重构同一语义 */
+	#mintToolsCursor(idx: number): string {
+		const anchor = this.#view?.tools[idx - 1]?.callId ?? "";
+		const sig = createHmac("sha256", this.#historyCursorKey).update(`${this.sessionId}\u0000tools\u0000${idx}\u0000${anchor}`).digest("hex").slice(0, 32);
+		return `t2.${idx}.${anchor}.${sig}`;
+	}
+
+	/** S5c：invalid=形状/签名不通过（伪造/篡改/跨会话/跨种类）。锚点是否仍指向同一结构
+	 * 由 #toolsPage 核对，失配属 stale → 固定失效、不返回任何数据 */
+	#verifyToolsCursor(cursor: string): { state: "ok"; idx: number; anchor: string } | { state: "invalid" } {
+		const match = /^t2\.(\d{1,12})\.([A-Za-z0-9_-]{1,64})\.([0-9a-f]{32})$/.exec(cursor);
+		if (!match) return { state: "invalid" };
+		const idx = Number(match[1]);
+		const anchor = match[2]!;
+		const expected = createHmac("sha256", this.#historyCursorKey).update(`${this.sessionId}\u0000tools\u0000${idx}\u0000${anchor}`).digest("hex").slice(0, 32);
+		const got = Buffer.from(match[3]!, "hex");
+		const want = Buffer.from(expected, "hex");
+		if (got.length !== want.length || !timingSafeEqual(got, want)) return { state: "invalid" };
+		return { state: "ok", idx, anchor };
+	}
+
 	handle(cmd: ClientCommand, actor = this.#opts.actor, _from?: unknown): void {
 		this.#lastActivity = Date.now();
-		if (!cmd || typeof cmd !== "object" || !["prompt", "steer", "approve", "abort", "history.page"].includes(cmd.type)) {
+		if (!cmd || typeof cmd !== "object" || !["prompt", "steer", "approve", "abort", "history.page", "tools.page"].includes(cmd.type)) {
 			this.#emit({ type: "error", code: "command_failed", message: "非法命令" }); return;
 		}
 		const role = this.#opts.getRole?.(actor);
@@ -450,16 +486,26 @@ export class Session {
 		if (this.#opts.isAuthorized && !this.#opts.isAuthorized(actor)) {
 			this.#emit({ type: "error", code: "command_failed", message: "资源权限已撤销" }); return;
 		}
-		if (cmd.type === "history.page") {
-			// S5a：只读分页 —— 任何成员角色（含 viewer）可读；不进队列（排队语义只对写命令有意义），
-			// 未就绪固定拒绝；错误只定向回发起连接（与分页应答同一通道，不广播）
+		if (cmd.type === "history.page" || cmd.type === "tools.page") {
+			// S5a/S5c：只读分页（历史/被裁旧工具）—— 任何成员角色（含 viewer）可读；不进队列
+			//（排队语义只对写命令有意义），未就绪固定拒绝；错误只定向回发起连接（与分页应答
+			// 同一通道，不广播）。授权与 sessionId 核对在网关分支已过，这里只做游标语义
 			if (!this.#host) { this.#opts.send({ type: "error", code: "command_failed", message: "会话尚未就绪（固定类别）" }, ++this.#seq, _from); return; }
-			void this.#historyPage(cmd, _from).catch((error: unknown) => {
-				// 已知的固定类别拒绝（游标无效/会话不匹配）保留原文；未知异常不透传内部细节
-				const known = error instanceof Error && error.message.includes("固定类别");
-				this.#opts.send({ type: "error", code: "command_failed",
-					message: known ? (error as Error).message : "历史分页失败（固定类别）" }, ++this.#seq, _from);
-			});
+			if (cmd.type === "history.page") {
+				void this.#historyPage(cmd, _from).catch((error: unknown) => {
+					// 已知的固定类别拒绝（游标无效/会话不匹配）保留原文；未知异常不透传内部细节
+					const known = error instanceof Error && error.message.includes("固定类别");
+					this.#opts.send({ type: "error", code: "command_failed",
+						message: known ? (error as Error).message : "历史分页失败（固定类别）" }, ++this.#seq, _from);
+				});
+			} else {
+				void this.#toolsPage(cmd, _from).catch((error: unknown) => {
+					// 同上：固定类别保留原文；未知异常统一「工具分页失败」
+					const known = error instanceof Error && error.message.includes("固定类别");
+					this.#opts.send({ type: "error", code: "command_failed",
+						message: known ? (error as Error).message : "工具分页失败（固定类别）" }, ++this.#seq, _from);
+				});
+			}
 			return;
 		}
 		if (!this.#host) {
@@ -580,6 +626,42 @@ export class Session {
 		// 定向应答（只发回发起连接，不广播）：历史对各成员相同，但没必要让所有端都收一份
 		this.#opts.send({ type: "history.page", items, total, oldestIncluded: start,
 			cursor: start > 0 ? this.#mintCursor(start) : null }, ++this.#seq, from);
+	}
+
+	/** S5c：被裁掉的旧工具向更早方向翻一页。与 #historyPage 完全同构：授权与 sessionId
+	 * 核对在网关分支已过；游标验签 + 锚点核对（锚=callId，前缀重构或锚失配 → 固定失效
+	 * 而非静默错位）；每页项数（toolsTail.maxItems）+ 序列化字节（toolsTail.maxBytes）
+	 * 双上限、单项 64KiB 截断，与 history.page 同一把尺；应答与错误都只定向发回发起
+	 * 连接。常态下进行中工具（MAX order）只随尾页下发、分页范围为已完结前缀，不漏不重；
+	 * 尾页容量不足或并行完结时锚可能移动，失配固定 stale 拒绝并要求重新接入 */
+	async #toolsPage(cmd: Extract<ClientCommand, { type: "tools.page" }>, from?: unknown): Promise<void> {
+		if (cmd.sessionId !== this.sessionId) throw new Error("会话不匹配（固定类别）");
+		const tools = this.#view?.tools ?? [];
+		const total = tools.length;
+		const verified = this.#verifyToolsCursor(cmd.cursor);
+		if (verified.state === "invalid") throw new Error("游标无效（固定类别）");
+		// 锚点核对：当前数组 idx-1 位置的 callId 必须与签发时一致，且 idx 不越界 —— 不一致
+		// 说明权威数组已被重构（如 durable 压缩清理了工具前缀），旧游标指向的内容不可再定位
+		if (verified.idx > total || (tools[verified.idx - 1]?.callId ?? "") !== verified.anchor) {
+			throw new Error("游标已失效，请重新接入（固定类别）");
+		}
+		const idx = verified.idx;
+		const limit = Math.min(cmd.limit ?? this.#toolsItems, this.#toolsItems, HISTORY_MAX_PAGE_ITEMS);
+		// 从 idx-1 向更早收集，条数/字节双上限，至少一项（idx>0 时），保证客户端总能前进
+		const items: ToolView[] = [];
+		let start = idx;
+		let bytes = 0;
+		for (let i = idx - 1; i >= 0; i--) {
+			const item = this.#clipTool(tools[i]!);
+			const size = Buffer.byteLength(JSON.stringify(item), "utf8");
+			if (items.length > 0 && (items.length + 1 > limit || bytes + size > this.#toolsBytes)) break;
+			items.unshift(item);
+			bytes += size;
+			start = i;
+		}
+		// 定向应答（只发回发起连接，不广播）
+		this.#opts.send({ type: "tools.page", items, total, oldestIncluded: start,
+			cursor: start > 0 ? this.#mintToolsCursor(start) : null }, ++this.#seq, from);
 	}
 
 	#emit(event: ClientEvent): void {

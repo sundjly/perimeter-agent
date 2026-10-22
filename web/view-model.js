@@ -1,7 +1,7 @@
 /** 自有协议的纯 reducer，两端共用。 */
 export function initialState() {
 	return { sessionId: "", model: null, streaming: false, messages: [], tools: [], inbox: [], approvals: [], participants: [],
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "viewer", errors: [], phase: "", history: null };
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "viewer", errors: [], phase: "", history: null, toolsHistory: null };
 }
 /** S5b：增量工具事件携带的截断标记同步到工具卡上。事件不带标记时清除残留 ——
  * 大输出的 progress（已截断）之后跟小输出的 end，不得留下过期标记。删除键而非置
@@ -93,6 +93,20 @@ export function reduce(state, event) {
 			}
 			next.messages = [...older, ...next.messages];
 			next.history = { total: event.total, oldestIncluded: event.oldestIncluded, cursor: event.cursor };
+			break;
+		}
+		case "tools.page": {
+			// S5c：更早的工具向前 prepend，按 callId 去重（含页内重复，与 history.page 同一语义）；
+			// 元信息以服务端应答为准，cursor 为空表示已到最早
+			const knownCalls = new Set(next.tools.map((item) => item.callId));
+			const olderTools = [];
+			for (const item of event.items) {
+				if (knownCalls.has(item.callId)) continue;
+				knownCalls.add(item.callId);
+				olderTools.push(item);
+			}
+			next.tools = [...olderTools, ...next.tools];
+			next.toolsHistory = { total: event.total, oldestIncluded: event.oldestIncluded, cursor: event.cursor };
 			break;
 		}
 		case "error": next.errors = [...state.errors, event.message].slice(-100); break;

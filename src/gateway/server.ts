@@ -20,7 +20,7 @@ import { type SandboxWiring, writeGitCredentialConfig } from "./sandbox-config.t
 import type { ModelGateway } from "../runtime/models.ts";
 import { type Authenticator, BrowserSessions, JwtAuthenticator, type Principal, RemoteJwks, scopeFromGroups } from "./auth.ts";
 import { DEFAULT_LIMITS, type Limits, Outbox, RateLimiter, hostAllowed, originAllowed, validateLimits } from "./transport.ts";
-import { Session } from "./session.ts";
+import { DEFAULT_HISTORY_TAIL_BYTES, DEFAULT_TOOLS_TAIL_BYTES, Session } from "./session.ts";
 import { acquireGatewayLock, type HeldLock, lockStillHeld, releaseGatewayLock } from "./state-lock.ts";
 import { DEFAULT_RECEIPT_TTL_MS, ReceiptStore, type CreateReceipt, type ReceiptOutcome, type ReceiptStage } from "./receipt-store.ts";
 
@@ -127,7 +127,8 @@ export interface GatewayConfig {
 	/** S5a：初始快照 tail 与每页历史的上限（项数/序列化字节；默认 200 项 / 1MiB，handoff §3.2）。透传给每个 Session */
 	historyTail?: { maxItems?: number; maxBytes?: number };
 	/** S5b：快照 tools 数组的出口上限（项数/序列化字节；默认 200 项 / 512KiB）。透传给每个 Session。
-	 * 与 historyTail 分账：两者默认值之和 + 单项余量留有 < maxFrameBytes 的余量；同时调大两者时需自行保证 */
+	 * 与 historyTail 分账：默认值之和 + 单项余量留有 < maxFrameBytes 的余量。S5c：构造期按实际
+	 * 生效值做合计校验（两者之和 + 256KiB ≤ maxFrameBytes），合计超限启动即报错 */
 	toolsTail?: { maxItems?: number; maxBytes?: number };
 	/** S5a2：会话构造后的探针（仅供测试/故障注入：拿到 Session 实例以注入重构快照等；
 	 * 生产不配置，零行为影响；先例 createStageProbe） */
@@ -331,7 +332,7 @@ export class Gateway {
 		}
 		// S5b：tools 出口上限同尺校验。预算与 messages 分账：默认 messages 1MiB + tools 512KiB
 		// + 单项截断余量（单项各字段 ≤64KiB）+ 固定字段合计 < maxFrameBytes；这里按同一条
-		// 256KiB 余量公式单项封顶，两处同时调大时的合计预算由配置者保证（注释即约定）
+		// 256KiB 余量公式单项封顶，两处同时调大时的合计预算由下方 S5c 合计校验兜底（启动即报错）
 		if (cfg.toolsTail !== undefined) {
 			for (const [name, value] of Object.entries(cfg.toolsTail)) {
 				if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`配置非法：toolsTail.${name} 必须为正整数`);
@@ -339,6 +340,17 @@ export class Gateway {
 			if (cfg.toolsTail.maxBytes !== undefined && cfg.toolsTail.maxBytes > this.#limits.maxFrameBytes - 256 * 1024) {
 				throw new Error("配置非法：toolsTail.maxBytes 过大：必须小于 maxFrameBytes 减去单项截断余量（256KiB）");
 			}
+		}
+		// S5c：合计校验 —— 按实际生效值（配置值或默认值）核对 historyTail.maxBytes +
+		// toolsTail.maxBytes + 固定余量 ≤ maxFrameBytes。余量沿用单项校验的 256KiB 同一把尺：
+		// 覆盖 audit（≤100 条）/approvals/participants/usage/history 等固定字段，以及「最新一项
+		// 恒保留」允许越过字节预算的越界余量。默认 1MiB + 512KiB + 256KiB = 1.75MiB < 2MiB，
+		// 默认与常见合法组合必过；两项各自合法但合计超限时快照帧必然撞 maxFrameBytes
+		//（1009 断连，正是本机制要消除的失效模式），启动即报错、固定文案指出两项之和
+		const historyTailBytes = cfg.historyTail?.maxBytes ?? DEFAULT_HISTORY_TAIL_BYTES;
+		const toolsTailBytes = cfg.toolsTail?.maxBytes ?? DEFAULT_TOOLS_TAIL_BYTES;
+		if (historyTailBytes + toolsTailBytes + 256 * 1024 > this.#limits.maxFrameBytes) {
+			throw new Error(`配置非法：historyTail.maxBytes + toolsTail.maxBytes 合计超限（${historyTailBytes} + ${toolsTailBytes}，加单项截断余量 256KiB 超过 maxFrameBytes ${this.#limits.maxFrameBytes}），快照帧必然超限`);
 		}
 
 		if (cfg.mode === "production") {
@@ -2468,12 +2480,12 @@ function attach(ws: WebSocket, session: Session, actor: string, opts: AttachOpts
 				opts.handleCreate?.(conn, cmd, actor);
 				return;
 			}
-			if (cmd.type === "history.page") {
-				// S5a：只读历史分页 —— 与 attach 同一资源门（上方 isAuthorized 已过），任何成员角色
-				// （含 viewer）可读；不写命令审计（高频读操作不刷审计链）。连接与会话一一对应：
+			if (cmd.type === "history.page" || cmd.type === "tools.page") {
+				// S5a/S5c：只读历史/工具分页 —— 与 attach 同一资源门（上方 isAuthorized 已过），任何成员
+				// 角色（含 viewer）可读；不写命令审计（高频读操作不刷审计链）。连接与会话一一对应：
 				// 命令里的 sessionId 必须就是本会话，跨会话固定拒绝（不泄漏其他会话的存在性）
 				if (!roleOf(meta.data, actor)) { sendError("无权读取该会话（固定类别）"); return; }
-				if (cmd.sessionId !== session.sessionId) { sendError("history.page 会话不匹配（固定类别）"); return; }
+				if (cmd.sessionId !== session.sessionId) { sendError(`${cmd.type} 会话不匹配（固定类别）`); return; }
 				session.handle(cmd, actor, conn);
 				return;
 			}

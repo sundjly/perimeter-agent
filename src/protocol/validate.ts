@@ -13,6 +13,9 @@ const SESSION_ID_SAFE = /^[A-Za-z0-9_-]{1,64}$/;
  * MessageView.id，随游标携带不算新增信息泄漏；形状只验字符集，语义（含锚与当前
  * 权威数组是否一致）在服务端核验 */
 const CURSOR_SAFE = /^v2\.[0-9]{1,12}\.[A-Za-z0-9_-]{1,64}\.[0-9a-f]{32}$/;
+/** S5c：tools 游标 t2.<idx>.<锚callId>.<hmac32>，与 history 的 v2 游标同构但种类不同：
+ * 形状层就互斥（v2 只进 history.page、t2 只进 tools.page），语义层还有 HMAC 域分隔再拒一道 */
+const TOOLS_CURSOR_SAFE = /^t2\.[0-9]{1,12}\.[A-Za-z0-9_-]{1,64}\.[0-9a-f]{32}$/;
 /** S5a：单页项数上限（与默认 tail 项数同值；服务端还会按会话配置取更严） */
 export const HISTORY_MAX_PAGE_ITEMS = 200;
 const KEYS: Record<string, string[]> = {
@@ -24,6 +27,7 @@ const KEYS: Record<string, string[]> = {
 	approve: ["type", "approvalId", "decision"],
 	create: ["type", "operationId", "requestHash"],
 	"history.page": ["type", "sessionId", "cursor", "limit"],
+	"tools.page": ["type", "sessionId", "cursor", "limit"],
 };
 
 const str = (v: unknown, max: number): v is string => typeof v === "string" && v.length > 0 && v.length <= max;
@@ -50,6 +54,12 @@ export function parseCommand(raw: unknown, maxPromptBytes = PROMPT_MAX_BYTES): {
 		// S5a：cursor 必填（无游标的分页语义含混，不如让客户端带上次应答里的 cursor）
 		if (typeof c.sessionId !== "string" || !SESSION_ID_SAFE.test(c.sessionId)) return { ok: false, error: "sessionId 无效" };
 		if (typeof c.cursor !== "string" || !CURSOR_SAFE.test(c.cursor)) return { ok: false, error: "cursor 无效" };
+		if (c.limit !== undefined && (typeof c.limit !== "number" || !Number.isSafeInteger(c.limit) || c.limit < 1 || c.limit > HISTORY_MAX_PAGE_ITEMS)) return { ok: false, error: "limit 无效" };
+	} else if (c.type === "tools.page") {
+		// S5c：与 history.page 同尺；cursor 必须是 t2 形（v2 history 游标在这里就是非法形状，
+		// 跨种类在入口即拒）
+		if (typeof c.sessionId !== "string" || !SESSION_ID_SAFE.test(c.sessionId)) return { ok: false, error: "sessionId 无效" };
+		if (typeof c.cursor !== "string" || !TOOLS_CURSOR_SAFE.test(c.cursor)) return { ok: false, error: "cursor 无效" };
 		if (c.limit !== undefined && (typeof c.limit !== "number" || !Number.isSafeInteger(c.limit) || c.limit < 1 || c.limit > HISTORY_MAX_PAGE_ITEMS)) return { ok: false, error: "limit 无效" };
 	}
 	return { ok: true, cmd: c as unknown as ClientCommand };

@@ -58,6 +58,11 @@ const handleLine = (line: string): void => {
 		if (state.history?.cursor) ws.send(JSON.stringify({ type: "history.page", sessionId: state.sessionId, cursor: state.history.cursor }));
 		else print("没有更早的历史了");
 	}
+	else if (line === "/older-tools") {
+		// S5c：向更早翻一页工具；没有游标（已到最早或快照未带 toolsHistory）时明确告知
+		if (state.toolsHistory?.cursor) ws.send(JSON.stringify({ type: "tools.page", sessionId: state.sessionId, cursor: state.toolsHistory.cursor }));
+		else print("没有更早的工具了");
+	}
 	else if (line.startsWith("/share ")) { const [, actor, role] = line.split(" "); ws.send(JSON.stringify({ type: "share", actor, role })); }
 	else if (line.startsWith("/unshare ")) ws.send(JSON.stringify({ type: "unshare", actor: line.slice(9) }));
 	else if (line.startsWith("/approve ")) { const [, approvalId, decision] = line.split(" "); ws.send(JSON.stringify({ type: "approve", approvalId, decision })); }
@@ -66,7 +71,7 @@ const handleLine = (line: string): void => {
 input.on("line", handleLine);
 ws.on("open", () => {
 	wsOpen = true;
-	print(labels.connected, "输入消息；/steer 文本；/approve id allow|deny；/abort；/share actor editor|approver|viewer；/unshare actor；/older 加载更早历史");
+	print(labels.connected, "输入消息；/steer 文本；/approve id allow|deny；/abort；/share actor editor|approver|viewer；/unshare actor；/older 加载更早历史；/older-tools 加载更早工具");
 	for (const line of pendingLines.splice(0)) handleLine(line); // open 后按序补发排队命令
 	if (pendingCloseAfterFlush) ws.close(); // stdin 已结束：补发完再关（管道输入时序）
 });
@@ -86,7 +91,8 @@ ws.on("message", (raw) => {
 			shownMessages.set(message.id, message.text);
 		}
 	}
-	if (frame.event.type === "session.snapshot") {
+	if (frame.event.type === "session.snapshot" || frame.event.type === "tools.page") {
+		// S5c：tools.page 向前 prepend 的更早工具走同一套已见去重打印（shownTools 按 callId+输出去重）
 		for (const tool of state.tools) if (shownTools.get(tool.callId) !== tool.output) {
 			// S5b：截断的工具带原始字节长度，与网页同一文案
 			const clipNote = tool.truncated ? `（已截断${tool.originalBytes ? `，原始 ${tool.originalBytes} 字节` : ""}）` : "";

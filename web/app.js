@@ -10,6 +10,7 @@ let ws;
 let connected = false;
 const expanded = new Set();
 let loadingOlder = false;
+let loadingOlderTools = false;
 function node(tag, text, className = "") {
 	const element = document.createElement(tag);
 	element.textContent = text;
@@ -34,6 +35,19 @@ function render(state) {
 			render(state);
 		};
 		children.push({ order: -Infinity, element: older });
+	}
+	// S5c：还有更早的工具时置顶「加载更早工具」（与「加载更早」同一渲染纪律：textContent +
+	// onclick 属性赋值，不拼 HTML 标记、无内联事件，CSP 约束不变）；排序稳定，紧随历史按钮之后
+	if (state.toolsHistory?.cursor) {
+		const olderTools = node("button", labels.loadOlderTools, "ghost");
+		olderTools.disabled = !connected || loadingOlderTools;
+		olderTools.onclick = () => {
+			if (loadingOlderTools || !state.toolsHistory?.cursor) return;
+			loadingOlderTools = true;
+			send({ type: "tools.page", sessionId: state.sessionId, cursor: state.toolsHistory.cursor });
+			render(state);
+		};
+		children.push({ order: -Infinity, element: olderTools });
 	}
 	for (const message of state.messages) if (message.text || message.thinking) children.push({ order: message.order ?? 0, element: node("div", `${message.actor ?? (message.role === "user" ? "用户" : "助手")}\n${message.text}`, `msg ${message.role}`) });
 	for (const tool of state.tools) {
@@ -109,8 +123,11 @@ async function connect() {
 		const frame = JSON.parse(data);
 		if (frame.event) {
 			state = reduce(state, frame.event);
-			// S5a：分页应答（或失败）后恢复按钮；错误也算一次失败尝试，不把按钮卡死
-			if (frame.event.type === "history.page" || frame.event.type === "error") loadingOlder = false;
+			// S5a/S5c：分页应答（或失败）后恢复按钮；错误也算一次失败尝试，不把按钮卡死
+			if (frame.event.type === "history.page" || frame.event.type === "tools.page" || frame.event.type === "error") {
+				loadingOlder = false;
+				loadingOlderTools = false;
+			}
 			if (state.sessionId) {
 				params.set("session", state.sessionId);
 				history.replaceState(null, "", "?" + params.toString());

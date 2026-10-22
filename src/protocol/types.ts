@@ -41,6 +41,10 @@ export type ClientEvent =
 	/** S5a：历史分页应答。只定向发回发起连接（不广播）；items 按「旧→新」排列，
 	 * total/oldestIncluded 是服务端当前权威元信息，cursor 为空表示已到最早 */
 	| { type: "history.page"; items: MessageView[]; total: number; oldestIncluded: number; cursor: string | null }
+	/** S5c：工具分页应答（被裁掉的旧工具回看）。与 history.page 同构且同纪律：只定向
+	 * 发回发起连接（不广播）；items 按「旧→新」排列；cursor 为空表示已到最早。游标按
+	 * 种类区分（t2 前缀 + HMAC tools 域），history 游标不能用于 tools，反之亦然 */
+	| { type: "tools.page"; items: ToolView[]; total: number; oldestIncluded: number; cursor: string | null }
 	| { type: "error"; code: ErrorCode; message: string };
 
 /**
@@ -78,6 +82,7 @@ export const CLIENT_EVENT_TYPES = [
 	"usage",
 	"session.created",
 	"history.page",
+	"tools.page",
 	"error",
 ] as const;
 
@@ -106,7 +111,11 @@ export type ClientCommand =
 	| { type: "create"; operationId: string; requestHash?: string }
 	/** S5a：向更早方向翻页。cursor 由服务端签发（绑定 sessionId 的不透明 HMAC 串），
 	 * limit 可省略（取服务端 tail 项数上限）。只读命令：任何成员角色可发 */
-	| { type: "history.page"; sessionId: string; cursor: string; limit?: number };
+	| { type: "history.page"; sessionId: string; cursor: string; limit?: number }
+	/** S5c：向更早方向翻工具页（被裁掉的旧工具回看）。cursor 由服务端签发（t2 前缀，
+	 * 与 history 游标按种类互斥）；limit 可省略（取服务端 tools tail 项数上限）。
+	 * 只读命令：任何成员角色可发 */
+	| { type: "tools.page"; sessionId: string; cursor: string; limit?: number };
 
 export type Decision = "allow" | "deny";
 
@@ -159,10 +168,11 @@ export interface MessageView { id: string; order?: number; role: "user" | "assis
  * 重构数组，此时旧游标按锚点核对固定失效，不静默错位）；cursor 指向「比它更早」
  * 的一页，由服务端签发并绑定 sessionId+边界锚点，客户端只能原样回传 */
 export interface SessionHistoryMeta { total: number; oldestIncluded: number; cursor: string | null }
-/** S5b：快照 tools 出口裁剪的元信息（与 SessionHistoryMeta 同构）。本轮不做 tools 分页：
- * 游标机制绑定 messages 数组结构（锚点=消息 id），tools 语义不同（含进行中的
- * MAX_SAFE_INTEGER order 项、与 durable 压缩的交互不同），元信息先行、分页待需要时另设计 */
-export interface SessionToolsMeta { total: number; oldestIncluded: number }
+/** S5b：快照 tools 出口裁剪的元信息（与 SessionHistoryMeta 同构）。S5c：被裁掉的旧
+ * 工具可经 tools.page 分页回看 —— cursor 与 history 游标同构造但按种类区分（t2 前缀 +
+ * HMAC tools 域），锚=被覆盖范围最新一个已完结工具的 callId（进行中的 MAX order 工具恒
+ * 排尾部、只随尾页下发，永不成为锚）；权威 tools 数组前缀被重构时旧游标按锚点核对固定失效 */
+export interface SessionToolsMeta { total: number; oldestIncluded: number; cursor: string | null }
 /** S5b：单条工具视图的截断标记 —— output/command/path 各展示字段 ≤64KiB，任一超限
  * 确定性截断；originalBytes 是各展示字段未裁前的字节和（与 MessageView 同口径） */
 export interface ToolView { callId: string; order?: number; action: ActionDescriptor; output: string; ok?: boolean; truncated?: boolean; originalBytes?: number }
