@@ -1,0 +1,310 @@
+[bounded-runner] [run-1792670862537-9fe3f952] 启动命令: node scripts/s5-token-benchmark.ts --revision c66c785bc71d7539aaa2e0520fc0d8bb06a1b8e4 --base-output /tmp/perimeter-s5d-measure-0fFHKcC3/evidence/base-report.json --output /tmp/perimeter-s5d-measure-0fFHKcC3/evidence/s5-report.json --deadline-ms 540000 (总预算 600000ms, target 595500ms, 预挂先于 spawn)
+[bounded-runner] ⚠️ 进程组安全校验未通过: runner 父进程 PGID 观察失败/预算耗尽 → 组关系未知，零信号；仅身份四正证时单进程维度管理
+
+============================================================
+Perimeter S0 Benchmark Runner (Real Local Mock Pipeline)
+Tasks: 30 | Modes: cold,warm,recovery | Repetitions: 3
+Total Scheduled Runs: 270 | Deadline: 540s
+============================================================
+
+[1/270] ✓ task-01-range-off-by-one [cold#1] 283ms (TTFT: 96ms) RSS: 165.8MB
+[2/270] ✓ task-01-range-off-by-one [cold#2] 247ms (TTFT: 70ms) RSS: 169.7MB
+[3/270] ✓ task-01-range-off-by-one [cold#3] 245ms (TTFT: 70ms) RSS: 175.8MB
+[4/270] ✓ task-01-range-off-by-one [warm#1] 242ms (TTFT: 67ms) RSS: 176.1MB
+[5/270] ✓ task-01-range-off-by-one [warm#2] 214ms (TTFT: 45ms) RSS: 177.7MB
+[6/270] ✓ task-01-range-off-by-one [warm#3] 245ms (TTFT: 71ms) RSS: 178.0MB
+[7/270] ✓ task-01-range-off-by-one [recovery#1] 459ms (TTFT: 288ms rec=259ms) RSS: 178.1MB
+[8/270] ✓ task-01-range-off-by-one [recovery#2] 453ms (TTFT: 282ms rec=253ms) RSS: 178.3MB
+[9/270] ✓ task-01-range-off-by-one [recovery#3] 459ms (TTFT: 289ms rec=259ms) RSS: 179.3MB
+[10/270] ✓ task-02-semver-coverage [cold#1] 236ms (TTFT: 44ms) RSS: 179.4MB
+[11/270] ✓ task-02-semver-coverage [cold#2] 239ms (TTFT: 42ms) RSS: 179.5MB
+[12/270] ✓ task-02-semver-coverage [cold#3] 241ms (TTFT: 42ms) RSS: 181.1MB
+[13/270] ✓ task-02-semver-coverage [warm#1] 228ms (TTFT: 46ms) RSS: 181.2MB
+[14/270] ✓ task-02-semver-coverage [warm#2] 238ms (TTFT: 42ms) RSS: 181.2MB
+[15/270] ✓ task-02-semver-coverage [warm#3] 243ms (TTFT: 43ms) RSS: 181.3MB
+[16/270] ✓ task-02-semver-coverage [recovery#1] 453ms (TTFT: 282ms rec=253ms) RSS: 181.3MB
+[17/270] ✓ task-02-semver-coverage [recovery#2] 453ms (TTFT: 283ms rec=253ms) RSS: 181.4MB
+[18/270] ✓ task-02-semver-coverage [recovery#3] 457ms (TTFT: 286ms rec=257ms) RSS: 181.5MB
+[19/270] ✓ task-03-legacy-url-migration [cold#1] 244ms (TTFT: 43ms) RSS: 181.5MB
+[20/270] ✓ task-03-legacy-url-migration [cold#2] 239ms (TTFT: 44ms) RSS: 181.5MB
+[21/270] ✓ task-03-legacy-url-migration [cold#3] 266ms (TTFT: 66ms) RSS: 181.7MB
+[22/270] ✓ task-03-legacy-url-migration [warm#1] 239ms (TTFT: 43ms) RSS: 181.8MB
+[23/270] ✓ task-03-legacy-url-migration [warm#2] 267ms (TTFT: 68ms) RSS: 184.9MB
+[24/270] ✓ task-03-legacy-url-migration [warm#3] 241ms (TTFT: 45ms) RSS: 185.0MB
+[25/270] ✓ task-03-legacy-url-migration [recovery#1] 456ms (TTFT: 285ms rec=256ms) RSS: 185.0MB
+[26/270] ✓ task-03-legacy-url-migration [recovery#2] 455ms (TTFT: 284ms rec=255ms) RSS: 185.0MB
+[27/270] ✓ task-03-legacy-url-migration [recovery#3] 457ms (TTFT: 286ms rec=257ms) RSS: 185.1MB
+[28/270] ✓ task-04-slice-dedupe-refactor [cold#1] 236ms (TTFT: 43ms) RSS: 189.9MB
+[29/270] ✓ task-04-slice-dedupe-refactor [cold#2] 243ms (TTFT: 45ms) RSS: 195.0MB
+[30/270] ✓ task-04-slice-dedupe-refactor [cold#3] 238ms (TTFT: 44ms) RSS: 197.0MB
+[31/270] ✓ task-04-slice-dedupe-refactor [warm#1] 239ms (TTFT: 42ms) RSS: 197.1MB
+[32/270] ✓ task-04-slice-dedupe-refactor [warm#2] 245ms (TTFT: 43ms) RSS: 199.7MB
+[33/270] ✓ task-04-slice-dedupe-refactor [warm#3] 282ms (TTFT: 42ms) RSS: 204.9MB
+[34/270] ✓ task-04-slice-dedupe-refactor [recovery#1] 455ms (TTFT: 285ms rec=255ms) RSS: 206.5MB
+[35/270] ✓ task-04-slice-dedupe-refactor [recovery#2] 462ms (TTFT: 291ms rec=262ms) RSS: 208.2MB
+[36/270] ✓ task-04-slice-dedupe-refactor [recovery#3] 456ms (TTFT: 286ms rec=256ms) RSS: 209.4MB
+[37/270] ✓ task-05-null-pointer-guard [cold#1] 206ms (TTFT: 50ms) RSS: 209.5MB
+[38/270] ✓ task-05-null-pointer-guard [cold#2] 212ms (TTFT: 43ms) RSS: 209.5MB
+[39/270] ✓ task-05-null-pointer-guard [cold#3] 214ms (TTFT: 42ms) RSS: 156.1MB
+[40/270] ✓ task-05-null-pointer-guard [warm#1] 232ms (TTFT: 65ms) RSS: 158.3MB
+[41/270] ✓ task-05-null-pointer-guard [warm#2] 210ms (TTFT: 45ms) RSS: 158.6MB
+[42/270] ✓ task-05-null-pointer-guard [warm#3] 208ms (TTFT: 42ms) RSS: 159.5MB
+[43/270] ✓ task-05-null-pointer-guard [recovery#1] 459ms (TTFT: 288ms rec=259ms) RSS: 160.3MB
+[44/270] ✓ task-05-null-pointer-guard [recovery#2] 455ms (TTFT: 284ms rec=255ms) RSS: 151.4MB
+[45/270] ✓ task-05-null-pointer-guard [recovery#3] 464ms (TTFT: 294ms rec=264ms) RSS: 151.9MB
+[46/270] ✓ task-06-hex-color-parser [cold#1] 236ms (TTFT: 41ms) RSS: 152.7MB
+[47/270] ✓ task-06-hex-color-parser [cold#2] 237ms (TTFT: 44ms) RSS: 152.9MB
+[48/270] ✓ task-06-hex-color-parser [cold#3] 238ms (TTFT: 43ms) RSS: 153.9MB
+[49/270] ✓ task-06-hex-color-parser [warm#1] 239ms (TTFT: 42ms) RSS: 154.0MB
+[50/270] ✓ task-06-hex-color-parser [warm#2] 239ms (TTFT: 43ms) RSS: 154.3MB
+[51/270] ✓ task-06-hex-color-parser [warm#3] 234ms (TTFT: 41ms) RSS: 155.3MB
+[52/270] ✓ task-06-hex-color-parser [recovery#1] 461ms (TTFT: 290ms rec=261ms) RSS: 156.2MB
+[53/270] ✓ task-06-hex-color-parser [recovery#2] 456ms (TTFT: 285ms rec=256ms) RSS: 157.6MB
+[54/270] ✓ task-06-hex-color-parser [recovery#3] 456ms (TTFT: 285ms rec=256ms) RSS: 157.6MB
+[55/270] ✓ task-07-stream-backpressure-leak [cold#1] 231ms (TTFT: 66ms) RSS: 159.9MB
+[56/270] ✓ task-07-stream-backpressure-leak [cold#2] 215ms (TTFT: 42ms) RSS: 160.0MB
+[57/270] ✓ task-07-stream-backpressure-leak [cold#3] 210ms (TTFT: 43ms) RSS: 160.0MB
+[58/270] ✓ task-07-stream-backpressure-leak [warm#1] 212ms (TTFT: 42ms) RSS: 160.1MB
+[59/270] ✓ task-07-stream-backpressure-leak [warm#2] 209ms (TTFT: 44ms) RSS: 161.0MB
+[60/270] ✓ task-07-stream-backpressure-leak [warm#3] 213ms (TTFT: 43ms) RSS: 161.1MB
+[61/270] ✓ task-07-stream-backpressure-leak [recovery#1] 454ms (TTFT: 283ms rec=254ms) RSS: 161.1MB
+[62/270] ✓ task-07-stream-backpressure-leak [recovery#2] 457ms (TTFT: 286ms rec=257ms) RSS: 161.1MB
+[63/270] ✓ task-07-stream-backpressure-leak [recovery#3] 460ms (TTFT: 292ms rec=260ms) RSS: 161.1MB
+[64/270] ✓ task-08-uuid-v4-validator [cold#1] 246ms (TTFT: 45ms) RSS: 157.6MB
+[65/270] ✓ task-08-uuid-v4-validator [cold#2] 220ms (TTFT: 45ms) RSS: 157.6MB
+[66/270] ✓ task-08-uuid-v4-validator [cold#3] 199ms (TTFT: 49ms) RSS: 157.8MB
+[67/270] ✓ task-08-uuid-v4-validator [warm#1] 208ms (TTFT: 40ms) RSS: 158.9MB
+[68/270] ✓ task-08-uuid-v4-validator [warm#2] 211ms (TTFT: 40ms) RSS: 156.5MB
+[69/270] ✓ task-08-uuid-v4-validator [warm#3] 210ms (TTFT: 41ms) RSS: 156.5MB
+[70/270] ✓ task-08-uuid-v4-validator [recovery#1] 454ms (TTFT: 282ms rec=254ms) RSS: 157.3MB
+[71/270] ✓ task-08-uuid-v4-validator [recovery#2] 456ms (TTFT: 284ms rec=256ms) RSS: 158.8MB
+[72/270] ✓ task-08-uuid-v4-validator [recovery#3] 456ms (TTFT: 285ms rec=256ms) RSS: 160.3MB
+[73/270] ✓ task-09-crypto-timing-attack [cold#1] 246ms (TTFT: 45ms) RSS: 162.3MB
+[74/270] ✓ task-09-crypto-timing-attack [cold#2] 257ms (TTFT: 49ms) RSS: 164.2MB
+[75/270] ✓ task-09-crypto-timing-attack [cold#3] 248ms (TTFT: 43ms) RSS: 167.7MB
+[76/270] ✓ task-09-crypto-timing-attack [warm#1] 238ms (TTFT: 41ms) RSS: 167.7MB
+[77/270] ✓ task-09-crypto-timing-attack [warm#2] 247ms (TTFT: 43ms) RSS: 167.7MB
+[78/270] ✓ task-09-crypto-timing-attack [warm#3] 245ms (TTFT: 43ms) RSS: 167.7MB
+[79/270] ✓ task-09-crypto-timing-attack [recovery#1] 467ms (TTFT: 296ms rec=267ms) RSS: 167.7MB
+[80/270] ✓ task-09-crypto-timing-attack [recovery#2] 454ms (TTFT: 284ms rec=254ms) RSS: 167.7MB
+[81/270] ✓ task-09-crypto-timing-attack [recovery#3] 458ms (TTFT: 287ms rec=258ms) RSS: 167.7MB
+[82/270] ✓ task-10-event-emitter-leak [cold#1] 291ms (TTFT: 66ms) RSS: 168.0MB
+[83/270] ✓ task-10-event-emitter-leak [cold#2] 275ms (TTFT: 45ms) RSS: 168.0MB
+[84/270] ✓ task-10-event-emitter-leak [cold#3] 268ms (TTFT: 44ms) RSS: 168.2MB
+[85/270] ✓ task-10-event-emitter-leak [warm#1] 266ms (TTFT: 44ms) RSS: 168.2MB
+[86/270] ✓ task-10-event-emitter-leak [warm#2] 263ms (TTFT: 42ms) RSS: 168.2MB
+[87/270] ✓ task-10-event-emitter-leak [warm#3] 293ms (TTFT: 68ms) RSS: 169.9MB
+[88/270] ✓ task-10-event-emitter-leak [recovery#1] 460ms (TTFT: 293ms rec=260ms) RSS: 169.9MB
+[89/270] ✓ task-10-event-emitter-leak [recovery#2] 454ms (TTFT: 285ms rec=254ms) RSS: 169.9MB
+[90/270] ✓ task-10-event-emitter-leak [recovery#3] 458ms (TTFT: 288ms rec=258ms) RSS: 142.3MB
+[91/270] ✓ task-11-json-depth-limit [cold#1] 220ms (TTFT: 48ms) RSS: 144.9MB
+[92/270] ✓ task-11-json-depth-limit [cold#2] 241ms (TTFT: 67ms) RSS: 145.2MB
+[93/270] ✓ task-11-json-depth-limit [cold#3] 246ms (TTFT: 70ms) RSS: 146.0MB
+[94/270] ✓ task-11-json-depth-limit [warm#1] 247ms (TTFT: 69ms) RSS: 148.9MB
+[95/270] ✓ task-11-json-depth-limit [warm#2] 249ms (TTFT: 69ms) RSS: 148.9MB
+[96/270] ✓ task-11-json-depth-limit [warm#3] 249ms (TTFT: 69ms) RSS: 149.5MB
+[97/270] ✓ task-11-json-depth-limit [recovery#1] 461ms (TTFT: 292ms rec=261ms) RSS: 149.5MB
+[98/270] ✓ task-11-json-depth-limit [recovery#2] 467ms (TTFT: 300ms rec=267ms) RSS: 149.5MB
+[99/270] ✓ task-11-json-depth-limit [recovery#3] 455ms (TTFT: 303ms rec=255ms) RSS: 149.5MB
+[100/270] ✓ task-12-retry-exponential-jitter [cold#1] 271ms (TTFT: 70ms) RSS: 149.5MB
+[101/270] ✓ task-12-retry-exponential-jitter [cold#2] 274ms (TTFT: 69ms) RSS: 150.0MB
+[102/270] ✓ task-12-retry-exponential-jitter [cold#3] 281ms (TTFT: 79ms) RSS: 151.5MB
+[103/270] ✓ task-12-retry-exponential-jitter [warm#1] 264ms (TTFT: 66ms) RSS: 153.4MB
+[104/270] ✓ task-12-retry-exponential-jitter [warm#2] 244ms (TTFT: 46ms) RSS: 155.8MB
+[105/270] ✓ task-12-retry-exponential-jitter [warm#3] 241ms (TTFT: 46ms) RSS: 155.8MB
+[106/270] ✓ task-12-retry-exponential-jitter [recovery#1] 453ms (TTFT: 282ms rec=253ms) RSS: 155.8MB
+[107/270] ✓ task-12-retry-exponential-jitter [recovery#2] 462ms (TTFT: 291ms rec=262ms) RSS: 155.8MB
+[108/270] ✓ task-12-retry-exponential-jitter [recovery#3] 462ms (TTFT: 292ms rec=262ms) RSS: 155.8MB
+[109/270] ✓ task-13-cookie-samesite-parser [cold#1] 216ms (TTFT: 46ms) RSS: 155.8MB
+[110/270] ✓ task-13-cookie-samesite-parser [cold#2] 212ms (TTFT: 45ms) RSS: 155.8MB
+[111/270] ✓ task-13-cookie-samesite-parser [cold#3] 214ms (TTFT: 42ms) RSS: 155.8MB
+[112/270] ✓ task-13-cookie-samesite-parser [warm#1] 213ms (TTFT: 44ms) RSS: 155.8MB
+[113/270] ✓ task-13-cookie-samesite-parser [warm#2] 212ms (TTFT: 43ms) RSS: 155.8MB
+[114/270] ✓ task-13-cookie-samesite-parser [warm#3] 212ms (TTFT: 44ms) RSS: 155.8MB
+[115/270] ✓ task-13-cookie-samesite-parser [recovery#1] 459ms (TTFT: 289ms rec=259ms) RSS: 155.8MB
+[116/270] ✓ task-13-cookie-samesite-parser [recovery#2] 454ms (TTFT: 283ms rec=254ms) RSS: 155.8MB
+[117/270] ✓ task-13-cookie-samesite-parser [recovery#3] 454ms (TTFT: 284ms rec=254ms) RSS: 155.8MB
+[118/270] ✓ task-14-query-param-array-merge [cold#1] 214ms (TTFT: 44ms) RSS: 155.9MB
+[119/270] ✓ task-14-query-param-array-merge [cold#2] 216ms (TTFT: 47ms) RSS: 156.9MB
+[120/270] ✓ task-14-query-param-array-merge [cold#3] 209ms (TTFT: 43ms) RSS: 156.9MB
+[121/270] ✓ task-14-query-param-array-merge [warm#1] 211ms (TTFT: 44ms) RSS: 160.8MB
+[122/270] ✓ task-14-query-param-array-merge [warm#2] 212ms (TTFT: 43ms) RSS: 162.7MB
+[123/270] ✓ task-14-query-param-array-merge [warm#3] 213ms (TTFT: 44ms) RSS: 164.8MB
+[124/270] ✓ task-14-query-param-array-merge [recovery#1] 455ms (TTFT: 285ms rec=255ms) RSS: 166.4MB
+[125/270] ✓ task-14-query-param-array-merge [recovery#2] 458ms (TTFT: 291ms rec=258ms) RSS: 168.0MB
+[126/270] ✓ task-14-query-param-array-merge [recovery#3] 464ms (TTFT: 309ms rec=264ms) RSS: 168.3MB
+[127/270] ✓ task-15-utf8-surrogate-split [cold#1] 212ms (TTFT: 45ms) RSS: 168.3MB
+[128/270] ✓ task-15-utf8-surrogate-split [cold#2] 218ms (TTFT: 42ms) RSS: 168.4MB
+[129/270] ✓ task-15-utf8-surrogate-split [cold#3] 209ms (TTFT: 44ms) RSS: 169.0MB
+[130/270] ✓ task-15-utf8-surrogate-split [warm#1] 214ms (TTFT: 44ms) RSS: 169.0MB
+[131/270] ✓ task-15-utf8-surrogate-split [warm#2] 210ms (TTFT: 47ms) RSS: 169.5MB
+[132/270] ✓ task-15-utf8-surrogate-split [warm#3] 206ms (TTFT: 43ms) RSS: 169.5MB
+[133/270] ✓ task-15-utf8-surrogate-split [recovery#1] 453ms (TTFT: 283ms rec=253ms) RSS: 169.5MB
+[134/270] ✓ task-15-utf8-surrogate-split [recovery#2] 458ms (TTFT: 288ms rec=258ms) RSS: 169.5MB
+[135/270] ✓ task-15-utf8-surrogate-split [recovery#3] 455ms (TTFT: 290ms rec=255ms) RSS: 169.5MB
+[136/270] ✓ task-16-base64url-padding [cold#1] 218ms (TTFT: 68ms) RSS: 169.6MB
+[137/270] ✓ task-16-base64url-padding [cold#2] 212ms (TTFT: 45ms) RSS: 169.6MB
+[138/270] ✓ task-16-base64url-padding [cold#3] 208ms (TTFT: 45ms) RSS: 170.3MB
+[139/270] ✓ task-16-base64url-padding [warm#1] 213ms (TTFT: 43ms) RSS: 170.3MB
+[140/270] ✓ task-16-base64url-padding [warm#2] 209ms (TTFT: 44ms) RSS: 170.3MB
+[141/270] ✓ task-16-base64url-padding [warm#3] 219ms (TTFT: 44ms) RSS: 170.9MB
+[142/270] ✓ task-16-base64url-padding [recovery#1] 464ms (TTFT: 294ms rec=264ms) RSS: 170.9MB
+[143/270] ✓ task-16-base64url-padding [recovery#2] 453ms (TTFT: 284ms rec=253ms) RSS: 171.0MB
+[144/270] ✓ task-16-base64url-padding [recovery#3] 455ms (TTFT: 285ms rec=255ms) RSS: 171.0MB
+[145/270] ✓ task-17-abort-controller-cascade [cold#1] 240ms (TTFT: 44ms) RSS: 171.7MB
+[146/270] ✓ task-17-abort-controller-cascade [cold#2] 237ms (TTFT: 44ms) RSS: 171.7MB
+[147/270] ✓ task-17-abort-controller-cascade [cold#3] 241ms (TTFT: 43ms) RSS: 171.8MB
+[148/270] ✓ task-17-abort-controller-cascade [warm#1] 263ms (TTFT: 66ms) RSS: 172.4MB
+[149/270] ✓ task-17-abort-controller-cascade [warm#2] 235ms (TTFT: 44ms) RSS: 172.4MB
+[150/270] ✓ task-17-abort-controller-cascade [warm#3] 242ms (TTFT: 43ms) RSS: 172.4MB
+[151/270] ✓ task-17-abort-controller-cascade [recovery#1] 463ms (TTFT: 292ms rec=263ms) RSS: 172.4MB
+[152/270] ✓ task-17-abort-controller-cascade [recovery#2] 454ms (TTFT: 285ms rec=254ms) RSS: 172.4MB
+[153/270] ✓ task-17-abort-controller-cascade [recovery#3] 458ms (TTFT: 287ms rec=258ms) RSS: 172.4MB
+[154/270] ✓ task-18-header-casing-fold [cold#1] 210ms (TTFT: 42ms) RSS: 172.4MB
+[155/270] ✓ task-18-header-casing-fold [cold#2] 212ms (TTFT: 44ms) RSS: 172.8MB
+[156/270] ✓ task-18-header-casing-fold [cold#3] 212ms (TTFT: 45ms) RSS: 172.8MB
+[157/270] ✓ task-18-header-casing-fold [warm#1] 208ms (TTFT: 44ms) RSS: 174.8MB
+[158/270] ✓ task-18-header-casing-fold [warm#2] 211ms (TTFT: 45ms) RSS: 174.8MB
+[159/270] ✓ task-18-header-casing-fold [warm#3] 213ms (TTFT: 45ms) RSS: 174.8MB
+[160/270] ✓ task-18-header-casing-fold [recovery#1] 458ms (TTFT: 288ms rec=258ms) RSS: 174.8MB
+[161/270] ✓ task-18-header-casing-fold [recovery#2] 458ms (TTFT: 286ms rec=258ms) RSS: 174.8MB
+[162/270] ✓ task-18-header-casing-fold [recovery#3] 455ms (TTFT: 288ms rec=255ms) RSS: 175.6MB
+[163/270] ✓ task-19-etag-weak-validator [cold#1] 241ms (TTFT: 43ms) RSS: 180.4MB
+[164/270] ✓ task-19-etag-weak-validator [cold#2] 232ms (TTFT: 52ms) RSS: 185.3MB
+[165/270] ✓ task-19-etag-weak-validator [cold#3] 241ms (TTFT: 46ms) RSS: 185.4MB
+[166/270] ✓ task-19-etag-weak-validator [warm#1] 240ms (TTFT: 44ms) RSS: 185.4MB
+[167/270] ✓ task-19-etag-weak-validator [warm#2] 241ms (TTFT: 43ms) RSS: 188.2MB
+[168/270] ✓ task-19-etag-weak-validator [warm#3] 243ms (TTFT: 43ms) RSS: 193.0MB
+[169/270] ✓ task-19-etag-weak-validator [recovery#1] 452ms (TTFT: 283ms rec=252ms) RSS: 194.6MB
+[170/270] ✓ task-19-etag-weak-validator [recovery#2] 455ms (TTFT: 285ms rec=255ms) RSS: 196.2MB
+[171/270] ✓ task-19-etag-weak-validator [recovery#3] 452ms (TTFT: 282ms rec=252ms) RSS: 196.7MB
+[172/270] ✓ task-20-status-code-range-assert [cold#1] 212ms (TTFT: 45ms) RSS: 196.7MB
+[173/270] ✓ task-20-status-code-range-assert [cold#2] 213ms (TTFT: 45ms) RSS: 196.7MB
+[174/270] ✓ task-20-status-code-range-assert [cold#3] 211ms (TTFT: 45ms) RSS: 196.7MB
+[175/270] ✓ task-20-status-code-range-assert [warm#1] 213ms (TTFT: 43ms) RSS: 196.7MB
+[176/270] ✓ task-20-status-code-range-assert [warm#2] 214ms (TTFT: 43ms) RSS: 196.8MB
+[177/270] ✓ task-20-status-code-range-assert [warm#3] 239ms (TTFT: 69ms) RSS: 196.8MB
+[178/270] ✓ task-20-status-code-range-assert [recovery#1] 455ms (TTFT: 285ms rec=255ms) RSS: 196.8MB
+[179/270] ✓ task-20-status-code-range-assert [recovery#2] 457ms (TTFT: 287ms rec=257ms) RSS: 196.8MB
+[180/270] ✓ task-20-status-code-range-assert [recovery#3] 453ms (TTFT: 288ms rec=253ms) RSS: 196.8MB
+[181/270] ✓ task-21-jwt-clock-skew-edge [cold#1] 271ms (TTFT: 74ms) RSS: 196.9MB
+[182/270] ✓ task-21-jwt-clock-skew-edge [cold#2] 241ms (TTFT: 45ms) RSS: 196.9MB
+[183/270] ✓ task-21-jwt-clock-skew-edge [cold#3] 240ms (TTFT: 43ms) RSS: 197.2MB
+[184/270] ✓ task-21-jwt-clock-skew-edge [warm#1] 239ms (TTFT: 44ms) RSS: 197.2MB
+[185/270] ✓ task-21-jwt-clock-skew-edge [warm#2] 241ms (TTFT: 44ms) RSS: 197.2MB
+[186/270] ✓ task-21-jwt-clock-skew-edge [warm#3] 274ms (TTFT: 70ms) RSS: 197.3MB
+[187/270] ✓ task-21-jwt-clock-skew-edge [recovery#1] 456ms (TTFT: 289ms rec=256ms) RSS: 197.3MB
+[188/270] ✓ task-21-jwt-clock-skew-edge [recovery#2] 456ms (TTFT: 287ms rec=256ms) RSS: 197.3MB
+[189/270] ✓ task-21-jwt-clock-skew-edge [recovery#3] 456ms (TTFT: 289ms rec=256ms) RSS: 197.3MB
+[190/270] ✓ task-22-file-descriptor-close [cold#1] 256ms (TTFT: 82ms) RSS: 198.7MB
+[191/270] ✓ task-22-file-descriptor-close [cold#2] 235ms (TTFT: 68ms) RSS: 198.7MB
+[192/270] ✓ task-22-file-descriptor-close [cold#3] 215ms (TTFT: 44ms) RSS: 198.7MB
+[193/270] ✓ task-22-file-descriptor-close [warm#1] 218ms (TTFT: 46ms) RSS: 198.7MB
+[194/270] ✓ task-22-file-descriptor-close [warm#2] 249ms (TTFT: 73ms) RSS: 198.7MB
+[195/270] ✓ task-22-file-descriptor-close [warm#3] 241ms (TTFT: 68ms) RSS: 198.7MB
+[196/270] ✓ task-22-file-descriptor-close [recovery#1] 457ms (TTFT: 288ms rec=257ms) RSS: 198.7MB
+[197/270] ✓ task-22-file-descriptor-close [recovery#2] 455ms (TTFT: 286ms rec=255ms) RSS: 198.8MB
+[198/270] ✓ task-22-file-descriptor-close [recovery#3] 456ms (TTFT: 290ms rec=256ms) RSS: 198.8MB
+[199/270] ✓ task-23-safe-path-join [cold#1] 240ms (TTFT: 69ms) RSS: 198.8MB
+[200/270] ✓ task-23-safe-path-join [cold#2] 211ms (TTFT: 43ms) RSS: 198.8MB
+[201/270] ✓ task-23-safe-path-join [cold#3] 216ms (TTFT: 46ms) RSS: 198.8MB
+[202/270] ✓ task-23-safe-path-join [warm#1] 214ms (TTFT: 48ms) RSS: 198.8MB
+[203/270] ✓ task-23-safe-path-join [warm#2] 211ms (TTFT: 43ms) RSS: 198.8MB
+[204/270] ✓ task-23-safe-path-join [warm#3] 210ms (TTFT: 44ms) RSS: 198.8MB
+[205/270] ✓ task-23-safe-path-join [recovery#1] 461ms (TTFT: 292ms rec=261ms) RSS: 198.8MB
+[206/270] ✓ task-23-safe-path-join [recovery#2] 456ms (TTFT: 284ms rec=256ms) RSS: 198.8MB
+[207/270] ✓ task-23-safe-path-join [recovery#3] 453ms (TTFT: 281ms rec=253ms) RSS: 198.8MB
+[208/270] ✓ task-24-regex-redos-mitigation [cold#1] 242ms (TTFT: 45ms) RSS: 198.9MB
+[209/270] ✓ task-24-regex-redos-mitigation [cold#2] 241ms (TTFT: 41ms) RSS: 198.9MB
+[210/270] ✓ task-24-regex-redos-mitigation [cold#3] 231ms (TTFT: 40ms) RSS: 198.9MB
+[211/270] ✓ task-24-regex-redos-mitigation [warm#1] 236ms (TTFT: 42ms) RSS: 198.9MB
+[212/270] ✓ task-24-regex-redos-mitigation [warm#2] 239ms (TTFT: 42ms) RSS: 198.9MB
+[213/270] ✓ task-24-regex-redos-mitigation [warm#3] 236ms (TTFT: 42ms) RSS: 198.9MB
+[214/270] ✓ task-24-regex-redos-mitigation [recovery#1] 455ms (TTFT: 284ms rec=255ms) RSS: 199.2MB
+[215/270] ✓ task-24-regex-redos-mitigation [recovery#2] 462ms (TTFT: 292ms rec=262ms) RSS: 199.2MB
+[216/270] ✓ task-24-regex-redos-mitigation [recovery#3] 454ms (TTFT: 283ms rec=254ms) RSS: 199.5MB
+[217/270] ✓ task-25-bigint-serialization [cold#1] 204ms (TTFT: 42ms) RSS: 199.6MB
+[218/270] ✓ task-25-bigint-serialization [cold#2] 208ms (TTFT: 42ms) RSS: 199.6MB
+[219/270] ✓ task-25-bigint-serialization [cold#3] 208ms (TTFT: 42ms) RSS: 199.6MB
+[220/270] ✓ task-25-bigint-serialization [warm#1] 206ms (TTFT: 41ms) RSS: 201.0MB
+[221/270] ✓ task-25-bigint-serialization [warm#2] 185ms (TTFT: 42ms) RSS: 201.0MB
+[222/270] ✓ task-25-bigint-serialization [warm#3] 207ms (TTFT: 43ms) RSS: 201.1MB
+[223/270] ✓ task-25-bigint-serialization [recovery#1] 457ms (TTFT: 288ms rec=257ms) RSS: 201.1MB
+[224/270] ✓ task-25-bigint-serialization [recovery#2] 460ms (TTFT: 289ms rec=260ms) RSS: 201.1MB
+[225/270] ✓ task-25-bigint-serialization [recovery#3] 466ms (TTFT: 296ms rec=266ms) RSS: 201.1MB
+[226/270] ✓ task-26-websocket-frame-masking [cold#1] 245ms (TTFT: 43ms) RSS: 201.1MB
+[227/270] ✓ task-26-websocket-frame-masking [cold#2] 241ms (TTFT: 43ms) RSS: 201.1MB
+[228/270] ✓ task-26-websocket-frame-masking [cold#3] 243ms (TTFT: 45ms) RSS: 201.1MB
+[229/270] ✓ task-26-websocket-frame-masking [warm#1] 247ms (TTFT: 43ms) RSS: 201.1MB
+[230/270] ✓ task-26-websocket-frame-masking [warm#2] 242ms (TTFT: 45ms) RSS: 201.1MB
+[231/270] ✓ task-26-websocket-frame-masking [warm#3] 244ms (TTFT: 43ms) RSS: 201.1MB
+[232/270] ✓ task-26-websocket-frame-masking [recovery#1] 458ms (TTFT: 288ms rec=258ms) RSS: 201.1MB
+[233/270] ✓ task-26-websocket-frame-masking [recovery#2] 462ms (TTFT: 297ms rec=262ms) RSS: 201.1MB
+[234/270] ✓ task-26-websocket-frame-masking [recovery#3] 456ms (TTFT: 288ms rec=256ms) RSS: 201.1MB
+[235/270] ✓ task-27-lru-cache-eviction [cold#1] 216ms (TTFT: 45ms) RSS: 201.1MB
+[236/270] ✓ task-27-lru-cache-eviction [cold#2] 208ms (TTFT: 42ms) RSS: 201.1MB
+[237/270] ✓ task-27-lru-cache-eviction [cold#3] 210ms (TTFT: 44ms) RSS: 201.2MB
+[238/270] ✓ task-27-lru-cache-eviction [warm#1] 212ms (TTFT: 45ms) RSS: 201.2MB
+[239/270] ✓ task-27-lru-cache-eviction [warm#2] 228ms (TTFT: 49ms) RSS: 206.5MB
+[240/270] ✓ task-27-lru-cache-eviction [warm#3] 217ms (TTFT: 45ms) RSS: 206.5MB
+[241/270] ✓ task-27-lru-cache-eviction [recovery#1] 464ms (TTFT: 294ms rec=264ms) RSS: 206.5MB
+[242/270] ✓ task-27-lru-cache-eviction [recovery#2] 456ms (TTFT: 285ms rec=256ms) RSS: 206.5MB
+[243/270] ✓ task-27-lru-cache-eviction [recovery#3] 457ms (TTFT: 288ms rec=257ms) RSS: 206.5MB
+[244/270] ✓ task-28-graceful-drain-timeout [cold#1] 304ms (TTFT: 72ms) RSS: 206.5MB
+[245/270] ✓ task-28-graceful-drain-timeout [cold#2] 329ms (TTFT: 77ms) RSS: 206.6MB
+[246/270] ✓ task-28-graceful-drain-timeout [cold#3] 295ms (TTFT: 69ms) RSS: 206.6MB
+[247/270] ✓ task-28-graceful-drain-timeout [warm#1] 270ms (TTFT: 43ms) RSS: 211.4MB
+[248/270] ✓ task-28-graceful-drain-timeout [warm#2] 267ms (TTFT: 47ms) RSS: 216.2MB
+[249/270] ✓ task-28-graceful-drain-timeout [warm#3] 280ms (TTFT: 48ms) RSS: 220.9MB
+[250/270] ✓ task-28-graceful-drain-timeout [recovery#1] 452ms (TTFT: 282ms rec=252ms) RSS: 222.5MB
+[251/270] ✓ task-28-graceful-drain-timeout [recovery#2] 455ms (TTFT: 286ms rec=255ms) RSS: 224.1MB
+[252/270] ✓ task-28-graceful-drain-timeout [recovery#3] 457ms (TTFT: 288ms rec=257ms) RSS: 225.7MB
+[253/270] ✓ task-29-circular-reference-inspect [cold#1] 220ms (TTFT: 45ms) RSS: 230.0MB
+[254/270] ✓ task-29-circular-reference-inspect [cold#2] 214ms (TTFT: 45ms) RSS: 230.0MB
+[255/270] ✓ task-29-circular-reference-inspect [cold#3] 215ms (TTFT: 43ms) RSS: 230.0MB
+[256/270] ✓ task-29-circular-reference-inspect [warm#1] 213ms (TTFT: 41ms) RSS: 230.0MB
+[257/270] ✓ task-29-circular-reference-inspect [warm#2] 214ms (TTFT: 45ms) RSS: 230.0MB
+[258/270] ✓ task-29-circular-reference-inspect [warm#3] 209ms (TTFT: 44ms) RSS: 233.2MB
+[259/270] ✓ task-29-circular-reference-inspect [recovery#1] 463ms (TTFT: 293ms rec=263ms) RSS: 234.7MB
+[260/270] ✓ task-29-circular-reference-inspect [recovery#2] 455ms (TTFT: 285ms rec=255ms) RSS: 236.3MB
+[261/270] ✓ task-29-circular-reference-inspect [recovery#3] 452ms (TTFT: 281ms rec=252ms) RSS: 237.8MB
+[262/270] ✓ task-30-atomic-file-replace [cold#1] 246ms (TTFT: 45ms) RSS: 242.7MB
+[263/270] ✓ task-30-atomic-file-replace [cold#2] 240ms (TTFT: 44ms) RSS: 247.5MB
+[264/270] ✓ task-30-atomic-file-replace [cold#3] 253ms (TTFT: 45ms) RSS: 252.3MB
+[265/270] ✓ task-30-atomic-file-replace [warm#1] 264ms (TTFT: 67ms) RSS: 254.3MB
+[266/270] ✓ task-30-atomic-file-replace [warm#2] 246ms (TTFT: 43ms) RSS: 254.3MB
+[267/270] ✓ task-30-atomic-file-replace [warm#3] 257ms (TTFT: 49ms) RSS: 254.3MB
+[268/270] ✓ task-30-atomic-file-replace [recovery#1] 452ms (TTFT: 282ms rec=252ms) RSS: 254.3MB
+[269/270] ✓ task-30-atomic-file-replace [recovery#2] 460ms (TTFT: 290ms rec=260ms) RSS: 254.3MB
+[270/270] ✓ task-30-atomic-file-replace [recovery#3] 458ms (TTFT: 289ms rec=258ms) RSS: 254.3MB
+
+Report written to: /tmp/perimeter-s5d-measure-0fFHKcC3/evidence/base-report.json
+
+================== SUMMARY ==================
+Execution Backend:  LocalBackend (host subprocess, non-isolated; S2 strong sandbox pending)
+Cold Pass Rate:     100.0% (avg 235ms, TTFT: 50ms)
+Warm Pass Rate:     100.0% (avg 232ms, TTFT: 48ms, cache: none reported (unknown/null))
+Recovery Pass Rate: 100.0% (avg 457ms, operable: 257ms, mode: real-independent-os-subprocess-ab)
+Overall Pass Rate:  100.0%
+Wall Clock Time:    129.01s / 540s limit
+Peak RSS:           254.3 MB (target: runner process PID 40765, not Gateway/Harness subprocess)
+Commercial Cost:    $0.00 (Mock configured; real commercial cost unknown / external_blocked)
+=============================================
+
+S5 report written to: /tmp/perimeter-s5d-measure-0fFHKcC3/evidence/s5-report.json
+
+================== S5 TOKEN BENCHMARK SUMMARY ==================
+Report Type:        S5-token-benchmark
+Repo Revision:      c66c785bc71d7539aaa2e0520fc0d8bb06a1b8e4
+Suite:              S0-v1.1.0-actual-mock (hash c704f6c3b8e6…)
+cold      n=90 pass=100.0% duration p50=236.5ms p95=282.1ms ttft(90 样本) p50 45ms / p95 73.1ms
+warm      n=90 pass=100.0% duration p50=237ms p95=268.65ms ttft(90 样本) p50 44ms / p95 69ms
+recovery  n=90 pass=100.0% duration p50=456ms p95=464ms ttft(90 样本) p50 287ms / p95 296ms
+Failed Consumed:    0 次失败 (input null / output null tok)
+Optimization Gates: not_measured (真实成本 external_blocked；无真实配对基线，不报告达成)
+Cache Read:         unknown (unknown) — 现有管道无法区分 cacheRead=0 与缺字段
+Privacy:            仅元数据；prompt/env/secret 未收集
+================================================================
+
+[bounded-runner] 执行完毕: settlement=natural_exit, target_exit=code=0, timedOut=false, kill=not_needed, residue=unknown, signaled=false, actualExitWall=129404.490542ms, closeWall=129404.53391700001ms, wallAtFinalLog=129406ms
+[bounded-runner] [CLI] target_exit=code=0 close=observed settlement=natural_exit kill=not_needed residue=unknown signaled=no actualExitWall=129404.490542ms closeWall=129404.53391700001ms wallAtCliLog=129406ms(pre_final_io) exitCode=由进程退出码给出

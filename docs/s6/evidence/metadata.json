@@ -1,0 +1,58 @@
+{
+  "recordedAt": "2026-10-22T12:53:29.569Z",
+  "repoRevision": "c66c785bc71d7539aaa2e0520fc0d8bb06a1b8e4",
+  "workspaceCodeUncommitted": [
+    "scripts/s6-supply-chain.ts",
+    "tests/s6-supply-chain.test.ts",
+    "src/evals/s5-token-benchmark.ts",
+    "scripts/s5-token-benchmark.ts",
+    "tests/s5-token-benchmark.test.ts"
+  ],
+  "lockSha256": "96aa0f81b3945db3b642eed3cad0237fa7ddd5c33adb2cc851895774ccb11112",
+  "nodeVersion": "v24.21.0",
+  "npmVersion": "11.19.0",
+  "scans": [
+    {
+      "command": [
+        "npm",
+        "audit",
+        "--package-lock-only",
+        "--ignore-scripts",
+        "--json"
+      ],
+      "exitCode": 1,
+      "artifact": "npm-audit-all.json",
+      "artifactMtime": "2026-10-22T12:52:30.771Z",
+      "summary": "1 high; fast-uri 3.1.5 dev via ajv; unresolved"
+    },
+    {
+      "command": [
+        "npm",
+        "audit",
+        "--package-lock-only",
+        "--ignore-scripts",
+        "--omit=dev",
+        "--json"
+      ],
+      "exitCode": 0,
+      "artifact": "npm-audit-prod.json",
+      "artifactMtime": "2026-10-22T12:49:24.046Z",
+      "summary": "0 findings in registry audit for production dependencies; vendor and images uncovered"
+    }
+  ],
+  "sourceHashes": {
+    "scripts/s6-supply-chain.ts": "fd97aadc30f2a4346bf56f425f4ddfaa647107912fe991d55ceaf95e9db9c31a",
+    "tests/s6-supply-chain.test.ts": "ab1115d46e059d7adfce2e496f59a497c52c22bb50c29826d954dff8587078c0"
+  },
+  "artifactHashes": {
+    "sbom.cdx.json": "f59c3d1e0a6c324ec0edc72a5eaf23666dc575d410887698c3fc67b0f26005cb",
+    "npm-audit-all.json": "41c3bbf0f2649d8bf31f9507d79d19760b269058371ffc34c33a10d2cc37c745",
+    "npm-audit-prod.json": "0590635acb81c10a8c258bb7ff052e0b8e73f1e9a863b7fa4fdc190164db6bfe",
+    "schema-validation.json": "00ad7b7999b385925e0583d79008223b253ba6b62734737bb77cdf3bf508a96d"
+  },
+  "limits": [
+    "No remediation or enterprise release approval",
+    "Timestamps use artifact mtime, not independently measured exact scan duration",
+    "Schema check ignores iri-reference/idn-email formats; generated artifact uses neither"
+  ]
+}

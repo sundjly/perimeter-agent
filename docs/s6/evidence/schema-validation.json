@@ -1,0 +1,6 @@
+{
+  "valid": true,
+  "errors": null,
+  "components": 126,
+  "formatLimits": "iri-reference/idn-email unsupported by ajv-formats; generated artifact uses neither"
+}

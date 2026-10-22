@@ -1,0 +1,64 @@
+TAP version 13
+# Subtest: 1. 分位数计算：线性插值 p50/p95 与空集 null 缺省
+ok 1 - 1. 分位数计算：线性插值 p50/p95 与空集 null 缺省
+  ---
+  duration_ms: 0.602334
+  type: 'test'
+  ...
+# Subtest: 2. null 分位数：TTFT 全缺失时 p50/p95 保持 null，token 同步 null
+ok 2 - 2. null 分位数：TTFT 全缺失时 p50/p95 保持 null，token 同步 null
+  ---
+  duration_ms: 1.665
+  type: 'test'
+  ...
+# Subtest: 3. 任务时长统计与 TTFT 分位数正确聚合
+ok 3 - 3. 任务时长统计与 TTFT 分位数正确聚合
+  ---
+  duration_ms: 0.669042
+  type: 'test'
+  ...
+# Subtest: 4. 失败任务消耗单独统计，不与成功任务混算
+ok 4 - 4. 失败任务消耗单独统计，不与成功任务混算
+  ---
+  duration_ms: 0.323375
+  type: 'test'
+  ...
+# Subtest: 5. 无真实配对基线时门槛一律 not_measured / external_blocked，绝不报告达成
+ok 5 - 5. 无真实配对基线时门槛一律 not_measured / external_blocked，绝不报告达成
+  ---
+  duration_ms: 0.777916
+  type: 'test'
+  ...
+# Subtest: 6. 小样本标记与空模式诚实降级
+ok 6 - 6. 小样本标记与空模式诚实降级
+  ---
+  duration_ms: 0.62375
+  type: 'test'
+  ...
+# Subtest: 7. Provenance：suiteHash 绑定真实 30 任务 fixture，revision/隐私/纯性
+ok 7 - 7. Provenance：suiteHash 绑定真实 30 任务 fixture，revision/隐私/纯性
+  ---
+  duration_ms: 0.410417
+  type: 'test'
+  ...
+# Subtest: 8. 转换入口验证：非 S0 local-mock 报告一律拒绝，负控断言带字段路径
+ok 8 - 8. 转换入口验证：非 S0 local-mock 报告一律拒绝，负控断言带字段路径
+  ---
+  duration_ms: 2.46275
+  type: 'test'
+  ...
+# Subtest: 9. CLI 跑批参数负控：0/NaN/负值/空与未知 tasks·modes 拒绝，不进入跑批
+ok 9 - 9. CLI 跑批参数负控：0/NaN/负值/空与未知 tasks·modes 拒绝，不进入跑批
+  ---
+  duration_ms: 0.516417
+  type: 'test'
+  ...
+1..9
+# tests 9
+# suites 0
+# pass 9
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 99.55875

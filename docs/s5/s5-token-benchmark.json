@@ -1,0 +1,260 @@
+{
+  "reportType": "S5-token-benchmark",
+  "generatedAt": "2026-10-22T14:03:54.706Z",
+  "provenance": {
+    "generator": "S5d s5-token-benchmark (pure transform over S0 runBenchmark output)",
+    "repoRevision": "c66c785bc71d7539aaa2e0520fc0d8bb06a1b8e4",
+    "repoRevisionNote": "repoRevision 由协调者显式传入；未传入时保持 null，不假设当前 HEAD。",
+    "suiteVersion": "S0-v1.1.0-actual-mock",
+    "suiteHash": "c704f6c3b8e61d0d013fe93fab21f4dd9acf889d8aa25bdb7f14e45c283860cc",
+    "fixtureHashes": {
+      "task-01-range-off-by-one": "d3f001c0e12a5861f052f50cd86296665eb4e5c7dff328c97e632daea1411f9f",
+      "task-02-semver-coverage": "6900ad468e6f526efa998841375f18b738912efa70ac2b15eac048adce5a67cf",
+      "task-03-legacy-url-migration": "f80b01808c27fcc4289d2da917b17f168326609a8e5e40670bc3ef9f8ff6269e",
+      "task-04-slice-dedupe-refactor": "6d2024fe7f6fb083d2a9fbe226ba6a0f7ceaa8a70ef017ba2d97f6aaa39dcd3b",
+      "task-05-null-pointer-guard": "2010a0c787d6f6a8e99a63b520746676bcd95236633f116a141f7827490903e0",
+      "task-06-hex-color-parser": "183c4d44890279654f6a773485209b9822298673825efdce031f6bd190dc1bfd",
+      "task-07-stream-backpressure-leak": "ad897e597ad20b6bf0d50ae5f80fa15ef16977cb596a03af814edfdde4a27e77",
+      "task-08-uuid-v4-validator": "7e227e6118952c60ae03e22b42e13a7bd533e350dbf8461e026186eec3dfe6d0",
+      "task-09-crypto-timing-attack": "ebcdf8fb70c0ba1bd3d6042431f3af83ff51fd8594fa0d1bda28cd66b5149aff",
+      "task-10-event-emitter-leak": "ed5773e825851500ea063a1cdef2ea8d5f665e2892539ec86d3e8e17632c3b5a",
+      "task-11-json-depth-limit": "8eed86da189af4970a8fdf996b65587db63301e12c06250c6fd0f57f81eaaa40",
+      "task-12-retry-exponential-jitter": "aeb34352d5200c635ba5920d7f0991349a6496d631cbf9507c35c0408f8190ee",
+      "task-13-cookie-samesite-parser": "1d834890611df7aa5071b52c564432b191e28890c5ada4a96e7fce73d5855577",
+      "task-14-query-param-array-merge": "0c8166fe9e12e150f4633aa0fd09e3e4987fc3a5b41ef50c3e3c78ef254bdd6d",
+      "task-15-utf8-surrogate-split": "9456b32c4ff290e218373361537d3c508022aff9eabf08f81431a0ef1d34762d",
+      "task-16-base64url-padding": "8aff8321c25c1f62cee11fc3e1e09db55f43a2382de0218b8e0f700dc8ef20b5",
+      "task-17-abort-controller-cascade": "49a4f43797aaa2023f2f4f35080d2f84b31fd50b4193855f84eab20b3c437535",
+      "task-18-header-casing-fold": "b13d8d302a76bb579a5f8b54e8d0e6dfcdd65230510e2bd013cbfa398c50c5d5",
+      "task-19-etag-weak-validator": "0fb24eb47ddb21969cf1d3b036e982a32b6fe37c62d97286814848e25bc98e20",
+      "task-20-status-code-range-assert": "f6010b6f3ff5f90047a337dd99c34665615ab96b4986adc38200a986f84ccac6",
+      "task-21-jwt-clock-skew-edge": "03e8d3a67c87d3f03a35eb369379d493a583b6c434ab0ca2dbb6cd37b73cdfa6",
+      "task-22-file-descriptor-close": "90050265c1000e6219ca56682c05c61b7f441f3731255c4f66f6c78e8608987f",
+      "task-23-safe-path-join": "60b326456f34d898e42240f2feb1589298c622ff83066209342543267848159e",
+      "task-24-regex-redos-mitigation": "c809bb5ce2dec8dbb732ac59c2f997cd64107ac93e74d03e0fad19c408be2d2f",
+      "task-25-bigint-serialization": "0dd9e239041a534dd70b8256896912180cb79bfdf0739ddeef5e5cab09cfb6be",
+      "task-26-websocket-frame-masking": "b5757cab11440a3323a34e4e344e3f739bbb4650aea9739367ea02272e190f44",
+      "task-27-lru-cache-eviction": "ce56ccd9182b1d5bdee9fc74ba3d3fd9e118bc5508e2d2d230eee2410bc6f726",
+      "task-28-graceful-drain-timeout": "08d7fba1b9776be2ca428e88cb5ecabd0f5d08d539488b2d8cef598f12a5c5b9",
+      "task-29-circular-reference-inspect": "420fe137f6561eea4cf87ca75190f806a129d68e209ae4a9f8860bb4415bbd09",
+      "task-30-atomic-file-replace": "41d0a1b8f893083f438586e3b6a43f2feef7303f73560edffb5259025b80b0be"
+    },
+    "sourceReport": {
+      "timestamp": "2026-10-22T12:09:51.930Z",
+      "totalRuns": 270,
+      "repetitions": 3,
+      "timedOut": false,
+      "path": "docs/s5/s5-base-report.json"
+    },
+    "mockDeclaration": {
+      "environment": "local-mock",
+      "model": "mock-model (LocalBenchmarkMockServer via ModelGateway)",
+      "mockConfiguredUnitPriceDollars": 0,
+      "realCostStatus": "unknown / external_blocked",
+      "note": "所有模型金额按 mock 配置为 $0.00；真实商业模型通道与对账未打通，本报告不代表真实经济效益。"
+    },
+    "backendLimitations": [
+      "执行后端为 LocalBackend（宿主机子进程）；本基准仅覆盖 LocalBackend 路径，不覆盖 S2 容器隔离后端。",
+      "Peak RSS 测量主体为 runner 运行进程自身，非 Gateway/Harness 子进程。",
+      "模型端点为本地 mock（不产生真实成本与真实缓存行为），recovery 模式为真实独立 OS 子进程 A/B 重启。",
+      "recovery 的 durationMs 沿用 S0 口径 = recoveryTimeToOperableMs+200（不可操作时常量 250），是派生值而非真实任务墙钟时长，跨模式时长对比无效；recovery 的 TTFT 与恢复就绪耗时为重启后真实单调钟观测。",
+      "任务集固定为 30 个 fixture 任务（suiteHash 绑定），默认每任务 3 次重复。"
+    ],
+    "privacy": {
+      "promptCollected": false,
+      "envCollected": false,
+      "secretsCollected": false,
+      "collectedFields": [
+        "taskId",
+        "mode",
+        "repetition",
+        "success",
+        "durationMs",
+        "ttftMs",
+        "recoveryTimeToOperableMs",
+        "eventsCount",
+        "inputTokens",
+        "outputTokens",
+        "cachedTokens",
+        "usageSource",
+        "rssBytes"
+      ],
+      "note": "collectedFields 为允许读取的源元数据白名单：转换仅读取白名单内字段做聚合，未列入的源字段一律忽略；报告体只发射统计结果，不逐条复制源测量。不读取、不发射 prompt、环境变量与 secret。"
+    }
+  },
+  "overall": {
+    "totalMeasurements": 270,
+    "passed": 270,
+    "passRate": 1,
+    "durationMs": {
+      "p50": 245,
+      "p95": 461.55,
+      "min": 185,
+      "max": 467,
+      "avg": 308
+    }
+  },
+  "modes": {
+    "cold": {
+      "mode": "cold",
+      "total": 90,
+      "passed": 90,
+      "passRate": 1,
+      "durationMs": {
+        "p50": 236.5,
+        "p95": 282.1,
+        "min": 199,
+        "max": 329,
+        "avg": 235
+      },
+      "ttft": {
+        "sampleSize": 90,
+        "missingCount": 0,
+        "p50": 45,
+        "p95": 73.1,
+        "smallSample": false,
+        "note": "TTFT 分位数仅聚合非空实测值（90/90）；样本数 < 90 时标记 smallSample。"
+      },
+      "tokens": {
+        "inputTokensSum": 24300,
+        "outputTokensSum": 3600,
+        "withUsageCount": 90,
+        "usageSourceBreakdown": {
+          "mock-reported": 90
+        },
+        "cachedTokens": null,
+        "cacheReadStatus": "unknown",
+        "note": "mock 上游（LocalBenchmarkMockServer）从不报告 cacheRead；现有管道在事件解析处将缺失字段与 0 归并（e.usage.cacheRead ?? 0），测量落库后 cachedTokens 仅在 >0 时非 null。因此无法可靠区分 cacheRead=0 与缺字段，本报告保持 unknown，不虚构缓存命中或 cacheHitRate。"
+      },
+      "modelCallCount": null,
+      "retryCount": null,
+      "compactionTokens": null
+    },
+    "warm": {
+      "mode": "warm",
+      "total": 90,
+      "passed": 90,
+      "passRate": 1,
+      "durationMs": {
+        "p50": 237,
+        "p95": 268.65,
+        "min": 185,
+        "max": 293,
+        "avg": 232
+      },
+      "ttft": {
+        "sampleSize": 90,
+        "missingCount": 0,
+        "p50": 44,
+        "p95": 69,
+        "smallSample": false,
+        "note": "TTFT 分位数仅聚合非空实测值（90/90）；样本数 < 90 时标记 smallSample。"
+      },
+      "tokens": {
+        "inputTokensSum": 24300,
+        "outputTokensSum": 3600,
+        "withUsageCount": 90,
+        "usageSourceBreakdown": {
+          "mock-reported": 90
+        },
+        "cachedTokens": null,
+        "cacheReadStatus": "unknown",
+        "note": "mock 上游（LocalBenchmarkMockServer）从不报告 cacheRead；现有管道在事件解析处将缺失字段与 0 归并（e.usage.cacheRead ?? 0），测量落库后 cachedTokens 仅在 >0 时非 null。因此无法可靠区分 cacheRead=0 与缺字段，本报告保持 unknown，不虚构缓存命中或 cacheHitRate。"
+      },
+      "modelCallCount": null,
+      "retryCount": null,
+      "compactionTokens": null
+    },
+    "recovery": {
+      "mode": "recovery",
+      "total": 90,
+      "passed": 90,
+      "passRate": 1,
+      "durationMs": {
+        "p50": 456,
+        "p95": 464,
+        "min": 452,
+        "max": 467,
+        "avg": 457
+      },
+      "ttft": {
+        "sampleSize": 90,
+        "missingCount": 0,
+        "p50": 287,
+        "p95": 296,
+        "smallSample": false,
+        "note": "TTFT 分位数仅聚合非空实测值（90/90）；样本数 < 90 时标记 smallSample。"
+      },
+      "tokens": {
+        "inputTokensSum": 48600,
+        "outputTokensSum": 7200,
+        "withUsageCount": 90,
+        "usageSourceBreakdown": {
+          "mock-reported": 90
+        },
+        "cachedTokens": null,
+        "cacheReadStatus": "unknown",
+        "note": "mock 上游（LocalBenchmarkMockServer）从不报告 cacheRead；现有管道在事件解析处将缺失字段与 0 归并（e.usage.cacheRead ?? 0），测量落库后 cachedTokens 仅在 >0 时非 null。因此无法可靠区分 cacheRead=0 与缺字段，本报告保持 unknown，不虚构缓存命中或 cacheHitRate。"
+      },
+      "modelCallCount": null,
+      "retryCount": null,
+      "compactionTokens": null
+    }
+  },
+  "failedTaskConsumption": {
+    "failedCount": 0,
+    "failedWithUsageCount": 0,
+    "failedInputTokensSum": null,
+    "failedOutputTokensSum": null,
+    "passedCount": 270,
+    "passedWithUsageCount": 270,
+    "passedInputTokensSum": 97200,
+    "passedOutputTokensSum": 14400,
+    "note": "失败任务消耗单独统计，不摊入成功任务均值；token 求和仅计非 null 实测值。mock 单价为 $0.00，不换算金额；真实商业成本 external_blocked。"
+  },
+  "optimizationGates": {
+    "overallStatus": "not_measured",
+    "statement": "初始优化门槛（每成功任务成本较基线下降≥20%、完成率下降≤2个百分点、首 token p95 回退≤10%）在无真实模型成本与真实配对基线时一律 not_measured / external_blocked；本报告不报告任何达成。",
+    "realModelCost": {
+      "status": "external_blocked",
+      "reason": "真实商业模型上游通道与对账未打通（S4 external_blocked）；当前 mock 单价 $0.00 不代表真实经济效益。",
+      "valueDollars": null
+    },
+    "costPerSuccessfulTaskReduction20pct": {
+      "status": "external_blocked",
+      "reason": "依赖真实模型成本计量（S4 external_blocked）与真实配对基线，两者均未具备。",
+      "baseline": null,
+      "current": null
+    },
+    "completionRateRegressionMax2pp": {
+      "status": "not_measured",
+      "reason": "无真实配对基线报告可比，仅本地 mock 固定任务集，不构成质量门槛实测。",
+      "baseline": null,
+      "current": null
+    },
+    "ttftP95RegressionMax10pct": {
+      "status": "not_measured",
+      "reason": "无真实配对基线报告可比；本报告的 p95 为绝对观测值，非与基线的回归对比。",
+      "baseline": null,
+      "current": null
+    }
+  },
+  "fieldProvenance": {
+    "cacheRead": {
+      "status": "unknown",
+      "source": "mock 上游（LocalBenchmarkMockServer）从不报告 cacheRead；现有管道在事件解析处将缺失字段与 0 归并（e.usage.cacheRead ?? 0），测量落库后 cachedTokens 仅在 >0 时非 null。因此无法可靠区分 cacheRead=0 与缺字段，本报告保持 unknown，不虚构缓存命中或 cacheHitRate。"
+    },
+    "modelCallCount": {
+      "status": "null",
+      "source": "现有链路无法可靠取得，保持 null，不虚构。来源：管道仅记录 eventsCount（WS 客户端事件总数），未隔离模型请求数，不虚构调用数。"
+    },
+    "retryCount": {
+      "status": "null",
+      "source": "现有链路无法可靠取得，保持 null，不虚构。来源：现有链路（ClientEvent 流与测量落库）未暴露逐请求重试事件，不虚构重试数。"
+    },
+    "compactionTokens": {
+      "status": "null",
+      "source": "现有链路无法可靠取得，保持 null，不虚构。来源：现有链路无上下文压缩（compaction/summarization）计量点，mock 会话为单轮工具调用，不虚构压缩 token。"
+    }
+  }
+}

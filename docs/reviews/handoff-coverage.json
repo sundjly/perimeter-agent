@@ -1,0 +1,809 @@
+{
+  "reviewer": "grok",
+  "date": "2026-10-18",
+  "round": 40,
+  "verdict": "request_changes (R40/R41 sensitive-read+DLP+runner round: DLP structured key->value unicode-escape bypass to upstream reproduced x5 over real HTTP, runner cleanup signal-discipline defects reproduced x8 pure-fake, R41 outer-supervise rejected as hard bound; statOf fix verified 14/14 with reconstruction-scope red honestly labeled; R41 manifest 95/95 verified + R40 self-reference kept frozen; author 93/608 greens not reused, full suite not rerun by design; S2 stays partial, B2 pending)",
+  "baselineCommit": "b354ffe",
+  "worktree": "dirty-uncommitted-s1",
+  "commands": {
+    "coverage40": "round-40 independent dynamic review of Pi R40 (task_0f8d88a845e6) + R41 (task_eb31faea55d8), reviewer root /tmp/grok-r42-review 0700 / ledger prov-r42.jsonl 0600 / nonce append-only logs / zero global scans (knownPID ps -p only) / real signals only to own children. Own compliant outer supervisor built per task-C contract (monotonic deadline + signal-chain timer pre-armed before ALL prelude, per-sync ps budget floor(min(3000,remaining)) zero-spawn <=0, group signal needs PGID==PID+PPID+birth+full-nonce-argv four positive proofs else unknown no-signal, TERM->grace with real exit polling->fresh re-verify->KILL with reserved real-wait, zero signals after close, no member enumeration, four walls separated, sticky red past wall) with five behavior-level self-proofs recorded (S1 TERM-ignore full chain with child-side SIGLOG evidence, S2 natural zero-signal, S3 ps-fail unknown no-signal 124, S4c argv-mismatch no-signal, S5 grace-reverify birth-mismatch kill withheld) - COORDINATOR HAS NOT ACCEPTED this supervisor as compliant: deviations kept unwashed (S3/S4c/S5 unknown-settlement returned 124 while own children still alive then next case stacked; bare debug kill -KILL during shim debugging without pre-armed deadline/identity proof; closing no-timeout ps -p sweep wrongly claimed all-gone -> five own children recorded terminal-state UNKNOWN; fixed-name cfg-live/live-shim files overwritten per case; first shim argv-mispass made initial S4 an accidental ps-fail run) - report verdict rests independently on static source findings + record-only pure-fake cases + real-HTTP facts + the one handle-held real positive control (b8). DEFECT A reproduced over real HTTP gateway with raw unicode-escaped bodies: escaped property keys pass\\u0077ord / api\\u005fkey / tok\\u0065n + non-token-shaped values -> 200 to upstream incl nested (A4) and TCP-chunked (A5) forms, fetchCalls=1; author R41 negatives only covered escaped whole-string assignment and escaped token VALUES; controls green (unescaped key 403, escaped token value 403, clean SHA/base64/UUID byte-equal passthrough, no cross-field join, invalid JSON/UTF8/depth/nodes 403 fetch0, scanner null/non-array/unknown-kind/overlong-hint 503 fetch0 both modes, GCP scanner-fault token-fetch 0, GCP token-302 502 redirect:error every fetch, real upstream 302 502 target 0 requests, public surface fixed categories, audit no raw secret); accidental char-class range _~ (0x5F-0x7E incl `{|}~) found in credential-assignment value class explaining A0/A9a accidental 403s. DEFECT B reproduced pure-fake (process.kill record-only, ps shim): b1 SIGKILL to -pgid+childPid 48ms AFTER leader reaped (childExitedConfirmed literal false at runner:396, wait-handle comment falsified), b2 ps -g failure during grace -> immediate KILL, b3 ps -g empty positive proof -> KILL anyway + residue echoed empty with child alive, b4v2 budget exhausted -> TERM+KILL still fired (no remaining guard before group TERM :205), b5 same-generation verification ignores command=/bin/evil, b9 direct fallback birth+PPID only ignores command, b6b validateProcessGroup(deadPid,200ms) = 7 ps x 150ms = 1329ms 6.6x budget overrun no total recompute, b7 'runner 返回' final onLog 2.5s block -> overBudget=false stale runnerWall 38ms real wall 2542ms (sticky check :430 precedes final onLog :450), b7b onLog throw -> runBounded rejects, b8 real positive control TERM-ignored child -> early KILL -> exit/close/gone proven. R41 outer-supervise.mjs read verbatim: ps/prov/open before deadlineTimer, spawn not detached but judged pgid==pid, sameGen always false on timeout -> never signals, await setInterval unbounded wait for close, deadlineTimer never cleared -> NOT a hard bound; author red-phase functional observations kept narrow-scope only. statOf fix verified 14/14 (seam EACCES/ENOENT/ELOOP/other -> fixed categories not ok+stats:null; real FS hardlink nlink=2, dangling/nonexistent backtrack stats:null, symlink loop not_supported, protocol extra-field invalid); RED-EVIDENCE-statOf confirmed as RECONSTRUCTION-scope (git index has no R40 file), not frozen-source red. Manifests: R41 95/95 hash+mode/uid verified, root=96 regular (95+manifest), no self-reference, 3 node_modules symlinks recorded, manifest sha e63af6e6 matches followup; deviations kept: provenance-r41.jsonl 644 not 0600, /tmp/runner-{head,core,cli-tail}.txt unlisted scratch on disk, deleted .bak -> unknown; R40 manifest line-97 self-reference confirmed (actual sha 14c950a8) frozen unmodified. Author 93/608/typecheck/probe/37-oracles NOT rerun by design (defects already proven); S2 partial, B2 pending per docs/reviews/s2-scm-scoped-grant-contract.md, G1/G3/54m57s-unknown/external carried unchanged.",
+    "r13FixpackVerify": "two fresh mkdtemp 0700 roots, each starting with ONLY the v2.1 script (sha 47c6b1de): positive 8/8 SAME runner exit 0 (wall 1236ms, PGID 28777, children ledger 23 = 22 git/node + 1 ps now counted); negative single-char corrupt EXPECT.manifestSha256 (tail 6->7) expected-red REAL runner exit 4 (43ms, PGID 29136, category manifest_sha_mismatch, failure.json complete, no fake zero); bounded runner 45s whole / git 5s / tsc 15s",
+    "byteAcceptance": "independent cmp -s: base 4/4 == vendor/original == manifest.original; patched post-strip 4/4 == vendor/dist == manifest.patched; installed dist 4/4 == reviewer positive emit; strip 4x1 -> 4x0; zero tsbuildinfo; TS 5.9.3; PRE==POST zero external drift",
+    "npmTest": "not rerun (no source change; vitest/full-suite forbidden by dispatch)",
+    "typecheck": "not rerun (no source change authorized)",
+    "gitReadonly": "rev-parse/ls-files/ls-tree/cat-file/apply(owned non-repo)/status only; author roots (vtVfSNbd, r12-m4cMpYUE, r12-neg-xgztXCcT) and grok r12 root frozen read-only; builder never executed",
+    "r14PrepGate": "readonly safety gate of Pi task_c156093d73fa prep root /tmp/perimeter-r14-prep-zJp8vI (no real resource executed by reviewer): 7 deliverable SHAs + repro cmp byte-identical to R13 frozen root + helpers/vendor/patch/builder/installed-dist/daemon-binary/runner hashes all match frozen ledgers; pi-mono cdaf blobs resolve read-only; node --check 6/6. After coordinator follow-ups, verdict request_changes with 9 required (R-Q14-1..9 in grok-s2-sdk-session-pin-round-14.md): docker whole budget 90s vs required 30s + backend-internal CLI budget disclosure (openEnvironment:47 30s / cleanup 5s); withDeadline race/unref must cancel+join (coordinator purefake oracle red x2 independently rerun by grok: 0 pass/2 fail exit 1 PGID 34882); readReady Atomics.wait blocks the loop (structurally unreachable ready); B4 new-generation pre-registration; B5 fixture child finalizers from ready + join longP/sentinelP; lost oracle needs in-memory connection-lost boolean match; docker fullCid 64-hex + driver positive-birth validation; all-path settled cleanup + failure JSON on unhandled; preflight image evidence whitelist Id. Fix confined to owned copies; targeted re-review of affected functions after fix, then coordinator dispatches the real run.",
+    "r15FixpackRecheck": "targeted re-review of Pi task_04dc9eda802e fix root /tmp/perimeter-r14-fix-fZM9j0 (zero real resource execution): 9 deliverable SHAs match 18.1; repro cmp byte-identical R13 frozen; old prep/coor roots frozen (coor oracles.test.mjs still d37b9551); node --check 7/7; own oracle copy (sourcePath->Pi fix root, coor original never executed) 2/2 pass exit 0 PGID 74831 vs R14 red 0/2; own isKnownLost/isFullCid purefake 2/2; Pi purefakes 2/2+4/4+3/3 cross-checked vs runCase implementation. R-Q14-1/2/3/4/6/7/8/9 + O-1/O-5 verified CLOSED. R14 wording correction recorded: coor oracle rerun rewrote source-provenance.json in coor frozen root (script self-write; no pre-write SHA, byte-identity unproven). New required R-Q15-1..4: B5 fixture TTL 8s/0.6s natural-expiry confound window up to ~ready+10.4s (need 30000ms + sentinel 5000ms + alive-at-abort assert); closeOnce must acquire positive identity (64hex+label+running) before any rm and fix closedHandle latch; driverProbe before Connection creation is structurally always-unknown + owned connection unregistered (move after snapshot, register close); deliverables manifest audit-notes row stale (fa95d8bb vs actual 8a3b94c2) + plan section-2 stale clause. Verdict request_changes; after fix + same-scope recheck, narrow approve for the real run.",
+    "r18StaticVerify": "round-18 static-only re-review of Pi r6 fix pack (root /tmp/perimeter-r18-fix-Ya5UaU, 0700/UID501, manifest 10/10 recomputed, repro 47c6b1de cmp byte-equal UNRUN, node --check 7/7): R-Q17-1 closed (runCase live deadline armed before caseFn sdk5:373, retry-close on deadline through real join :386-396, post-join unified case_deadline, closeFailed gate :403, non-convergence=disclosed runner-kill honest red); R-Q17-2 closed (execution-time remaining injection min(cap,case,whole), zero-spawn on <=0 via budget_exhausted_refused, no max(1,...) spawn, caseStopAt reset after join :397, DaemonResource deps-by-reference getter deadlineMs verified in helper source, multi-cleanup itemized <=88s+epsilon<90s converging paths, probe <=29s+epsilon; sdk5 has NO active whole-round abort - budget-enforced with disclosed runner-kill backstop, killSignal default SIGTERM); R-Q17-3 closed (arm :236 actually precedes OWN_PGID_PROBE :239 and all preflight; finally order close:453 -> driver waitOwnerGone/unknown:455-472 -> closeOnce rm:473 -> inspect-gone:474-481, rm never precedes join attempt, unknown never gone, latch success-only retryable). Sole required R-Q18-1: repo docs/implementation/s2-sdk-session-pin.md gained unauthorized section 18.4 (task authorized 18.3-append only; author disclosed it; delete or obtain explicit approval before it counts as authorized footprint). Behavior face stays blocked: both prepared test files UNRUN (no red/green results), real execution separately dispatched; 54m57s node termination still unknown with no new positive evidence; reviewer ran zero fakes/vm/resources this round. Evidence: /tmp/grok-s2-r18-review-i5DgtjXO (0700).",
+    "r19StaticVerify": "round-19 static-only re-review of Pi r7 fix pack + r8 wholeTimer patch (root /tmp/perimeter-r20-fix-5y1VL3, 0700/UID501, manifest 13/13 recomputed, repro 47c6b1de cmp byte-equal UNRUN, node --check 8 distinct mjs, r8 changed ONLY sdk5 - probe/fixture/preflight/repro byte-equal to r7/r6, caseB1..B5 bodies hash-identical r6->r8). r7 substantive fixes verified at source: unified live fallback (single onDeadline case+join, 25ms rearm, fixes r6 first-onDeadline-no-rearm defect), driverJoinProven positive-only gate inside closeOnce (no proof -> refuse rm + residual-container-not-removed honest red retryable, restores original task_4a83dddf7b7a gate; R18's unknown-then-rm acceptance corrected), per-call Math.floor budgets + floor<=0 refuse (no timeout:0) + explicit caps clamped + killSignal SIGKILL for owned controlled children, module-level 88s active whole timer armed before prelude with activeCase registration. Vendor conditional risk independently confirmed read-only (vendor/pi-env/original/connection.js: close sets #closed first; #teardown sets live=false + clears #session/#ready BEFORE stdin.end()/child.kill(), pending reject LAST -> sync throw in end/kill leaves pending forever unsettled, retry close no-op; owned unfixable, needs separate SDK authorization, blocked; normalG1 not withdrawn). R8 coordinator finding CONFIRMED as real gap: wholeStopExceeded/wholeWallMs sampled ONCE at sdk5:786-788 BEFORE summary build + writeFileSync; sync tail can cross the 88s deadline and the if at :802 uses the stale const -> 5/5 pass printed, timer cleared in finally, exit 0 past window (R-Q19-1 required: re-sample after writes before verdict + exit-time recheck in finally that can only flip to red). R-Q19-2 required: wholeWallMs is verdict-time sample not actual Node exit wall - rename wholeWallMsAtVerdict + capture exit wall in finally. R-Q19-3 required: live comment block :152-160 still carries rejected SIGTERM/epsilon<1s weak bound contradicting r7 discipline. wholetimer-r8-oracle classified source/model slice + new Function truth table (prepared NOT run, no provenance artifacts; cannot catch the two-instant sampling gap). Behavior face blocked: zero runs this round, both sides no new positive exit evidence for the 54m57s node. Evidence: /tmp/grok-s2-r19-review-XdURWFKl (0700).",
+    "r21StaticVerify": "round-20 targeted static re-review of Pi r9 fix pack (root /tmp/perimeter-r21-fix-U92OuS, coor-verified 0700/UID501/non-symlink, manifest 15/15 UID501/0600/hash-match, repro 47c6b1de cmp byte-equal UNRUN; reviewer re-ran node --check 9 distinct mjs 9/9, diffed sdk5 r8->r9: 4 hunks only - header version chain, live comment block, verdict/finally rewrite, main catch rewrite; caseB1..B5 untouched; probe/preflight/repro/abort-fixture cmp-equal to r8). R-Q19-1 CLOSED: fresh wholeRemainingAtDecisionMs resample at sdk5:822 AFTER summary writeFileSync :817 and BEFORE verdict :823 (wholeDeadlineFired || decision<=0; old wholeStopExceeded const zero residue); outer finally order clearTimeout :854 -> wholeWallMsAtFinalize sample :856 -> exit-wall-sdk5.json write :857 BEFORE final fresh recheck :861-862 that can only flip red (sets exitCode=4 first :863, nothing ever resets exitCode); all five red branches (decision/caseFailure/cleanupAggregate/finalize/main-catch) set non-zero exitCode BEFORE attempting evidence writes inside try/catch (write failure cannot flip green); success stdout declared intermediate (comment + deadlineSemantics), final verdict = exitCode + failure-evidence; wholeTimer clearTimeout exactly 2 (finally :854, main catch :875; :447/:473 are the per-case fallback timer cleared only after real join), no unref/race/process.exit, finally positionally after cleanup+summary+branches so unsettled never reaches clear. R-Q19-2 CLOSED: wholeWallMsAtVerdict everywhere with explicit non-exit-wall comment; wholeWallMsAtFinalize commented as main-finally sampling NOT OS/Node exit observation - real exit wall remains unmeasured until authorized outer-runner run (R19's own 'finally = actual exit wall' wording superseded, recorded in report §0-3). R-Q19-3 CLOSED: live comment :171-178 rewritten to R19 semantics (SIGKILL/floor/whole timer/two-stage constant-red/kernel latency unproven/runner 90s backstop, no epsilon-proven claims); old SIGTERM/epsilon wording only in retained version-chain history (:71,:85-86,:103) and negated statements. Four oracles text-verified PREPARED-NOT-RUN: tailgate-r9 slice anchors real (sdk5:770, :869-872), 7 markers present, SHA pin matches, ①-⑤ model the two-instant causality on the real tail (① would catch the r8 stale-const bug); two precision notes recorded (catch-clear text assertion lives in wholetimer-r9 not tailgate despite header cross-ref; failure-write order not observable through stubbed writeFailureSummary) - not defects; joinfb SHA-pin only, purefake SHA+verdict-gate adaptation, wholetimer renamed with dual-resample expression sanity. Exit-wall write failure swallowed by catch: recorded as missing diagnostic evidence only, red/green governed by exitCode+failure JSON independent of that write; no new architecture gate. Verdict approve NARROW to this static-prep pack only: zero runs this round by both sides, behavior face unproven, red/green separation (r8 frozen red first, then r9 green) and real repro/sdk5/docker dispatch remain coordinator-authorized; SDK5 unrun/current5fail/544x2/G1 full-3s/G3/S2 enterprise partial/54m57s node unknown/vendor post-state teardown blocked all carried; no release, no enterprise acceptance. Evidence: /tmp/grok-s2-r20-review-xFgJpy (0700).",
+    "r38TeardownRealExec": "round-38 REAL-EXECUTION review of Pi task_1d32155f0dd9 SDK teardown hardening continuation (author root /tmp/perimeter-s2-teardown-lMDwlI 0700; target hashes independently verified: patch aac1576e, dist connection.js fa270daa, builder 02b0bd13; manifest.original 4 files unchanged; author root manifest independently recomputed 20/20 OK but is a 20-file subset, not full-root coverage). Reviewer fresh owned 0700 root /tmp/grok-s2-teardown-r38-dCQxnm with own outer runner (pre-armed wall-clock deadline over full child lifetime, setsid exclusive PGID, real wait() child exit, ps group observation; ps failure=unknown). Independently reproduced: 4 adapted oracles 37/37 green (tailgate 6 incl forceSettle + new test-6, wholetimer 6, joinfb 5, purefake 20) with SHA pins cb1e2cc5/5ec9a6a7 and adaptation diffs confined to EXPECT+headers+mechanical fixes, zero assertion weakening; RED on r8 frozen copies exit 1 with ①②⑤ red / ③④ green and ① failing exactly on 0 !== 4 semantic assertion; teardown-fault 5/5 (real-pending barrier via REQUEST-frame write counts + flushRequests; original red control reproduces pre-fix close-penetration + pending-never-settles); build-negative 4/4; patch-install 14/14; docker-backend 34/34 on real docker 29.8.2 (incl new start.env.PATH regression assertion for the §6 ENOENT fix); preflight 9/9; adapted repro exit 0 8/8 byte-identical (cdaf6c227+new patch, wall 1119ms; old 47c6b1de frozen untouched, adapted repro SHA 4529628b honestly different); sdk5 exit 0 5/5 behaviors pass (B1..B5, cleanup all-settled, wholeDeadlineFired=false, exit-wall evidence, outer wall 6s); probe lifecycle pass BUT summary.wallMs=1792324005691.767 garbage reproduced live (probe:544 Date.now() minus :131 performance.now t0) -> REQUIRED R-Q38-1 one-line monotonic fix + fresh probe run; bounded full serial independently 564/564 pass 0 fail 0 skip 0 todo in 240s + typecheck pass. Builder missing-pin negative control (reviewer-owned fixture, full reds kept): A head=pin honored (log shows base pin=<sha>), B head removed with prior+sourceBaseHashes present REFUSED at build.mjs:78 base-drift, C bad-head git show fails loudly - no silent-HEAD output path in production shape; residual silent-fallback warning + builder git isolation + bounded() 60s SIGTERM recorded as optional R-Q38-3 (not a gate). Doc inaccuracies found (R-Q38-2 required, metadata): report §0 says 36/36 vs actual/final 37/37, §18.3 tail says tailgate 5/5 vs 6/6, §5 sdk5 SHA fc23e9d3 stale vs actual cb1e2cc5, probe garbage wallMs not flagged, manifest subset coverage unstated. Author deviations preserved unwashed (debug files, bare python3, two original failure JSONs, temp git-init patch provenance). 54m57s node unknown carried independently; new owned PGIDs never used as retro-exit proof. Verdict approve BOUNDED to this S2 SDK slice only; S2 stays partial; G1 full-3s/G3/enterprise/customer-external not upgraded. Evidence: /tmp/grok-s2-teardown-r38-dCQxnm (0700).",
+    "r39RunnerErrataAndV2Rerun": "round-39 errata + v2 re-execution after coordinator rejected R38 safety closure (missed followup msg_b989eff62cff 11:43:06Z, worker_done 11:54:15Z - miss acknowledged, original mail unretreivable via check count=0, task body taken as full transcript). R38 v1 outer-run.sh claims corrected: date +%s wall-clock-seconds polling was NOT monotonic/ms-precision (lifetime coverage itself held); ps -axo GLOBAL enumeration violated the no-global-scan discipline; group_empty claims void - ps snapshot taken >=1s after wait, .ps snapshots deleted, PGID==PID assumed from setsid without positive verification, birth often empty; v1 negpin.sh rm-rf reused fixture/out dirs and logs (append-only violated), wrote /tmp/negpin-conn-base.ts outside root (exists 14354B, disclosed not deleted), diagnostic copy deleted (content no longer claimable). v1 scripts + old evidence frozen kept. New v2 runner (runner2.mjs, new r39 root /tmp/grok-s2-teardown-r39-kVbTLg 0700): monotonic performance.now ms, spawn detached with scoped bounded ps -p PID positive verification PGID==PID + PPID==runner + birth/argv recorded, real wait exit code/signal, deadline over full lifetime, timeout ops only on scoped-reverified same-generation group (unverifiable=unknown no force kill, no fake gone after SIGKILL), NO ps -a/-e/-axo anywhere, group_residue_unknown honestly recorded with no scan to fabricate group_empty, outer wall sampled monotonic after final evidence write and labeled runner-observed NOT os-exit-wall, target_exit separate from runner fields, append-only nonce logs. v2 independent re-execution all natural exits 0: 4 fakes 37/37 (walls 108-160ms), preflight 210ms pass, repro 1170ms 8/8 SAME, sdk5 6005ms 5/5 pass (all-settled, deadlineFired=false, exit-wall 5900ms, full summaries/ledgers/events/exit-wall originals saved not just stdout), probe 565ms lifecycle pass with mixed-clock garbage wallMs 1792324707135.03 reproduced as expected (R-Q38-1 required stays: probe:544 one-line monotonic fix + fresh run; not fixed this task), test:bounded PARALLEL default (not serial) 564/564 pass 0 fail 0 cancelled 0 skipped 0 todo in 129500.46ms + typecheck pass. Functional conclusions from R38 stand (two generations, two independent all-green runs); bounded/residue claims re-grounded by v2 only. R38 manifest recheck: 401/402 OK, sole FAILED = manifest self-reference line (expected), out-of-root leftover /tmp/negpin-conn-base.ts absent from manifest - both disclosed, no fabrication. Verdict approve BOUNDED unchanged, re-grounded by v2; S2 partial; 54m57s node unknown unchanged (zero new evidence, zero global scan, zero unknown kill); R-Q38-2 doc-count alignment stays required; R-Q38-3 stays optional not-a-gate. Evidence: /tmp/grok-s2-teardown-r39-kVbTLg (0700)."
+  },
+  "stageSource": "docs/handoff.md section 7 table. Do not use docs/s1-implementation-report.md stage names.",
+  "coordinatorUpdate20261022": {
+    "scope": "补充最新本机证据；原 round-40 reviewer/verdict/items 保留为历史，不能代表当前状态。",
+    "S5": {
+      "status": "partial",
+      "commits": ["e2d69a6", "9a603d8", "c66c785", "89cacec"],
+      "evidence": ["docs/implementation/s5-tools-paging.md", "docs/reviews/grok-s5c-tools-paging-round-1.md", "docs/s5/s5-base-report.json", "docs/s5/s5-token-benchmark.json"],
+      "measured": "固定30任务×3模式×3次，270/270通过；129秒；LocalBackend/mock；runner RSS；真实独立OS进程A/B恢复。",
+      "limits": "真实成本/配对优化门槛未测；缓存零与缺字段不可区分；调用/重试/压缩无可靠计量；recovery.durationMs是recTime+200/不可用250派生值，不是任务墙钟，跨模式不可比较。S5d 9/9、12/12 CLI负控、typecheck0、Grok round-2 approve限本地统计层。"
+    },
+    "S6": {
+      "status": "partial",
+      "commit": "079cd53",
+      "localStatus": "local_verified",
+      "evidence": ["docs/implementation/s6-local-delivery.md", "docs/operations/s6-runbook.md", "docs/reviews/grok-s6-local-delivery-round-1.md", "docs/s6/evidence/metadata.json"],
+      "validation": "10/10；全仓typecheck0；126组件；最终CycloneDX1.6官方schema通过；Grok approve仅限本地包。",
+      "scan": "全依赖1 high（fast-uri@3.1.5，dev ajv传递）未修；生产依赖扫描0发现；vendor/容器未覆盖。",
+      "externalBlockers": ["真实CNI/IdP/KMS/DPA/WORM", "soak与隔离目录恢复演练", "真实成本/账单对账", "客户安全负责人具名批准", "未修开发供应链漏洞与镜像供应链证据"]
+    }
+  },
+  "items": [
+    {
+      "itemId": "s0-dependency-record",
+      "stage": "S0",
+      "status": "partial",
+      "source": "docs/handoff.md §7 S0；§0 基线说明",
+      "requirement": "记录依赖、模型能力与部署范围",
+      "paths": [
+        "package.json",
+        "docs/handoff.md"
+      ],
+      "acceptance": "依赖锁、模型能力与当前部署范围有单独可核对记录",
+      "dependsOn": [],
+      "evidence": "第七轮：包名/版本与 package.json、lock 对齐（@earendil-works/chord、pi-ai、pi-durable、pi-env 各 1.1.0），SHA-256 台账与实测一致。遗留一处过时表述：DockerBackend 行仍写「守护进程未配置 external_blocked」，而 docker 29.8.2 已可用且容器套件真实执行。金额按 mock 价格 $0.00 表述，未冒充真实成本。 第29轮：manifest 0b87934f/builder 40753000/patch 940892b9/template dd3fd94f 与任务先验复验一致；installed dist 4 文件=审者 patched emit 逐字节，安装态与 manifest 自洽。 第30轮：v2.1 summary.gitEnv 固化记录；children 台账 23=22 git/node+1 ps 误称已修；PRE==POST vendor/installed 零漂移复验。"
+    },
+    {
+      "itemId": "s0-threat-model",
+      "stage": "S0",
+      "status": "implemented",
+      "source": "docs/handoff.md §7 S0；§5.1",
+      "requirement": "建立威胁模型与风险台账",
+      "paths": [
+        "docs/s0/threat-model.md"
+      ],
+      "acceptance": "威胁主体、信任边界、未关闭风险、责任人和到期日可核对",
+      "dependsOn": [],
+      "evidence": "docs/s0/threat-model.md 有 8 类威胁主体、Mermaid 信任边界图、RSK-001…008 台账。未授权负责人统一标「待指定」，RSK-002 补记 root 物理删除的残余风险与恢复路径。RSK-004…008 如实标为未关闭/external，未把代码缺口写成外部阻塞。"
+    },
+    {
+      "itemId": "s0-benchmark-baseline",
+      "stage": "S0",
+      "status": "implemented",
+      "source": "docs/handoff.md §7 S0；§4.4",
+      "requirement": "建立验收任务与基准，并保存当前测试报告",
+      "paths": [
+        "src/evals/gateway-process.ts:ce1a50b0881dcbe1",
+        "src/evals/benchmark-pipeline.ts:62031faf9aae4628",
+        "src/evals/benchmark-runner.ts:f84c846a62e9afa4",
+        "src/evals/benchmark-fixtures.ts:01ba1a9264b8c4c3",
+        "docs/s0/actual-local-mock-benchmark.json:e23b8beab2479055",
+        "docs/s0/benchmark-baseline.md:e7222a320303dec0"
+      ],
+      "acceptance": "固定任务集的完成率、token 与延迟基线被保存；测试报告可复跑",
+      "dependsOn": [],
+      "evidence": "第十二轮独立复跑 270 条（129s，deadline 内自发退出）：recovery 为真实独立 OS 子进程 A/B（recoveryProcessMeta 记录 PID 对唯一、A exitCode 0、不同 PID 断言），同 stateRoot/workspace 未提交产物逐字节连续；warm/cold token 全部事件化（nullable，cacheRead 缺失即 null，usageSource 两态），80/40/25 常量已删；memoryMetric 标注 runner_process + PID；LocalBackend 非强隔离措辞已校准；negative 真失败；cleanTestEnv 与 deadline 保护真实。真实获批模型/客户质量/成本/SLA 仍 external unknown，mock $0.00 非真实账单。"
+    },
+    {
+      "itemId": "s0-local-mock-only",
+      "stage": "S0",
+      "status": "implemented",
+      "source": "docs/handoff.md §7 S0",
+      "requirement": "明确当前只以 local/mock 为证据，不把绿灯写成生产通过",
+      "paths": [
+        "docs/handoff.md",
+        "docs/s1-implementation-report.md"
+      ],
+      "acceptance": "文档与运行环境都表明没有真实模型、真实集群证据",
+      "dependsOn": [],
+      "evidence": "实现报告写明使用本地测试 IdP。本轮 docker info 与 kubectl current-context 均失败。"
+    },
+    {
+      "itemId": "s0-no-new-sdk",
+      "stage": "S0",
+      "status": "implemented",
+      "source": "docs/handoff.md §7 S0",
+      "requirement": "不引入新 SDK 或 provider",
+      "paths": [
+        "package.json"
+      ],
+      "acceptance": "package.json 依赖集合不因 S0/S1 增加",
+      "dependsOn": [],
+      "evidence": "git status 未包含 package.json 或 package-lock.json。 第29轮（grok 2026-10-17，session-pin R12 隔离重建审）：package.json/lock 未触；vendor patch+固定 cdaf6c227 重建路径证明零新依赖；审 verdict request_changes 仅指作者 owned repro.mjs 与报告文字（fail() process.exit、缺 GIT_NO_LAZY_FETCH、缺 out/cfg mkdir 三项），8/8 字节复现事实独立双跑成立。 第30轮（grok 2026-10-17，R-Q12a/b/c 修复验证门 approve 微门）：v2.1 脚本自足+零 process.exit+显式 GIT_NO_LAZY_FETCH，双 fresh root 正控 8/8、负控单字符改错真 exit 4；request_changes 三项全闭，仅限 owned 脚本+§17 文字。"
+    },
+    {
+      "itemId": "s1-jwt-verify",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 可信身份；§7 S1",
+      "requirement": "JWT 校验 alg/iss/aud/exp/nbf，principal 使用 issuer+sub",
+      "paths": [
+        "src/gateway/auth.ts:196-286",
+        "tests/enterprise-s1.test.ts"
+      ],
+      "acceptance": "伪造算法、过期、错误 iss/aud、非法 sub 拒绝；合法 RS256/ES256 得到稳定 principal",
+      "dependsOn": [
+        "s0-no-new-sdk"
+      ],
+      "evidence": "第二轮：NaN、Infinity、负数、大于 300 的 clockSkewSec 构造失败。skew 30 接受 exp=now-10，拒绝 exp=now-31；默认 skew 同样拒绝。真实客户 IdP 仍见 s1-real-idp。"
+    },
+    {
+      "itemId": "s1-jwks-fresh-stale",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 JWKS 轮换；s1-review R1",
+      "requirement": "JWKS 轮换、fresh/maxStale fail-closed、限频与大小上限",
+      "paths": [
+        "src/gateway/auth.ts:158-194",
+        "tests/enterprise-s1.test.ts"
+      ],
+      "acceptance": "超过最大陈旧时间不返回已知 kid；陈旧窗口内允许；故障 single-flight；超大响应与过多 key 拒绝",
+      "dependsOn": [
+        "s1-jwt-verify"
+      ],
+      "evidence": "第二轮：ttl 与 maxStale 构造校验、过期 fail-closed、陈旧窗口内仍返回旧 kid 均成立。第三轮：带 signal 与不带 signal 的 get 共享一次 fetch；abort 前者后后者拿到 kid=key-1，命中数保持 1。两个都带 signal 时 abort 一个，另一个拿到 kid=key-2，命中数也是 1。"
+    },
+    {
+      "itemId": "s1-prod-query-token",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §7 S1 完成判据；§5.2 浏览器凭证",
+      "requirement": "生产模式不接受 query token 或自报 actor",
+      "paths": [
+        "src/gateway/server.ts:557-580",
+        "scripts/attach.ts:14-22",
+        "web/app.js:49-52"
+      ],
+      "acceptance": "生产 query 中出现 token 或 actor 即拒绝；客户端不再发送它们",
+      "dependsOn": [
+        "s1-jwt-verify"
+      ],
+      "evidence": "第五轮 Chrome：服务端拒绝生产 query token/actor。raw bearer、raw token/actor、hash 加 raw 组合下，页面自己的 POST 与 WS 都无凭证键，search 凭证被从地址栏抹掉。CLI 升级 URL 不带 token。"
+    },
+    {
+      "itemId": "s1-cookie-session",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 浏览器凭证",
+      "requirement": "同源 Secure/HttpOnly/SameSite cookie，有 cookie 即做 Origin/CSRF 防护",
+      "paths": [
+        "src/gateway/server.ts:446-516",
+        "src/gateway/auth.ts:299-327"
+      ],
+      "acceptance": "cookie 只有不透明 id；恶意 Origin 不能换票或劫持 WS；生产 origin 必须 https",
+      "dependsOn": [
+        "s1-jwt-verify"
+      ],
+      "evidence": "第五轮 Headless Chrome：hash 与 raw 组合下 POST /auth/session 均 204，Cookie 为 __Host-perimeter_session，HttpOnly、Secure、SameSite=Strict，document.cookie 为空，随后 WS 带该 Cookie。带 query 或 body 的 POST 为 400。网关进程本身不提供 TLS，本轮用本地 TLS 反代满足 production 的 https Origin。会话仍只在内存，见 s1-persistent-revocation。未实现 double-submit CSRF。"
+    },
+    {
+      "itemId": "s1-pkce",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 可信身份；§7 下一位 agent",
+      "requirement": "浏览器 OIDC Authorization Code + PKCE；客户参数缺失时先提供测试 IdP，不把 JWT 接口冒充公司 SSO",
+      "paths": [
+        "src/gateway/server.ts:684-893",
+        "tests/enterprise-s1.test.ts"
+      ],
+      "acceptance": "授权码与 PKCE 在测试 IdP 上走通；文档不声称已接客户 SSO",
+      "dependsOn": [
+        "s1-cookie-session"
+      ],
+      "evidence": "第七轮真实 Chrome 跨站全链路通过：login 302 签发 __Host-perimeter_pkce（Path=/，HttpOnly、Secure、SameSite=Lax），跨站回 callback 携带该 cookie，302 到 / 并签发 Strict 会话 cookie 且销毁 pkce，WS 带 cookie 升级成功，URL 无凭证。node 负测：state 篡改/无 cookie/伪造 cookie 400，重放与 nonce 错配 401，iss/aud 错 401，多受众无 azp 或 azp 错值 401、azp=clientId 302，token 端点 302 不跟随，70KiB 洪泛 400，deadline 502 无迟到 cookie，断开后会话数不增，20 槽占满时 callback 503 无 cookie。文档未声称已接客户 SSO。"
+    },
+    {
+      "itemId": "s1-real-idp",
+      "stage": "S1",
+      "status": "external_blocked",
+      "source": "docs/handoff.md §7 S1；§0 证据口径",
+      "requirement": "用客户 issuer、audience 与组映射验证真实 IdP",
+      "paths": [
+        "src/gateway/server.ts:887-898"
+      ],
+      "acceptance": "真实 IdP 签发的 token 通过，错误 issuer 或组映射拒绝",
+      "dependsOn": [
+        "s1-jwt-verify",
+        "s1-pkce"
+      ],
+      "evidence": "没有客户 IdP 参数。本轮只用本地生成的 RSA/EC 密钥。"
+    },
+    {
+      "itemId": "s1-host-origin",
+      "stage": "S1",
+      "status": "partial",
+      "source": "docs/handoff.md §5.2 传输与入口；§7 S1",
+      "requirement": "HTTP 与 upgrade 都做精确 Host/Origin allowlist",
+      "paths": [
+        "src/gateway/server.ts:411-442",
+        "src/gateway/server.ts:519-524",
+        "src/gateway/transport.ts:113-120"
+      ],
+      "acceptance": "未列出的 Host/Origin 拒绝；生产 origin 只能是精确 https；通配与后缀匹配拒绝",
+      "dependsOn": [],
+      "evidence": "WS 与 /auth 有套件。静态 GET 只检查 Host，不检查 Origin。网关进程本身是 HTTP，TLS 终结不在进程内。"
+    },
+    {
+      "itemId": "s1-schema-byte-limits",
+      "stage": "S1",
+      "status": "partial",
+      "source": "docs/handoff.md §3.2；§7 S1 限流/字节边界",
+      "requirement": "入站 schema、帧大小、prompt 上限、每连接队列与 bufferedAmount、连接数与命令速率",
+      "paths": [
+        "src/protocol/validate.ts",
+        "src/gateway/transport.ts:18-92",
+        "src/gateway/server.ts:157"
+      ],
+      "acceptance": "非法命令、超长 prompt、超限帧和慢连接被拒绝或只断开该连接；默认接近 1MiB 入站、64KiB prompt、2MiB 队列、8MiB 水位",
+      "dependsOn": [],
+      "evidence": "parseCommand 与 Outbox 默认值符合建议值。慢端测试使用伪造 socket，不是真实半开连接。普通 HTTP 没有连接总数上限。初始 tail 200 不属于本项已完成部分。"
+    },
+    {
+      "itemId": "s1-auth-cancel-concurrency",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §3.2 超时中止；s1-review 保留项 1",
+      "requirement": "验签有截止时间，超时取消底层工作，HTTP 与 WS 共享实际并发上限",
+      "paths": [
+        "src/gateway/auth.ts:17-18",
+        "src/gateway/server.ts:463-540",
+        "src/gateway/server.ts:831-859"
+      ],
+      "acceptance": "超时后适配器工作停止；迟到结果无 cookie；HTTP+WS 同时进行的 authenticate 不超过配置上限",
+      "dependsOn": [
+        "s1-jwt-verify"
+      ],
+      "evidence": "第三轮：20 个忽略 abort 的 authenticate 进入后，第 21 个 HTTP、一个 WS、以及再一个 HTTP 都是 503，进入数保持 20。这 20 个为 504 且无 Set-Cookie，abort 次数为 20。Promise 未完成前再请求仍是 503。放行后下一请求为 204，Set-Cookie 名为 __Host-perimeter_session。名额会占到忽略 abort 的适配器自己 settle，这是当前设计。"
+    },
+    {
+      "itemId": "s1-resource-authz",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 完整资源授权；§7 S1",
+      "requirement": "attach、命令、共享、审批、中止都按服务端主体和 repo/team 校验；客户端不能改 scope",
+      "paths": [
+        "src/gateway/server.ts:424-434",
+        "src/gateway/server.ts:653-725"
+      ],
+      "acceptance": "伪造 team、跨会话、无成员关系或 scope 不匹配都被拒绝",
+      "dependsOn": [
+        "s1-jwt-verify"
+      ],
+      "evidence": "第三轮：生产形态 scopeFromGroups(principal)，groups 含 dev。真实 prompt 进入 mock 请求体，system 内容为 main-repo/core-team，没有资源权限已撤销。未映射组关闭码 4003、原因无权创建会话，模型日志为空。会话回调按当前连接取 principal。list/history/diff/artifact/export 端点仍不存在，这不是绕过。登录时的 groups 快照不会自动跟随 IdP。"
+    },
+    {
+      "itemId": "s1-revoke-disconnect",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2；§7 S1 过期/吊销",
+      "requirement": "吊销和权限收缩断开旧连接，并拒绝后续接入",
+      "paths": [
+        "src/gateway/server.ts:584-594",
+        "src/gateway/server.ts:699-701",
+        "src/gateway/server.ts:763-766"
+      ],
+      "acceptance": "revoke 与资源撤权都立即 close，旧连接不能再收发会话数据",
+      "dependsOn": [
+        "s1-resource-authz"
+      ],
+      "evidence": "第二轮：actor 型 resolveScope 翻转后，命令关闭码 4003，presence 不再包含该 actor。revokePrincipal 关闭码 4001。登录时的 groups 快照不会自动跟随 IdP 组变更。吊销表仍只在内存，见 s1-persistent-revocation。"
+    },
+    {
+      "itemId": "s1-inflight-recheck",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 在途审批失效；§3.1",
+      "requirement": "撤权后已入队命令不得执行，在途审批失效",
+      "paths": [
+        "src/gateway/session.ts:97",
+        "src/gateway/session.ts:139-144",
+        "src/runtime/approvals.ts:69-75"
+      ],
+      "acceptance": "ready 前入队、撤权后 flush 的 prompt 不到模型；已撤权主体不能把 pending 审批批成 allow",
+      "dependsOn": [
+        "s1-revoke-disconnect"
+      ],
+      "evidence": "第五轮：负向撤权后 argv[4] 为 0 字节，写 queue-leak.txt 的脚本没有留下该文件，关闭码 4003。正向对照同一脚本，argv[4] 含 prompt 且工作区真的写出该文件，oracle 可失败。仓库 F3-3 正向轮询 argv[4] 并断言真实 marker，npm test 三次 396 pass。"
+    },
+    {
+      "itemId": "s1-persistent-revocation",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 离职撤权；实现报告 §3.4",
+      "requirement": "吊销与浏览器会话在重启后仍然有效",
+      "paths": [
+        "src/gateway/server.ts:989-1096",
+        "src/gateway/auth.ts:463-489"
+      ],
+      "acceptance": "重启后已吊销主体不能用旧 cookie 或旧 token 接入",
+      "dependsOn": [
+        "s1-revoke-disconnect"
+      ],
+      "evidence": "第七轮真实双子进程共享 stateRoot：重启后 alice 同 JWT 与旧 cookie 均 401，bob 旧 cookie 的 WS actor 保持 https://corp.local|bob（身份跨进程保持），restorePrincipal 后恢复；崩溃窗口构造（吊销已落盘+会话未清理）被按 principal.id 过滤，旧 cookie 401；已初始化后删除 revocations.json、revoked 内非字符串、会话条目缺 principal 三类均 exit 3 fail-closed 拒启；stateRoot 0700、三个持久文件 0600，chmod 全部限于 stateRoot 内；恢复条目经 restore 逐字段校验。"
+    },
+    {
+      "itemId": "s1-static-path",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "s1-review R5；handoff §6 不提供 host 任意文件预览",
+      "requirement": "静态文件不能通过词法路径或符号链接逃出 webRoot",
+      "paths": [
+        "src/gateway/server.ts:599-614",
+        "tests/enterprise-s1.test.ts"
+      ],
+      "acceptance": "目录遍历、坏编码、指向 webRoot 外的符号链接均不可读",
+      "dependsOn": [],
+      "evidence": "套件断言遍历 404、坏编码 400、符号链接 404。hardlink 与 TOCTOU 仍是残余风险，不把该项扩成通用文件隔离。"
+    },
+    {
+      "itemId": "s1-web-cli-client",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §7 S1 网页/CLI",
+      "requirement": "网页与 CLI 使用服务端身份，不把生产凭据放进 query，断线按关闭码处理",
+      "paths": [
+        "web/app.js:49-55",
+        "scripts/attach.ts:14-28"
+      ],
+      "acceptance": "CLI --bearer 不带 query token；网页换 cookie 后连接；4001/4003 不重连",
+      "dependsOn": [
+        "s1-cookie-session",
+        "s1-prod-query-token"
+      ],
+      "evidence": "CLI --bearer 在 PERIMETER_TOKEN 存在时 URL 仍只有 session。第五轮 Chrome：hash 与 raw 组合下 WS 均无凭证；revoke 后 3.5s 没有新升级；页面收到关闭码 4003 后 4s 没有新升级；连续失败间隔 1372ms 然后 1555ms。"
+    },
+    {
+      "itemId": "s1-bearer-page-query",
+      "stage": "S1",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 浏览器凭证；§7 S1 完成判据「无生产 query token」",
+      "requirement": "生产页面不得把 bearer、token 或 actor 放进会被代理记下的请求 URL；启动日志不得打印带凭证的 URL",
+      "paths": [
+        "web/app.js:51-72",
+        "src/gateway/server.ts:1036",
+        "scripts/demo.ts:169-180"
+      ],
+      "acceptance": "页面不从 location.search 读取 bearer、token 或 actor。第一次文档 GET 的请求目标不含这些字段。hash 可以作一次性引导，读完立即从地址栏去掉。不得用随后 WS 不带 token 当作通过。交换后 cookie 仍为 __Host-perimeter_session。demo 与 production 的启动日志都不打印带凭证的 URL。不放宽生产 auth 对 query 和非空 body 的拒绝，除非同时改路由并证明 body 不进访问日志",
+      "dependsOn": [
+        "s1-cookie-session"
+      ],
+      "evidence": "第五轮 Chrome：#bearer 的第一次 GET 查询键为空，replaceState 先于 fetch，POST 时 hash 与 search 均空，WS 为 /? 。raw bearer、raw token/actor、hash 加 raw 三种组合下页面 POST/WS 均无凭证键，search 凭证被抹掉。demo 的 server.ts 启动行没有 ?token= 也不含 token 值，scripts/demo.ts 的打开行没有 query。用户键入的那一次导航 GET 仍会带查询串，页面不能取消已发出的导航。"
+    },
+    {
+      "itemId": "s2-no-local-backend",
+      "stage": "S2",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 文件系统隔离；§7 S2",
+      "requirement": "企业模式禁止 local backend",
+      "paths": [
+        "src/gateway/server.ts:203-220"
+      ],
+      "acceptance": "production 未显式配置隔离后端时拒绝启动",
+      "dependsOn": [
+        "s1-jwt-verify"
+      ],
+      "evidence": "第十三轮：production 缺 backend、LocalBackend 实例、伪装 kind 的 LocalBackend 子类（instanceof 捕获）、allowLocal、默认 bridge 全部 fail-closed 拒启，测试齐备；非法 kind 与接口缺失也拒绝。"
+    },
+    {
+      "itemId": "s2-container-hardening",
+      "stage": "S2",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 文件系统隔离",
+      "requirement": "non-root、read-only、drop ALL、no-new-privileges、资源限制、seccomp、禁止 hostPath 与 docker.sock、不自动挂 SA token",
+      "paths": [
+        "src/gateway/execution-backend.ts:337-401",
+        "deploy/sandbox.yaml"
+      ],
+      "acceptance": "Docker 与 Pod 两条路径都落实上述约束，并有对应测试",
+      "dependsOn": [
+        "s2-no-local-backend"
+      ],
+      "evidence": "第十五轮：R1 六条绕过面与 R2 两项残留全部闭合（fake CLI 行为学实证：inspect name→ID_A 绑定后 name 重绑 ID_B，launch 仍用 ID_A；extraArgs 9 种挂载形式全拒、未知选项不吞参）；两项历史红灯 fresh 真绿（docker 文件 34/34），六轮全量 417/417/0 全部自发退出，owned 容器 0；只读根、non-root、cap-drop ALL、no-new-privileges、tmpfs noexec 与最小挂载面由真实容器断言。seccomp 仍依赖 runtime 默认而非显式 profile，真实集群 Pod 路径与 CNI 出口 external。"
+    },
+    {
+      "itemId": "s2-path-guard",
+      "stage": "S2",
+      "status": "partial",
+      "source": "docs/handoff.md §5.2 工具安全；s2-protected-paths-plan.md Slice A",
+      "requirement": "path-carrying 工具经与工具同一 ExecutionEnv 的 canonical 视角做包含/越界/symlink/NUL 守卫，fail-closed，策略 deny 与 require_approval 均不漏；审批等待期目标漂移复检",
+      "paths": [
+        "src/runtime/execution-env.ts",
+        "src/runtime/harness-host.ts",
+        "src/runtime/path-guard.ts",
+        "src/runtime/perimeter-extension.ts",
+        "tests/path-guard-exec-helper.test.ts",
+        "tests/protected-paths.test.ts"
+      ],
+      "acceptance": "真实链正反控：多级新建与 workspace 内绝对路径正控；.. 外逃/绝对外逃/假前缀/symlink 出界/循环 fail-closed；canonical 复判 deny 与 require_approval 不漏；审批等待期漂移复检拒",
+      "dependsOn": [
+        "s2-four-eyes",
+        "s2-container-hardening"
+      ],
+      "evidence": "第六轮（grok 2026-10-17）：有限 approve 恢复包——R5 required（3 项集成 beforeTool 测试静默删除）关门。产品四哈希与 R5 台账相符（f6fcbbd/0f76749/e25a404/e5a8e60 零改动）；tests/path-guard-exec-helper.test.ts 24=21（R5 原项全保留）+3（与 R4 原版逐字一致：真实 beforeTool+NodeExecutionEnv+createPathGuardResolver，多级新建/绝对路径放行与 symlink 外逃/ELOOP/NUL/~越界 deny 及 policy.denied 无宿主路径断言）。三份限定专项独立全绿（Pi 708ms PGID54686/协调者 697ms PGID57660/grok 705ms，runner 120s 外挂，0 skip 0 fail 自然 exit）；静态 0 错。480 为静态计数（顶层 test( 405 旁证），本轮未跑全量不报全绿；dockerReady 模块加载副作用已披露、零容器创建；daemon 停滞约束继续，不重启不换 context。G1 SDK bootstrap/reconnect 与 G3 lost 死亡确认维持 blocked；s2-protected-paths/S2/企业维持 partial，本恢复包不构成总体 approve/implemented；K8s unknown；bash/硬链接/敏感读/TOCTOU 不扩。证据 /tmp/perimeter-r6/ 与 /tmp/perimeter-r6-grok/。 设计轮（2026-10-17，grok-s2-sdk-cancellation-design-round-1.md）：G1 session-pin 子方向认可+最小分段（G1-only JS+d.ts，兼容 1.1.0 daemon）；整体设计 request_changes 5 处 required（info/session 原子性、pin 运行时台账硬校验、closeAsync 降级为 transportExit 证据、groupReaped 经 spillPath-only 白名单丢失+生产 capability 缺失须启动前 fail-closed、构建命令与平台矩阵精确化）。设计批准≠runtime 成功；G1 30s 未察觉窗口与 G3 网络分区不可证维持如实声明；阶段仍 partial。 G1-knownlost 实现轮（2026-10-17，grok-s2-sdk-session-pin-round-1.md）：有限 approve——SDK snapshot()+sessionPin 最小 diff（+7/+19，pinned+cwd fail-closed，pinnedSession 可运行时核验）、vendor manifest/patch/apply-verify-rollback 哈希链逐环独立重算一致（源TS→生成dist→实际加载全符）、perimeter pinned guardEnv 接线+运行时 fail-closed（原1.1/错版/部分apply/重装原版全拒）。known-lost 语义三方独立证实（真实杀 daemon 立即 lost 零 spawn、旧 pin 跨代持续 deny、工具 unpinned 真实重连、新 snapshot 新 pin 恢复、abort 不伤 sentinel）；独立实测 serial 486/486、bounded① 485/486（readLocalProbe existsSync→JSON.parse 读竞态 flake，required 修复：有界轮询至合法 JSON）、bounded② 486/486、session-pin 6/6、path-guard 24/24、SDK vitest 5/5、静态 0 错。G1 30s 静默窗口与 G3 lost 死亡维持 unknown/blocked，3s 预算门槛未闭；s2-protected-paths/S2/企业维持 partial。 G1-knownlost 实现第1审终版（2026-10-17，grok-s2-sdk-session-pin-round-1.md，经协调者两条追加清单修订）：语义核认可不重开（SDK snapshot/sessionPin 最小 diff、vendor 哈希链逐环一致、pinned guardEnv 接线、known-lost 语义三方证实、独立 serial 486/486 与 bounded② 486/486）；落地件 request_changes 8 处 required：R1 readLocalProbe existsSync→JSON.parse 读竞态（bounded① 485/486，复跑全绿）；R2 作者 SDK 运行缺 raw log 路径；R3 installer process.exit/mixed 态静默自愈/回滚无预校验/symlink-hardlink-manifest键逃逸面；R4 owned tsconfig 只在 /tmp 未入库不可复现；R5 sourceMappingURL 指向旧 map 表述不实；R6 patch 运行时无旧SDK/篡改/部分apply/重装负控；R7 远程 helper PATH 宿主增补须回标准最小；R8 owned 证据须精确 ID 生命周期格式（全局计数不足，close 为同步包装不 await transport exit）。G1 30s 静默窗口与 G3 lost 死亡维持 unknown/blocked，3s 预算门槛未闭；s2-protected-paths/S2/企业维持 partial。 session-pin round-2（2026-10-17，grok-s2-sdk-session-pin-round-2.md）：R1-R8 修复本体有限 approve（逐项独立复证：installer 参数化纯函数严格 schema/realpath/原子 rename/mixed-unknown 全拒、builder 入库幂等 hash 复现、sourceMappingURL 剥离 grep=0、previous/ 升级快照、11 项 isolated 负控全绿、PATH 回标准+helperNode、R8 ownedAlive 身份证据、readLocalProbe 有界轮询）；独立实测 serial 498/498、bounded 498/498、负控 11/11、session-pin 7/7、path-guard 24/24、SDK vitest 5/5、静态 0 错。2 处 required 跟进：R-Q1 重连恢复用例 kill-0 waitGone 早于 teardown 处理的时序竞态（fresh/fresh2 各 1 次实录，修法确定性等待或有界 lost 重试）；R-Q2 报告证据表「7 pass ×4」引用 fresh/fresh2 不实须更正（实际全绿=stability×3+独立 7/7+498×2）。G1 30s 静默窗口与 G3 lost 死亡维持 unknown/blocked，3s 预算门槛未闭；s2-protected-paths/S2/企业维持 partial。 session-pin round-2 终版（2026-10-17，grok-s2-sdk-session-pin-round-2.md，经协调者 02:24/02:25 追加清单修订）：R1-R8 修复本体可证部分独立复证（installer 核心安全属性、builder 入库幂等、map 剥离 grep=0、PATH 回标准+helperNode、readLocalProbe 有界轮询、11 项函数层负控）；独立实测 serial 498/498、bounded 498/498、负控 11/11、session-pin 7/7、path-guard 24/24、SDK vitest 5/5、静态 0 错。落地件 request_changes（R-Q1～R-Q8）：R-Q1 重连恢复用例时序竞态（fresh/fresh2 实录）；R-Q2 报告「7 pass ×4」引用 fresh/fresh2 不实；R-Q3 runtime 未强制 kind==patched（原版安装靠 capability 巧合拦截）；R-Q4 runtime 层负控缺失；R-Q5 ownedAlive 未知/Z 语义不当；R-Q6 新 R8 用例无 cleanup 登记失败分支泄漏 transport；R-Q7 builder rmSync 无所有权+manifest 重写缺预校验；R-Q8 计数分解错误（实为 486+1+11）与资源 ledger 缺 nonce/PGID/birth/containerID 生命周期格式。498×2 raw 属实保留。G1 30s 静默窗口与 G3 lost 死亡维持 unknown/blocked，3s 预算门槛未闭；s2-protected-paths/S2/企业维持 partial。 session-pin round-3（2026-10-17，grok-s2-sdk-session-pin-round-3.md）：R-Q1～R-Q8 修复全部独立复证，有限 approve——runtime 强制 kind==patched（CLI 双语义对照）、能力门纯函数+3 项 runtime 负控（original/旧 SDK 零 I/O/缺错 getter）、teardown barrier+lost 有界重试确定性时序、DaemonResource 创建即登记+nonce/pid/pgid/ppid/birth/session ledger、ownedAlive 未知/Z 语义修正、builder 步骤 0 预校验+mkdtemp（rmSync 移除）、JSONL ledger 双份（session-pin 182 事件；Docker 4 次真实 CID 生命周期）。独立实测 serial 506/506、bounded 506/506、patch-install 14/14、build-negative 4/4、docker-owned-ledger 1/1、session-pin 7/7、path-guard 24/24、SDK vitest 5/5、静态 0 错。G1 30s 静默窗口/无响应 CANCEL 与 G3 lost 死亡维持 unknown/blocked，3s 预算门槛未闭；s2-protected-paths/S2/企业维持 partial，Pod unknown。 session-pin round-3 终版（2026-10-17，grok-s2-sdk-session-pin-round-3.md）：R-Q1/R-Q2/R-Q3/R-Q4/R-Q7 approve（独立复证：teardown barrier+lost 有界重试确定性时序、runtime 强制 kind==patched 双语义对照、能力门纯函数+3 负控零 I/O、builder 步骤 0 预校验+mkdtemp+rmSync 移除）；R-Q5/R-Q6/R-Q8 主体落地但残余未闭 → request_changes（R-Q9a～d）：track 注册窗口与 after 顺序中断泄漏、重连新代无 track/未证 gone、kill 前出生/pgid 未实比、psIdentity 任意非零空输出当 gone、Docker 用例 environment 在 try 外/ws 清理在后/按名非 CID gone/任意非零当 gone/CID 12hex 截断。独立实测 serial 506/506、bounded 506/506、patch-install 14/14、build-negative 4/4、docker-owned-ledger 1/1（ledger 双份：session-pin 182 事件+Docker 4 次 CID 生命周期）、session-pin 7/7、path-guard 24/24、SDK vitest 5/5、静态 0 错。G1 30s 静默窗口/无响应 CANCEL 与 G3 lost 死亡维持 unknown/blocked，3s 预算门槛未闭；s2-protected-paths/S2/企业维持 partial，Pod unknown。 session-pin round-4（2026-10-17，grok-s2-sdk-session-pin-round-4.md）：R-Q9a～d 修复全部落地并独立复证，有限 approve——track 任何 await 前同步登记 dispose+失败 close+如实 unknown、runAllCleanups 聚合、重连新代新 nonce/完整身份/末 gone、kill 前登记代际全字段比对+注入 spy 零 kill 负控、ps-observer 注入式 observer 19 项纯负控（仅 exit1 双空=gone；error/signal/null/其它非零/畸形=unknown；Z 等收割；全身份复用判定）、Docker ledger nonce 资源名+全 64hex CID+gone 精确 NoSuchObject 匹配（exit0=live 判失败）、git 子命令全隔离。独立实测 serial 525/525、bounded 525/525、ps-observer 19/19、patch-install 14/14、build-negative 4/4、docker-ledger 1/1、session-pin 7/7、path-guard 24/24、SDK vitest 5/5、静态 0 错；产品/SDK/vendor 哈希 R3 终态零改动（仅测试件变更）。G1 30s 静默窗口/无响应 CANCEL 与 G3 lost 死亡维持 unknown/blocked，3s 预算门槛未闭；s2-protected-paths/S2/企业维持 partial，Pod unknown，整仓历史资源仍 unknown。 session-pin round-4 终版（2026-10-17，grok-s2-sdk-session-pin-round-4.md）：R-Q9a 主体（await 前同步登记/失败 close/runAllCleanups/重连新代跟踪）、R-Q9b 主体（kill 前全字段比对+可注入）、R-Q9d 全部（nonce 资源名/全 CID/gone 精确 NoSuchObject/live 判失败/git 隔离）独立复证；协调者确认成立。但 R-Q9c oracle 缺陷经协调者纯 fake probe 独立复现+本审代码证实：waitOwnerGone 对未采到出生身份（NaN/空 generation）仍 alive 的 owner 因 matchesGeneration 必假记 gone-pid-reused 并 resolve（/tmp/perimeter-r10/coordinator-unknown-generation.log，exit1/58ms）；任一字段不符即 reuse 过宽。19 项负控无 kill spy/无 track 观察失败注入/无分变量用例，报告 kill-spy 覆盖声称无依据。request_changes（R-Q9c 语义修正：仅有效完整出生真实不同才判复用，同 birth 漂移/无效字段=unknown 拒杀不计 reaped；R-Q9a' dispose unknown 须失败收尾；R-Q9b' 负控补齐）；525×2 双绿不抵消。G1 已批部分不撤（缺陷在测试 observer 层）；3s 预算门槛/G3/lost/30s/CANCEL/S2 企业维持 pending/unknown/partial。 session-pin round-5 微门（2026-10-17，grok-s2-sdk-session-pin-round-5.md）：六门 approve——R-Q9c oracle 语义（无效 generation=unknown 拒绝/同 birth 漂移=unknown/真实 birth 不同才 reuse；协调者复现重跑 exit0 到新 log 不覆盖旧 fail）、R-Q9a' dispose unconfirmed、R-Q9a'' observeBirth 冻结前正向核验、R-Q9b' kill spy 实测每字段零 kill、C 接缝同模块、R-Q9d' classifyInspectGone 整句白名单+driver 可读身份；1 处 required：track 预登记仍 no-op 占位，成功路径清理靠测试手动 dispose 绕过登记 callback（须真实闭包重绑+只调登记 callback 断言）。执行偏差如实记录：作者越微门边界跑真 Docker/daemon；引用更正（docker-ledger.log/session-pin-regression.log 为失败迭代，绿在 -5/-re；regression 文件级 unconfirmed 为新 fail-closed 诚实触发）；round-4 措辞纠偏（协调者确认范围不含 driver 全字段）。本审微门独立实测：ps-observer 24/24、daemon-resource-fault 11/11、patch-install 14/14、build-negative 4/4、typecheck 0、oracle 复跑 exit0；未跑真 Docker/daemon/全量（下一验证包口径）。G1 30s 窗口/G3/lost 维持 unknown/blocked；s2-protected-paths/S2/企业 partial。 session-pin round-6 微门（2026-10-17，grok-s2-sdk-session-pin-round-6.md）：R-Q9a 登记真实处置关门，approve——track 登记 callback 为真实闭包（未就绪=close+unconfirmed 失败/closedOnce 幂等；就绪重绑实例 dispose）、session-pin 删除全部手动 dispose 绕过（登记 callback 唯一清理通道）、fault 三门（只调登记 callback=close 恰1+gone+幂等；snapshot reject 保留原异常+cleanupError；observe 失败=close+unknown）；协调者双脚本原样重跑双 exit 0（registered-cleanup closeCalls=1；unknown-generation unknown 拒绝），旧 fail raw 保留；本轮零越界（无真 Docker/daemon/session-pin/全量/SDK vitest）。文档更正 2 处：§11.5 build.mjs 哈希表陈旧值（实测 40753000 撤回生效）；§11.4 Docker 行引用不存在日志且本轮按派单未跑应删/标 N/A。全仓 serial/default 双绿与真 Docker/daemon ledger 复验留下一验证包；G1 30s 窗口/无响应 CANCEL/G3 lost 维持 unknown/blocked；s2-protected-paths/S2/企业 partial。 session-pin round-6 终版（2026-10-17，grok-s2-sdk-session-pin-round-6.md）：normal 登记处置已证（真实闭包+删 6 处手动绕过+门1 只调登记 callback=close 恰1+gone+幂等；协调者独立复跑同证）；builder 误改撤回独立核验（40753000/0b87934f 恢复）。request_changes（R-Q9a finalizer 状态机 2 个 actual fail，协调者纯 fake 复现 exit1/102ms 本审亲读）：①重复 unconfirmed callback 因 closedOnce 早退伪成功（须缓存同一失败恒失败）；②snapshot pending 期间 close 已启动后迟到 snapshot 仍发布 ready 资源（须 close-started 拒绝 ready）。修法：三态 finalizer（pending-finalizer/ready-dispose/settled）+结果缓存不变形，测试断言 actual callback。文档更正 2 处：§11.5 build.mjs 哈希陈旧值；§11.4 Docker 行引用不存在日志（本轮按派单未跑真 Docker 应标 N/A）。本轮零越界；全仓 serial/default 双绿与真 Docker/daemon ledger 复验留下一验证包；G1 30s 窗口/无响应 CANCEL/G3 lost 维持 unknown/blocked；s2-protected-paths/S2/企业 partial。 session-pin round-7 微门（2026-10-17，grok-s2-sdk-session-pin-round-7.md）：R-Q9a-①② finalizer 状态机修复 approve——三态 settled sticky 缓存（重复 unconfirmed 恒 reject 不伪成功/close 不重复）、迟到 snapshot 在 observe 前检查 settled→ledger unknown+throw 拒绝发布 ready、无 no-op 占位、测试断言 actual callback；协调者三脚本原样重跑到新 log 全 exit 0（finalizer-state 2/2、registered-cleanup close1、unknown-generation unknown 拒绝），旧 fail raw（r10/r12）保留；我方独立 daemon-resource-fault 14/14（含 sticky/迟到 snapshot 新断言）、ps-observer 24/24、patch-install 14/14、typecheck 0。required（引用更正）：§12.2 fault 行误引失败迭代 daemon-resource-fault.log（12/14），终态绿跑为 daemon-fault-2.log（14/14）须改引。本轮双方均未跑真 Docker/daemon/session-pin/全量/SDK vitest/builder（按派单）；全仓 serial/default 双绿与真 Docker/daemon ledger 复验留下一验证包；G1 30s 窗口/无响应 CANCEL/G3 lost 维持 unknown/blocked；s2-protected-paths/S2/企业 partial。 session-pin round-7 微门（2026-10-17，grok-s2-sdk-session-pin-round-7.md）：R-Q9a-①② finalizer 状态机修复 approve——三态 settled sticky 缓存（重复 unconfirmed 恒 reject/close 不重复）、迟到 snapshot 在 observe 前检查 settled→unknown+throw 拒绝发布 ready、无 no-op 占位、actual callback 断言；协调者独立复测三脚本 4/4 exit0/216ms 同证；我方独立 daemon-resource-fault 14/14（含 sticky/迟到 snapshot 新断言）、ps-observer 24/24、patch-install 14/14、typecheck 0、三 coor 脚本新 log 全 exit0，旧 fail raw 保留。required（作者文档两处事实纠正+引用更正）：§12 谎称 §11.4/§11.5 已更正——实证 §11.5 仍 38eeeaac 陈旧值、§11.4 仍引不存在 docker-ledger.log 标 1/1，须实际改文本；§12.2 fault 行误引失败迭代（12/14），终态为 daemon-fault-2.log 14/14 须改引；作者本轮跑 builder 4/4 超微门清单（builder tests 明禁）记执行边界偏差。产品/build.mjs/manifest SHA 双方核验不变，产品 SDK 不重开。本轮双方均未跑真 Docker/daemon/session-pin/全量/SDK vitest；全仓 serial/default 双绿与真 Docker/daemon ledger 复验留下一验证包；G1 30s 窗口/无响应 CANCEL/G3 lost 维持 unknown/blocked；s2-protected-paths/S2/企业 partial。 session-pin round-8 首次真实验证（2026-10-17，grok-s2-sdk-session-pin-round-8.md）：有限 approve「G1-knownlost 客户端补丁+当前 fixture/resource 证据」——冻结哈希 IDENTICAL（产品/SDK dist/tests/builder/manifest）、报告三处事实更正实改核验通过（§11.4 误引撤销/§11.5 40753000/§12.2 终态引用）、双跑全绿：serial 544/544（238.4s/237.9s）+ bounded 544/544（129.2s×2）+ session-pin 真 daemon 5×7（ledger 150 行全生命周期）+ Docker owned ledger（nonce 资源名/全 64hex CID/精确 NoSuchObject gone/driver PID+birth+driver-gone）+ 纯门/负控/coor 三脚本/typecheck 全绿（Pi 与 grok 双跑并列）。状态观察：pi-mono 工作树 SDK 补丁缺失（snapshot/pin grep=0，stash@{0} 疑存），SDK vitest 对源受阻 raw 保留；已安装 dist 补丁完好（哈希复核），产品面不受影响；SDK 补丁 provenance 现存 vendor patch+installed dist，恢复工作树需授权。不预支：全部 3s/G3/S2/企业；30s 未察觉/无响应 CANCEL/remote lost 死亡/整仓历史资源/Pod 维持 pending/unknown/partial。 session-pin round-8 补充（协调者 08:45/08:48 清单落实）：R-Q9e token 泄漏阻塞——Docker driver 身份观测捕获完整命令行（含 --token 值）落入持久化 ledger，脱敏扫描实证 r15 1 行+r9 9 行共 10 行；真实资源证据通道修前阻塞（driverProbe 只记 pid/ppid/pgid/birth+marker 布尔，不得记录含 token 命令行；既有行由协调者/用户决定脱敏或作废重采）。计数：544 为 runner 实测实数（双方双跑一致），Pi 的 506+19+14+3+2 分解基线归属混乱须按文件准确分解（静态顶层 431+嵌套=544）。SDK 源工作树补丁缺失（stash@{0} 疑存）→ SDK vitest 对源受阻 raw 保留；installed dist 补丁完好产品面不受影响；恢复工作树需授权。有限 approve 范围不变（G1-knownlost 客户端补丁+当前 fixture/resource 证据）；3s/G3/S2/企业/30s/CANCEL/lost/历史资源/Pod 维持 pending/unknown/partial。 session-pin round-9（2026-10-17，grok-s2-sdk-session-pin-round-9.md）：ledger 安全白名单微门 request_changes（R-Q9f～R-Q9k）——协调者 canary 负控本审原样重跑 0/2 fail exit1/107ms/PGID85623 复现：producer appendLedgerEvent 只挑顶层键、driver/outcome 值原样透传；docker-owned-ledger.test.ts:84 driver-probed 事件仍透传 raw driver（identity.command 含 --token，R8 泄漏的确切事件未修，§14.1 投影声明与代码不符）；作者 canary 门①测试内先投影/门②fixedCategory 测试本地计算＝替身覆盖缺口；新文件 write 后 chmod 0600 存创建窗口；waitOwnerGone unknown outcome=id.detail（ps stdout/stderr 切片+error.message）与 docker-owned:127/session-pin:126 raw 诊断绕出。归属验证未削弱认可（in-memory marker 比对/mismatches 去片段/单 producer 双通道/kept-existing 如实）。执行边界：Pi 派单窗口内 09:15:27Z 一次真实 session-pin 单轮 30 行追加 r9-session-pin（766→796，§14.4「未跑」矛盾，归属指向作者终端待裁决，新增行无 token 旧行字节未动）；§14.4 fresh 表引 R6-era coor 旧 log（mtime 07:58Z），builder 疑点核销（本轮无 fresh builder4）。本审独立实测（/tmp/perimeter-r16-grok/，批准 runner）：canary 0/2、ledger-privacy 5/5、ps-observer 24/24、fault 14/14、三 coor oracle 4/4 exit0（新 log 不借旧绿）、typecheck 0。R8 勘误：CID 尾误（raw 全 ID c63eb25fb909a85eda6930d542b247e3e65af836ce485570e10695956ad80fd5）；「525 非实测」误写（R10 轮 525×2 双绿真实已证不可抹，正确分解 544=506+24+14）；token 总量实为 15 行（r15 1+r9 9+r11 5，R8 漏扫 r11）。真实资源证据通道维持阻塞（R-Q9f/g 修复且 canary 转绿前）；session-pin 真 daemon/Docker ledger 真实回归、隔离 owned 基线+vendor.patch 证明留协调者另派；30s/CANCEL/remote lost/整仓历史 unknown/Pod 维持 pending/unknown/blocked；3s/G3/S2/企业不预支。 session-pin round-10（2026-10-17，grok-s2-sdk-session-pin-round-10.md）：R10 ledger 生产路径修复验证门 request_changes——六项 required（R-Q9f～k）全部落地独立复证：coor canary 原样 0/2 fail→2/2 绿 exit0/PGID27926（验收达成，旧 fail log 留存）、privacy 9/9（原5+raw4）、ps-observer 24/24、fault 14/14、三 oracle 原样 exit0、typecheck 0；§13.2 原位 544=506+24+14 与 §14.6 七文件 hash 逐值实测全符；产品/build/manifest/vendor+安装 dist 零改动复核 ✓；R9 窗口 7daemon/30行归属采信（作者自认+nonce PID 前缀/时间线/默认路径全吻合，796 行 0 token，非绝对证明如实记录）。新 required：R-Q10a waitOwnerGone:114（及 daemon-resource:62 同类）throw 仍嵌 id.detail（ps stdout 切片=命令行）经 test reporter 落盘=持久通道，coordinator 第4诊断 oracle（r17/coordinator-unknown-diagnostic.test.mjs，10:19:36Z 送达晚于作者 final 批次 10:13:18Z）对终态代码 exit1 在盘实证、§15.3 未报告；R-Q10b OUTCOME_ALLOWED 缺 7 个生产固定类别（gone-pid-reused（birth 不同）/identity drift/generation 无效存活/inspect-gone: live/driver-gone-pid-reused/gone/zombie）落盘被静默改写 unknown——持久层归属标签收窄+「全集」声称不实，测试断言在 producer 前 spy 层不覆盖；附注 sanitizeDriverValue 丢 {unknown:…} 固定串。本审实测 /tmp/perimeter-r18-grok/（bounded runner 预 deadline，PGID/耗时/exit 全录），5 ledger 字节前后一致、冻结 4 脚本 SHA 前后一致、pi-mono HEAD 8efd314fa/stash 原样。真实通道复验维持阻塞至 R-Q10a 修复+第4 oracle 转绿；3s/G3/S2/企业不预支。 round-10 补充（协调者 10:21Z 清单落实）：第4诊断 oracle 本审原样复现 0/1 fail exit1/PGID37245/101ms（脚本 SHA 4cd7a77659e41c24 未改，新 log r18-grok，与在盘 raw 一致）——R-Q9j 未闭实证；R-Q10a 扩充 failures/聚合 throw 同类通道（docker-owned :55/:101-104/:116/:130 String(e)/stderr 原文→reporter 落盘，修法固定类别文本、失败语义保留）；R-Q10c driver-probed 持久层丢 pid（修 {pid,...safe}，producer raw门②已证兼容）+ driver 未知 else 分支分类=测试内部证据完备性问题（非 SDK 状态机、非容器生命周期削弱），修法 failures.push 从严或聚合注释收窄二选一。 session-pin round-11（2026-10-17，grok-s2-sdk-session-pin-round-11.md）：R11 第4诊断 oracle 修复验证门 approve（微门，仅限本修复包）——R-Q10a/b/c+runAllCleanups 聚合通道全项独立复证：两 throw（ps-observer:116 waitOwnerGone/daemon-resource:63 observeBirth）固定类别+pid 无 id.detail；docker failures 六处+聚合只携固定类别+计数（String(e)/stderr/cause/stack 全零命中）；runAllCleanups 全 callback 执行+恒 reject+计数保真、错误对象不留存（ps-observer.test 聚合断言原位更新同语义未删，24 测数不变）；OUTCOME_ALLOWED 实测 38 项含 7 串精确补全，本审对 5 写入方全生产 outcome 串枚举对账零静默 unknown；privacy 15/15（原 9+新 6：真实 appendLedgerEvent 序列化往返 7/7 保真+枚举外 canary 仍 unknown+driver {unknown:…} 保固定串）；driver-probed {pid,...安全投影} 恢复+producer 深 pid 双保险；driver 不可观测从严 failures.push（本派指定支），容器 CID-gone 证据链独立，SDK 状态机/归属 kill 未触（session-pin/fault hash 与 R9 时点相同）。§15.1 三处声明原位更正+§15.3 后到红补录（时点公平：oracle 10:19/10:21Z 晚于作者 10:13:18Z final，非隐瞒）；§16.5 七 hash 本审 7/7 复算相符，产品 5 文件零改动复核 ✓。本审实测 /tmp/perimeter-r19-grok/（bounded 15/45s 预死线，绝对 argv/PGID/counts/exit/wall 全录）：第4诊断 oracle 原样 1/1 绿 exit0/PGID89458（0/1 fail→转绿，R-Q9j 闭环）、canary 2/2、三 oracle exit0、privacy 15/15、ps-observer 24/24、fault 14/14、typecheck 0（2852ms）；冻结 5 脚本 SHA 前后一致；5 旧 ledger 字节/权限前后逐一致（3 docker 600、2 session-pin 644 历史时点保留，未脱敏未重采）；旧红 3 份（r17 coor/r18-grok/r19 RED-before-fix）原样留存。本审执行偏差如实记录：首轮 runner argv 顺序错（.mjs 当命令 EACCES）5 log 留存本审目录，改正后全绿，与作者代码无关。真实通道复验前置条件已满足（R-Q10a/b/c 闭+第4 oracle 绿），执行由协调者另派；3s/CANCEL/G3/整仓历史资源 unknown/S2 企业 partial、SDK 5 未跑+当前源 5 fail、544×2 历史均保留不变。 session-pin round-14 执行前安全门（2026-10-18，grok-s2-sdk-session-pin-round-14.md）：R14 准备包静审 request_changes 共 9 required（R-Q14-1..9）：Docker 整轮 90s vs 派单 30s+backend 内部 CLI 预算口径（openEnvironment:47 30s/cleanup 5s）、withDeadline race/unref 须取消+join（协调者 purefake oracle 双红，本审独立复跑 0/2 exit1 PGID34882）、readReady Atomics.wait 同步阻塞事件循环（ready 结构性不可达）、B4 新代触发重连前预登记、B5 fixture 子进程 ready 后立即登记补杀+longP/sentinelP 全路径 join、lost oracle 补内存布尔 connection-lost 匹配、Docker fullCid 64hex 校验+driver 正向出生核验、全路径 settled+unhandled 补 failure JSON、preflight 镜像证据白名单 Id。其余执行许可条件全部满足：7 交付 SHA 复验、repro 与 R13 冻结根 cmp 逐字节同、helpers/vendor/patch/builder/安装 dist/daemon 二进制/runner 哈希全符冻结台账、cdaf blob 只读可解析、import 面仅 pi-durable/env 最窄 symlink+owned 字节副本、五行为 oracle 与原 SDK test 一一对应加强、B5 owned fixture ready→ps 正向身份→abort→waitOwnerGone 独立证 PID gone、0600 白名单 ledger/固定类别/token 零落盘、Docker 单一已知镜像/network none/全 CID/exact no-such-object/driver 从严、preflight 只读 blocked 客观。审者零真实执行；R11/R13 门不重开；G1 3s/G3/S2 企业/原 SDK 5 未跑 均维持不预支。审者 root /tmp/grok-s2-r14-review-ywuOYhI1/。 修复限 owned 副本；修后本审对受影响函数定向复审，通过后另派真实执行。审者 root /tmp/grok-s2-r14-review-ywuOYhI1/。 session-pin round-15（2026-10-18，grok-s2-sdk-session-pin-round-15.md）：Pi R14 修复包定向复审 request_changes——R-Q14-1/2/3/4/6/7/8/9+O-1/O-5 实证闭合（本审自有 oracle 副本对修复版 2/2 绿 PGID74831 对照 R14 红 0/2、isKnownLost/isFullCid purefake 2/2、Pi 三 purefake 5/2/3 互证、预算分层/O-5 桥接/preflight Id 64hex 字节级核验均符）；R14 报告一处表述更正在案（coor oracle 复跑曾重写其 root 内 source-provenance.json，无写前 SHA 不能称字节未变；本审已改自有 root 副本口径）。新 required R-Q15-1..4：B5 fixture TTL 8s 自然到期可冒充 abort-kill 绿（修 30000/5000ms+abort 时 sentinel alive 正证）、closeOnce 未取得正向归属即按名 rm+闩锁不可重试、driverProbe 时序在 Connection 前必 unknown+owned connection 未登记 close、deliverables 清单 audit-notes 行未重盖+plan §2 措辞残留。修后同口径复核通过即窄批准另派真实执行；静态绿不预支行为绿。审者 root /tmp/grok-s2-r15-review-b2hica2o/。 session-pin round-16（2026-10-18，grok-s2-sdk-session-pin-round-16.md）：Pi R15 修复包（R-Q15-1..4）定向复审 request_changes——R-Q15-1..4 全项闭合（B5 TTL 30000>case15s+abort 前 alive 正证+exec 必须 aborted+单调窗核验+补杀不算；closeOnce 只读恢复+重验同代+显式 rm -f full64CID 恒非名字+闩锁成功才置位可重试+backend.cleanup 按名路径全移除；driver 发现移 snapshot 后+直接子范围零全局扫描+owned Connection 创建即登记 close；manifest 11 行全量重算+plan §2 如有）；R15 硬门 SDK 90s/case 15s/runCase 预挂顺序（timer 先于 caseFn+单调复核）/子 CLI min(5s,剩余) 成立。新 required R-Q16-1..6（协调者三反例本审自有 root 独立复跑 0/3 全红+静态证实）：①armBodyDeadline 局部相对 18s 挂于 preflight 后（最坏 15+18=33s 推穿 29s 停止窗与 30s runner，ensureOpen 仅看 fired）→须自 t0 绝对起算总预算；②owned close 异常被 main 局部 failures 的 ReferenceError 掩盖（模块级 openOwnedConnection 引用不可见名）→记录器注入；③alive 正证与 abort 间 await sleep(120) 间隙使 sentinel（TTL5s）可自然早死仍假绿+单调窗用 wall Date.now 且锚 ready 而非 exec 起点→零 await+performance.now+exec 锚；④cleanups 次序使容器 rm 先于 transport close（违反 plan §4 意图，vendor close 有真实 teardown 可用）→先 close 并 join 再 rm；⑤realPsRunner 每次 ps 固定 3s 不受剩余停止窗限→预算化或如实预留；⑥隐私口径纠正（协调者 msg_eafaa849ef03，本审 §0 采纳：R13 raw 例外仅限 accepted repro，R15 §3.6 援引过宽）：child-N-out/err.log、raw-context/body-raw-context/unhandled raw stack 为未批 raw 通道，真实执行前收敛为固定类别+安全投影（children EVENTS argv 投影 ledger 沿用 R11 口径不变）。审者复验：manifest 11/11、node --check 3/3、冻结 root SHA+mtime 未触、coor 原件零执行；R15 反例适配重跑 4/4（安全断言不弱化）、独立 purefake 15/15、R16 三反例副本 0/3 红。作者 17/17 不替代独审。边界维持：原 SDK 5 未跑/current5fail/544×2/历史红保留、artifact 8/8≠behavior 5/5、G1 3s/G3/S2 企业 partial 不升级、R11/R13 不重开不撤旧报告、既有已写 raw 保留历史。修后同口径复核通过才窄批准执行前准备，真实执行另派，审者不运行。审者 root /tmp/grok-s2-r16-review-zr/。 session-pin round-17（2026-10-18，grok-s2-sdk-session-pin-round-17.md）：Pi R16 修复包（R-Q16-1..6+join/整轮硬门）定向复审 request_changes——R-Q16 主体闭合（绝对 t0 预挂/B5 sleep 前移零 await abort+performance.now exec 锚/close 记录器注入+重抛/unshift 先 close 后 rm/ps 预算化 observer/R-Q16-6 固定类别收敛；协调者 R16 三反例与 join 反例适配版 @r5 3/3+1/1 绿、@r4 0/3+0/1 红，本审独立 4/4+9/9+joinfb 实证；manifest 12/12、repro 逐字节零跑、root 0700 非 symlink、冻结 root/coor 原件零执行、node --check 8/8）。新 required R-Q17-1..3：①withDeadline 在 case promise 拒绝即清 timer 且 runCase close 仅单次尝试——close 抛错+producer 不结算=悬挂至 runner kill（kill 非终止证明）、自然结算=自然终止冒充及时（joinfb 实证 60ms/15ms、closedAttempts=1）→ deadline 须覆盖至 join 完成+onDeadline 重试 close；②SDK 无整轮主动截止，WHOLE_STOP 88s 未计 straddle（80s case 最坏+单次 wait≤5s+内部 ps≤3s 可达 ~96s>runner 90s）→ 下调 ≤82s 或最小整轮主动截止；trackDaemon deadlineMs 固定 5s；sdk5 budgetedPsRunner 实际无 caseStopAt 限与交付报告所称不符→修代码或改报告；耗尽后 1ms spawn 须明示仅限 cleanup 段；③probe:208 注释『早于 OWN_PGID_PROBE』不实（IIFE :187 先于 arm :210，实质无影响）→修注释；finally 次序 close→rm→driver-wait 与协调者既定次序偏差——安全分析无假绿/无无归属杀（rm 正向归属、driver 死亡正向证明、unknown 不当 gone），记偏差由 Pi 最小调整或如实标注。过程公平记录：R16 approve 草判经跟进更正 request_changes 最终交付正确；R16 同名 tee 覆盖致早期红原始 log 仅存 transcript、shell PGID 81485 非独占；54m57s 挂起 node 终止状态 unknown（协调者自纠 ESC 先行干预依据不足、作者 unknown 未解继续叠 fake 均如实并列，不回改旧报告/旧 raw）；隐私按 msg_1db150bc1c3f 最终口径：既准 R11/R13/R15 私有 owned raw 例外保留、不新增禁令、preflight unhandled raw 保留属例外且交付报告已如实限定。边界维持：原 SDK5 未跑/current5fail/544×2/旧红/七 mockPod unknown 保留、artifact 8/8≠behavior 5/5、G1 3s/G3/S2 企业 partial 不升级、R11/R13 不重开。修后同口径复核通过才窄批准执行前准备，真实执行另派，审者零资源。审者 root /tmp/grok-s2-r17-review-AzdWjrVh/。"
+    },
+    {
+      "itemId": "s2-four-eyes",
+      "stage": "S2",
+      "status": "implemented",
+      "source": "docs/handoff.md §5.2 工具安全（四眼审批）；§7 S2",
+      "requirement": "执行/审批/分享拆权限；高风险请求者不能自批，自动化无权自批；审批绑定完整意图与上下文，参数/HEAD/policy/成员变化即失效",
+      "paths": [
+        "src/runtime/approvals.ts:8307708ff8222371",
+        "src/runtime/perimeter-extension.ts:0d5a245f44677c60",
+        "src/gateway/session.ts:1d5b1f17745b630d",
+        "tests/four-eyes.test.ts:5c77043eaf81bcd4"
+      ],
+      "acceptance": "沿真实 Gateway/Harness+工具管道独立正反控：自批/跨凭证/无权 B 拒，合法独立 B 才执行；args/HEAD/policy/ACL/expiry/撤权任一变化使旧批准失效；prod 缺可靠 context 拒高风险",
+      "dependsOn": [
+        "s1-jwt-verify",
+        "s2-no-local-backend"
+      ],
+      "evidence": "第二十三轮（第四审）：runtime gate 以真实证据关闭——两次全新 OS 进程无 preflight 三场景全过（ng fail-closed policy.denied 零 pending 零落盘；git 真 HEAD + 独立 B allow 落盘；ctx 上下文丢失 decide+verify 双拒），Pi 原始日志交叉核验一致（all-run1 preflight:null exit 0 3066ms；fault-inject 真实 exit 4 1123ms cleanupConfirmed:false pendingReconcile 0e8233d5ed7e），r20 439×2 为历史证据、四眼 12/12 直跑。遗留最小项（探针可观测性）：故障运行 stdout JSON exitCode:0 与真实 exit 4 不一致（终态折算晚于落盘/打印）、naturalExit 预写——须先定终态再落盘/打印；修复前 exit 判据以 bounded runner 真实 exitCode 为准。 第二十三轮：探针终态摘要契约修复复验——finalexit 先算后 manifest/stdout/process.exitCode 三处同值，cleanup 失败三面同 4、usage/policy/crash 不继承旧 0、naturalExit 除名改 plannedExit（真实退出由外层 bounded runner 记录）；产品/测试哈希未变，r20 439×2 保持历史。 历史条目撤回说明：原 s2-four-eyes（missing，R1）记录的缺口（context 缺失回退全零/漂移检查跳过/args 变更负测未补/审计故障闭环未证）已由 R2 修复并经第十九、二十一、二十三轮独立复验闭合，该 missing 条目按去重撤回，断言以本条为准。"
+    },
+    {
+      "itemId": "s2-real-egress",
+      "stage": "S2",
+      "status": "external_blocked",
+      "source": "docs/handoff.md §5.2 可验证出口；§7 S2",
+      "requirement": "真实集群默认拒绝，覆盖跨 namespace、IPv6、metadata IP 与 DNS 隧道",
+      "paths": [
+        "deploy/networkpolicy.yaml",
+        "src/deploy/netpol.ts",
+        "src/gateway/execution-backend.ts:344-345"
+      ],
+      "acceptance": "集群内负面探测失败才算通过；生成 YAML 不算",
+      "dependsOn": [
+        "s2-container-hardening"
+      ],
+      "evidence": "第十五轮：本地机制层已落地——生产 docker 后端 listen 时强制 network inspect Internal=true 并绑定网络 Id（fake CLI TOCTOU 实证），network=none 亦可验证阻断。真实集群 CNI 出口（跨 namespace、IPv6、metadata IP、DNS 隧道）与客户批准仍 external；kubectl 仍无 current-context。禁止把静态 NetworkPolicy 标成已验证。"
+    },
+    {
+      "itemId": "s2-protected-paths",
+      "stage": "S2",
+      "status": "partial",
+      "source": "docs/handoff.md §5.2 保护路径/敏感读",
+      "requirement": "bash、python、符号链接和 hardlink 不能改保护路径或读取未授权 secret",
+      "paths": [
+        "config/policy.yaml",
+        "src/policy/engine.ts",
+        "README.md"
+      ],
+      "acceptance": "真实执行环境中的绕过失败；不能只让策略函数断言通过",
+      "dependsOn": [
+        "s2-container-hardening"
+      ],
+      "evidence": "README 写明 deny_paths 对 bash 不成立，只读工具豁免路径。本轮没有真实沙箱红队。"
+    },
+    {
+      "itemId": "s2-repo-scoped-token",
+      "stage": "S2",
+      "status": "partial",
+      "source": "docs/handoff.md §5.2 SCM 最小权能",
+      "requirement": "凭据代理按租户、session、repo、ref 与 read/write 发短期 token，并可吊销",
+      "paths": [
+        "src/gitproxy/server.ts:5-31"
+      ],
+      "acceptance": "沙箱 token 不能访问未授权 repo；push 与 fetch 分离；日志无上游 secret",
+      "dependsOn": [
+        "s1-resource-authz"
+      ],
+      "evidence": "代理有仓库名 allowlist，push 默认关闭，使用共享会话 token。不是按 repo/ref 签发的短期上游凭证。"
+    },
+    {
+      "itemId": "s2-dlp",
+      "stage": "S2",
+      "status": "partial",
+      "source": "docs/handoff.md §5.2 出站 DLP",
+      "requirement": "上游请求发出前完成检测并可阻断高置信 secret",
+      "paths": [
+        "src/modelgw/server.ts:177-188",
+        "src/modelgw/secrets.ts"
+      ],
+      "acceptance": "高置信 secret 不到上游；误报与漏报有对照集",
+      "dependsOn": [
+        "s4-body-deadline-drain"
+      ],
+      "evidence": "scanSecrets 只写审计，注释写明不改写请求体。没有阻断开关测试。"
+    },
+    {
+      "itemId": "s2-redirect-check",
+      "stage": "S2",
+      "status": "partial",
+      "source": "docs/handoff.md §5.2 禁止或逐跳验证 HTTP redirect",
+      "requirement": "模型与 JWKS 出站不跟随未验证重定向",
+      "paths": [
+        "src/gateway/auth.ts:133",
+        "src/modelgw/server.ts:224"
+      ],
+      "acceptance": "JWKS 与模型 upstream 的 30x 都不自动跟随到未批准主机",
+      "dependsOn": [
+        "s2-dlp"
+      ],
+      "evidence": "RemoteJwks fetch 使用 redirect error。模型网关 fetch 没有设置 redirect。"
+    },
+    {
+      "itemId": "s3-create-receipt",
+      "stage": "S3",
+      "status": "missing",
+      "source": "docs/handoff.md §3.1；§7 S3",
+      "requirement": "显式创建与持久 receipt：同身份同键同内容复用，同键异内容拒绝",
+      "paths": [
+        "src/gateway/server.ts:357-398"
+      ],
+      "acceptance": "并发重复创建只有一个会话和一个结果；目录存在不能当成 prompt 已接受",
+      "dependsOn": [
+        "s1-resource-authz"
+      ],
+      "evidence": "创建仍由 WS attach 隐式发生。仓库内没有 operationId/receipt 类型或存储。handoff 中 S3 依赖 S1，不依赖 S2 真实集群已经通过。"
+    },
+    {
+      "itemId": "s3-exclusive-lock-ready",
+      "stage": "S3",
+      "status": "missing",
+      "source": "docs/handoff.md §3.3；§7 S3",
+      "requirement": "stateRoot 独占锁、readiness、SIGTERM 时拒新任务并限时 drain",
+      "paths": [
+        "src/gateway/server.ts:102-185"
+      ],
+      "acceptance": "第二实例启动失败；锁不因心跳过期被抢走；liveness 不依赖模型厂商",
+      "dependsOn": [
+        "s3-create-receipt"
+      ],
+      "evidence": "没有锁文件或 readiness 端点。关闭路径仍是既有会话回收，不是企业 drain 契约。"
+    },
+    {
+      "itemId": "s3-crash-side-effects",
+      "stage": "S3",
+      "status": "partial",
+      "source": "docs/handoff.md §3.1 unsafe 不重放；§7 S3",
+      "requirement": "重启、kill、未知副作用可见且不自动重放；恢复保留未提交改动",
+      "paths": [
+        "tests/crash-recovery.test.ts",
+        "src/runtime/harness-host.ts"
+      ],
+      "acceptance": "磁盘满、两实例、断网和 unknown 副作用都有负面测试",
+      "dependsOn": [
+        "s3-exclusive-lock-ready"
+      ],
+      "evidence": "既有 crash-recovery 测试包含在第六轮两次串行的 377 pass 里（排除挂死的 docker-backend 文件）。没有磁盘满、收据冲突和备份恢复测试。PVC 未实现。"
+    },
+    {
+      "itemId": "s3-backup-restore",
+      "stage": "S3",
+      "status": "external_blocked",
+      "source": "docs/handoff.md §3.3 备份；§9",
+      "requirement": "SQLite 与 workspace 一致备份，隔离目录演练恢复",
+      "paths": [
+        "docs/handoff.md"
+      ],
+      "acceptance": "记录恢复点、未推送变更和审批状态；RPO/RTO 有真实演练",
+      "dependsOn": [
+        "s3-crash-side-effects"
+      ],
+      "evidence": "无备份作业、无 KMS、无演练记录。禁止用本地测试绿灯代替。"
+    },
+    {
+      "itemId": "s4-body-deadline-drain",
+      "stage": "S4",
+      "status": "missing",
+      "source": "docs/handoff.md §4.1；§3.2 模型 deadline",
+      "requirement": "模型请求体上限、connect/首 token/idle/总时长 deadline、写回等待 drain、断流取消 upstream",
+      "paths": [
+        "src/modelgw/server.ts:162",
+        "src/modelgw/server.ts:224-234",
+        "src/modelgw/server.ts:330-333"
+      ],
+      "acceptance": "超限请求拒绝；超时后 upstream 与本地写回都释放",
+      "dependsOn": [
+        "s1-schema-byte-limits"
+      ],
+      "evidence": "readBody 会拼完整请求。fetch 无 AbortSignal。res.writeHead 后 pipe 没有单独的 drain 契约测试。该项依赖 S1 的字节边界，不等待 S2 真实集群。"
+    },
+    {
+      "itemId": "s4-persistent-budget",
+      "stage": "S4",
+      "status": "missing",
+      "source": "docs/handoff.md §4.3；§7 S4",
+      "requirement": "忽略客户端收费归属；原子 reserve/settle/release；重启不清零；无 usage 记 usage_unknown",
+      "paths": [
+        "src/modelgw/server.ts:96",
+        "src/modelgw/server.ts:159-175",
+        "src/modelgw/server.ts:235-247"
+      ],
+      "acceptance": "并发预留不超卖；进程重启后账本仍在；未知用量不写成 0 且不自动重试",
+      "dependsOn": [
+        "s4-body-deadline-drain",
+        "s3-create-receipt"
+      ],
+      "evidence": "#used 是内存 Map，完成后才增加。团队来自请求头。价格在 models 中为 0。"
+    },
+    {
+      "itemId": "s4-real-model",
+      "stage": "S4",
+      "status": "external_blocked",
+      "source": "docs/handoff.md §7 S4 真实获批通道；§0",
+      "requirement": "客户批准的模型通道、区域、零留存与 DPA 有证据",
+      "paths": [
+        "src/runtime/models.ts",
+        "src/modelgw/server.ts"
+      ],
+      "acceptance": "获批通道的账单与 usage 可对账；未批准公网模型不能作为 fallback",
+      "dependsOn": [
+        "s4-persistent-budget"
+      ],
+      "evidence": "本轮模型只使用 tests/fixtures/mock-model.mjs。没有供应商协议或账单。"
+    },
+    {
+      "itemId": "s5-history-pagination",
+      "stage": "S5",
+      "status": "missing",
+      "source": "docs/handoff.md §3.2 初始 tail；§7 S5",
+      "requirement": "初始有界 tail，旧历史分页，慢端不能靠不断生成大快照恢复",
+      "paths": [
+        "src/gateway/session.ts:158-168",
+        "web/view-model.js"
+      ],
+      "acceptance": "快照有项数和字节上限；超限返回分页游标；重连尾页一致",
+      "dependsOn": [
+        "s3-crash-side-effects",
+        "s1-schema-byte-limits"
+      ],
+      "evidence": "snapshot 仍是当前视图全量。超过 maxFrameBytes 时 Outbox 会杀掉连接，没有分页。"
+    },
+    {
+      "itemId": "s5-reconnect-backoff",
+      "stage": "S5",
+      "status": "implemented",
+      "source": "docs/handoff.md §3.2 重连退避",
+      "requirement": "重连指数退避加 jitter，成功后归零；吊销关闭码不重连",
+      "paths": [
+        "web/app.js:89-94"
+      ],
+      "acceptance": "4001 与 4003 停止；普通断线间隔增长且带 jitter",
+      "dependsOn": [
+        "s1-web-cli-client"
+      ],
+      "evidence": "第五轮 Chrome：握手连续失败的间隔为 1372ms 然后 1555ms。revokePrincipal 后 3.5s 没有新升级。页面收到关闭码 4003 后 4s 没有新升级。4001 与 4003 在 web/app.js 同一个 return。分页仍见 s5-history-pagination。"
+    },
+    {
+      "itemId": "s5-token-benchmark",
+      "stage": "S5",
+      "status": "missing",
+      "source": "docs/handoff.md §4.4；§7 S5",
+      "requirement": "冷缓存、热缓存、重启恢复三组基准，并满足拟定的成本与完成率门槛",
+      "paths": [
+        "src/runtime/harness-host.ts",
+        "src/evals/runner.ts"
+      ],
+      "acceptance": "每组不少于建议样本量；成本下降不得伴随超过门槛的完成率或延迟回退；无实测则写未达成",
+      "dependsOn": [
+        "s4-real-model",
+        "s4-persistent-budget"
+      ],
+      "evidence": "压缩阈值 32768 与缓存字段透传是既有代码。测量骨架和固定任务集仍是本地 missing。真实模型上的成本数字才是 external_blocked。本轮没有跑该基准。"
+    },
+    {
+      "itemId": "s5-permission-source",
+      "stage": "S5",
+      "status": "implemented",
+      "source": "docs/handoff.md §7 S5 不改权限事实来源",
+      "requirement": "共享 reducer 只做展示，授权仍在服务端",
+      "paths": [
+        "web/view-model.js",
+        "src/gateway/server.ts:697-705"
+      ],
+      "acceptance": "前端角色只影响按钮；服务端仍拒绝 viewer 命令",
+      "dependsOn": [
+        "s1-resource-authz"
+      ],
+      "evidence": "命令角色检查在网关。reducer 测试包含在第六轮套件的通过项里。审批二次鉴权见 s1-inflight-recheck。"
+    },
+    {
+      "itemId": "s6-p0-checklist",
+      "stage": "S6",
+      "status": "missing",
+      "source": "docs/handoff.md §5.2；§7 S6",
+      "requirement": "P0 安全检查单全部完成才可公司试用",
+      "paths": [
+        "docs/handoff.md"
+      ],
+      "acceptance": "检查单每一项有证据路径；例外有客户安全负责人、范围和到期日",
+      "dependsOn": [
+        "s1-pkce",
+        "s2-four-eyes",
+        "s2-real-egress",
+        "s4-persistent-budget",
+        "s3-backup-restore"
+      ],
+      "evidence": "检查单在规格中仍是未勾选状态。S1 只覆盖其中身份与入口的一部分。"
+    },
+    {
+      "itemId": "s6-soak",
+      "stage": "S6",
+      "status": "external_blocked",
+      "source": "docs/handoff.md §8 建议 SLO",
+      "requirement": "24h soak 无未处理 rejection 和资源持续增长",
+      "paths": [],
+      "acceptance": "约定并发下有 24 小时记录",
+      "dependsOn": [
+        "s6-p0-checklist"
+      ],
+      "evidence": "本轮最长命令约 14 秒的测试套件。没有 soak。"
+    },
+    {
+      "itemId": "s6-customer-approval",
+      "stage": "S6",
+      "status": "external_blocked",
+      "source": "docs/handoff.md §0；§7 S6",
+      "requirement": "客户安全负责人具名批准后才开放公司试用",
+      "paths": [],
+      "acceptance": "批准记录含范围、例外和到期日",
+      "dependsOn": [
+        "s6-p0-checklist"
+      ],
+      "evidence": "仓库中没有该批准。"
+    },
+    {
+      "itemId": "s6-worm-kms-dpa",
+      "stage": "S6",
+      "status": "external_blocked",
+      "source": "docs/handoff.md §5.2 审计与密钥、数据与供应链",
+      "requirement": "审计链外部锚定或 WORM、密钥走 KMS、模型处理有 DPA",
+      "paths": [
+        "src/audit/log.ts"
+      ],
+      "acceptance": "截尾可检测；密钥不在仓库；DPA、区域和零留存有文件",
+      "dependsOn": [
+        "s6-customer-approval"
+      ],
+      "evidence": "本地哈希链仍是既有实现。没有 WORM、KMS 或 DPA 证据。README 已说明哈希链不能防有写权限的攻击者。"
+    },
+    {
+      "itemId": "s6-sbom-scan",
+      "stage": "S6",
+      "status": "missing",
+      "source": "docs/handoff.md §5.2 数据与供应链",
+      "requirement": "镜像 digest、SBOM、依赖与镜像漏洞扫描、发布签名",
+      "paths": [
+        "deploy/sandbox.Dockerfile"
+      ],
+      "acceptance": "发布物带 digest、SBOM 和扫描报告",
+      "dependsOn": [
+        "s2-container-hardening"
+      ],
+      "evidence": "本轮没有生成 SBOM 或扫描报告。"
+    },
+    {
+      "itemId": "s7-routing-fencing",
+      "stage": "S7",
+      "status": "missing",
+      "source": "docs/handoff.md §7 S7",
+      "requirement": "会话路由与 fencing；禁止多个网关共用一个 SQLite",
+      "paths": [
+        "src/gateway/server.ts"
+      ],
+      "acceptance": "有单节点瓶颈测量后才做；第二写入者不能启动",
+      "dependsOn": [
+        "s6-p0-checklist",
+        "s3-exclusive-lock-ready"
+      ],
+      "evidence": "无路由层。handoff 要求 S6 完成且有单节点瓶颈测量后才做。独占锁也尚未实现。"
+    },
+    {
+      "itemId": "s7-ecosystem",
+      "stage": "S7",
+      "status": "missing",
+      "source": "docs/handoff.md §6 MCP/多 SCM；§7 S7",
+      "requirement": "多 SCM、monorepo、MCP、自动化 DAG 单独威胁建模后再接入",
+      "paths": [],
+      "acceptance": "新执行面有主体、预算、审批和网络限额；不能默认放行未知工具",
+      "dependsOn": [
+        "s7-routing-fencing",
+        "s2-four-eyes"
+      ],
+      "evidence": "这些入口不存在。本轮不应实现它们。"
+    }
+  ]
+}

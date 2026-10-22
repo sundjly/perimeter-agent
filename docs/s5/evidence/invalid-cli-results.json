@@ -1,0 +1,125 @@
+{
+  "root": "/var/folders/z6/vyl58kzs68j2dsrm_np0ktkr0000gn/T/perimeter-s5d-cli-neg-OLpDOx",
+  "results": [
+    {
+      "args": [
+        "--repetitions",
+        "0"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--repetitions",
+        "NaN"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--repetitions",
+        "-1"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--repetitions",
+        "1.5"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--deadline-ms",
+        "0"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--deadline-ms",
+        "NaN"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--deadline-ms",
+        "-1"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--deadline-ms",
+        "Infinity"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--tasks",
+        ""
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--tasks",
+        "not-a-task"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--modes",
+        ""
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    },
+    {
+      "args": [
+        "--modes",
+        "restart"
+      ],
+      "exit": 1,
+      "outputExists": false,
+      "baseExists": false,
+      "passed": true
+    }
+  ]
+}

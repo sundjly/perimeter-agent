@@ -1,0 +1,59 @@
+{
+  "recordedAt": "2026-10-22T14:13:59.393Z",
+  "measurementSourceRevision": "c66c785bc71d7539aaa2e0520fc0d8bb06a1b8e4",
+  "measurementExport": "/tmp/perimeter-s5d-measure-0fFHKcC3/w/tree",
+  "reportGeneratorWasUncommittedAtMeasurement": true,
+  "finalConversionCommand": [
+    "node",
+    "scripts/s5-token-benchmark.ts",
+    "--from-report",
+    "docs/s5/s5-base-report.json",
+    "--revision",
+    "c66c785bc71d7539aaa2e0520fc0d8bb06a1b8e4",
+    "--output",
+    "docs/s5/s5-token-benchmark.json"
+  ],
+  "sourceHashes": {
+    "src/evals/s5-token-benchmark.ts": "5d25fba2df8b853de0826b984364e27c4ab9d1e3311d03875e6478fdab519749",
+    "scripts/s5-token-benchmark.ts": "8aa1da95e611cd111a6c02894182a039b4970e18aa5e1a415c3c5d33de3ed3cd",
+    "tests/s5-token-benchmark.test.ts": "748846343026d79ce3c9a82627bb378d3dd0eba55bacdd910ebb2f3ce4914281"
+  },
+  "pipelineHashes": {
+    "src/evals/benchmark-runner.ts": {
+      "sha256": "f84c846a62e9afa4813accdd94e66b37cc3e919e7c61d779b9074b23a3e9748f",
+      "identicalToMeasuredExport": true
+    },
+    "src/evals/benchmark-pipeline.ts": {
+      "sha256": "62031faf9aae4628132633235d26083888010a7889ac1162a920798ff2338953",
+      "identicalToMeasuredExport": true
+    },
+    "src/evals/benchmark-fixtures.ts": {
+      "sha256": "01ba1a9264b8c4c367fc7613dc5d5189e636fbf2df35d03c7074fc612cbce2e8",
+      "identicalToMeasuredExport": true
+    }
+  },
+  "artifactHashes": {
+    "docs/s5/s5-base-report.json": "2722fb1747e1b7bb2588e8d6ce4d67756f6fad2610d6703b58c471359d0b88eb",
+    "docs/s5/s5-token-benchmark.json": "bae2382b6c9e7accfedcbf723bc0fabf9d1000701e2e14f4a19bc429512e412e",
+    "docs/s5/evidence/run.log": "a64d7bd4b86216d59f76d749a9c6c630a40d938b299d106cfff2f8d7a7322f94",
+    "docs/s5/evidence/unit.tap": "974e96e28092337691830cde5ab40c0838e78d7819ed329c0a985b454f5e8dc8",
+    "docs/s5/evidence/invalid-cli-results.json": "cce300cfcacaf9589c313ac20047baf70f43c0c08aea28ce6344c332d98d4634"
+  },
+  "suiteHash": "c704f6c3b8e61d0d013fe93fab21f4dd9acf889d8aa25bdb7f14e45c283860cc",
+  "validation": {
+    "unitTests": 9,
+    "unitPassed": 9,
+    "typecheckExit": 0,
+    "invalidCliCases": 12,
+    "invalidCliPassed": 12,
+    "actualMeasurements": 270,
+    "actualPassed": 270
+  },
+  "limits": [
+    "Local mock/LocalBackend only; source revision marks measurement pipeline, source hashes bind added final generator",
+    "recovery duration is recTime+200 or constant250, not actual task wall clock",
+    "runner RSS only; no Gateway/Harness memory measurement",
+    "runner residue unknown, no cleanup signals; cannot claim complete process-tree clearance",
+    "real cost/cache/retries/compaction/optimization gates unknown or external_blocked"
+  ]
+}
