@@ -1,7 +1,7 @@
 /** 自有协议的纯 reducer，两端共用。 */
 export function initialState() {
 	return { sessionId: "", model: null, streaming: false, messages: [], tools: [], inbox: [], approvals: [], participants: [],
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "viewer", errors: [], phase: "" };
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, cacheHitRate: null }, audit: [], role: "viewer", errors: [], phase: "", history: null };
 }
 /** @param {import("./view-model.js").ViewState} state @param {import("../src/protocol/types.ts").ClientEvent} event */
 export function reduce(state, event) {
@@ -17,9 +17,13 @@ export function reduce(state, event) {
 		case "agent.settled": next.streaming = false; next.phase = ""; break;
 		case "agent.status": next.phase = event.detail; break;
 		case "message.start": {
+			// S5a：服务端权威历史在增长时，客户端持有的 total 同步 +1（替换同 id 不算新增），
+			// 否则尾页元信息在下一次快照/分页前是陈旧的
+			const isNew = !next.messages.some((item) => item.id === event.messageId);
 			next.messages = next.messages.filter((item) => item.id !== event.messageId);
 			next.messages.push({ id: event.messageId, order: event.order, role: event.role,
 				...(event.actor !== undefined ? { actor: event.actor } : {}), text: "", thinking: "" });
+			if (next.history && isNew) next.history = { ...next.history, total: next.history.total + 1 };
 			break;
 		}
 		case "message.text": { const message = next.messages.find((item) => item.id === event.messageId); if (message) message.text += event.delta; break; }
@@ -59,6 +63,20 @@ export function reduce(state, event) {
 		case "policy.denied": { const tool = next.tools.find((item) => item.callId === event.callId); if (tool) { tool.ok = false; tool.output = `策略拒绝（${event.rule}）：${event.reason}`; } break; }
 		case "audit.entry": next.audit = [...state.audit, event.entry].slice(-100); break;
 		case "usage": next.usage = event.usage; break;
+		case "history.page": {
+			// S5a：更早的历史向前 prepend，按 id 去重（重试/重连可能拿到重叠页，同一页内的
+			// 重复项同样只保留首次出现）；历史元信息以服务端应答为准，cursor 为空表示已到最早
+			const known = new Set(next.messages.map((item) => item.id));
+			const older = [];
+			for (const item of event.items) {
+				if (known.has(item.id)) continue;
+				known.add(item.id);
+				older.push(item);
+			}
+			next.messages = [...older, ...next.messages];
+			next.history = { total: event.total, oldestIncluded: event.oldestIncluded, cursor: event.cursor };
+			break;
+		}
 		case "error": next.errors = [...state.errors, event.message].slice(-100); break;
 	}
 	return next;

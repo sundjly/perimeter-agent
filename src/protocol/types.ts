@@ -37,6 +37,9 @@ export type ClientEvent =
 	/** S3b：显式创建的定向应答（只发回发起连接，不广播、不带 seq）。replayed=true 表示
 	 * 命中既有收据原样返回；stage/outcome 如实透传收据（outcome_unknown 不当成功） */
 	| { type: "session.created"; operationId: string; requestId: string; sessionId: string; stage: string; outcome: string; replayed: boolean }
+	/** S5a：历史分页应答。只定向发回发起连接（不广播）；items 按「旧→新」排列，
+	 * total/oldestIncluded 是服务端当前权威元信息，cursor 为空表示已到最早 */
+	| { type: "history.page"; items: MessageView[]; total: number; oldestIncluded: number; cursor: string | null }
 	| { type: "error"; code: ErrorCode; message: string };
 
 /**
@@ -73,6 +76,7 @@ export const CLIENT_EVENT_TYPES = [
 	"audit.entry",
 	"usage",
 	"session.created",
+	"history.page",
 	"error",
 ] as const;
 
@@ -99,7 +103,9 @@ export type ClientCommand =
 	/** S3b：显式创建会话。operationId 是幂等键（按 principal 作用域隔离）；requestHash
 	 * 是客户端对创建内容的指纹（缺省按空内容记账），同键不同内容固定拒绝 */
 	| { type: "create"; operationId: string; requestHash?: string }
-	;;
+	/** S5a：向更早方向翻页。cursor 由服务端签发（绑定 sessionId 的不透明 HMAC 串），
+	 * limit 可省略（取服务端 tail 项数上限）。只读命令：任何成员角色可发 */
+	| { type: "history.page"; sessionId: string; cursor: string; limit?: number };
 
 export type Decision = "allow" | "deny";
 
@@ -145,10 +151,18 @@ export interface AuditEntryView {
 
 export type Role = "owner" | "editor" | "approver" | "viewer";
 export interface Participant { actor: string; role: Role; clients: number }
-export interface MessageView { id: string; order?: number; role: "user" | "assistant"; text: string; thinking: string; actor?: string }
+/** S5a：单条消息的截断标记——文本/思考超过单项上限时按确定性规则裁剪，原始字节长度保留 */
+export interface MessageView { id: string; order?: number; role: "user" | "assistant"; text: string; thinking: string; actor?: string; truncated?: boolean; originalBytes?: number }
+/** S5a/S5a2：快照与分页应答携带的历史元信息。oldestIncluded 是尾页首条在服务端
+ * 权威 messages 数组中的下标（常态追加只增；durable 压缩会 splice 前缀并前置摘要
+ * 重构数组，此时旧游标按锚点核对固定失效，不静默错位）；cursor 指向「比它更早」
+ * 的一页，由服务端签发并绑定 sessionId+边界锚点，客户端只能原样回传 */
+export interface SessionHistoryMeta { total: number; oldestIncluded: number; cursor: string | null }
 export interface ToolView { callId: string; order?: number; action: ActionDescriptor; output: string; ok?: boolean }
 export interface SessionView {
 	sessionId: string; model: string | null; streaming: boolean; messages: MessageView[]; tools: ToolView[];
 	inbox: { id: string; mode: string }[]; approvals: { approvalId: string; action: ActionDescriptor; reason: string; actor?: string; expiresAt: number; argsHash?: string }[];
 	participants: Participant[]; usage: Usage; audit: AuditEntryView[]; role: Role;
+	/** S5a：快照为有界尾页时必带；全量快照（旧服务端）缺省 */
+	history?: SessionHistoryMeta;
 }

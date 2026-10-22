@@ -1,10 +1,11 @@
 import { initialState, reduce, type ViewState } from "../../web/view-model.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { AuditLog, contentHash, type AuditEntry } from "../audit/log.ts";
-import type { ClientCommand, ClientEvent, SessionView, Role } from "../protocol/types.ts";
+import type { ClientCommand, ClientEvent, SessionView, Role, MessageView } from "../protocol/types.ts";
+import { HISTORY_MAX_PAGE_ITEMS } from "../protocol/validate.ts";
 import { isSafeScopedIdentityValue, mintScopedToken } from "../modelgw/scoped-token.ts";
 import { HarnessHost } from "../runtime/harness-host.ts";
 import type { ModelGateway } from "../runtime/models.ts";
@@ -44,9 +45,18 @@ export interface SessionOptions {
 	/** S3c：prompt 幂等账本条目上限。超限固定拒绝新任务（**不淘汰旧键**——淘汰会让同键重复生成
 	 * 变成无提示窗口）；默认 10_000，需运维归档轮替。网关构造期校验正整数 */
 	promptLedgerMaxEntries?: number;
+	/** S5a：初始快照 tail 与每页历史的上限（项数与序列化字节，取更严）。默认 200 项 / 1MiB
+	 * （handoff §3.2）。配置需保证 maxBytes + 单项截断余量 < 网关 maxFrameBytes，否则快照帧必超限 */
+	historyTail?: { maxItems?: number; maxBytes?: number };
 }
 
 const DEFAULT_PROMPT_LEDGER_MAX_ENTRIES = 10_000;
+
+/** S5a：初始 tail 与单页的默认上限（handoff §3.2：初始 tail 200 项且 ≤1MiB） */
+const DEFAULT_HISTORY_TAIL_ITEMS = 200;
+const DEFAULT_HISTORY_TAIL_BYTES = 1024 * 1024;
+/** S5a：单项展示上限（text/thinking 各自按 UTF-8 字节裁剪，码点边界对齐），超限带 truncated 标记与原始长度 */
+export const HISTORY_MAX_ITEM_BYTES = 64 * 1024;
 
 /**
  * S4c：模型 scoped 凭证的短 TTL（10min）—— 被窃凭证的可用窗口有界；tokenProvider
@@ -70,12 +80,29 @@ export class Session {
 	/** S3b：prompt 幂等账本（key=actor+requestId → 内容 hash），随 durable 提交前落盘，跨重启有效 */
 	#promptLedger?: Map<string, string>;
 	#ledgerFile: string;
+	/** S5a：有界 tail/每页上限与游标签发密钥（密钥只在网关进程内存，每会话实例随机） */
+	#tailItems: number;
+	#tailBytes: number;
+	#historyCursorKey: Buffer;
 	constructor(opts: SessionOptions) {
 		this.#opts = opts;
 		this.#aclVersion = opts.aclVersion ?? 1;
 		this.#backend = opts.backend ?? new LocalBackend();
 		// 与 HarnessHost 的 sqlite 默认目录同一推导，保证账本与转录同生命周期
 		this.#ledgerFile = join(opts.stateDirectory ?? join(opts.workspace, "..", ".state", opts.sessionId), "prompt-ledger.json");
+		// S5a：tail 上限配置构造期 fail-fast（与 promptLedgerMaxEntries 同尺）
+		const tail = opts.historyTail;
+		if (tail !== undefined) {
+			for (const [name, value] of Object.entries(tail)) {
+				if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`配置非法：historyTail.${name} 必须为正整数`);
+			}
+		}
+		this.#tailItems = tail?.maxItems ?? DEFAULT_HISTORY_TAIL_ITEMS;
+		this.#tailBytes = tail?.maxBytes ?? DEFAULT_HISTORY_TAIL_BYTES;
+		// S5a/S5a2：游标 HMAC 密钥。签名覆盖 sessionId+idx+锚消息 id：伪造/篡改/跨会话
+		// 一律验签失败；权威数组重构（durable 压缩 splice 前缀）由锚点核对检出、固定失效。
+		// 网关重启或会话回收后旧游标同样失效（客户端重新 attach 取新尾页），不持久化 —— 导航态不值得密钥管理
+		this.#historyCursorKey = randomBytes(32);
 		mkdirSync(opts.workspace, { recursive: true });
 	}
 	get sessionId(): string { return this.#opts.sessionId; }
@@ -274,9 +301,78 @@ export class Session {
 		return { ...view, audit: [...this.#audit] };
 	}
 
+	// ── S5a：有界快照与历史分页（handoff §3.2：初始 tail 200 项且 ≤1MiB，超限返回分页游标）──
+
+	/** 单条超大消息按确定性规则裁剪（每字段 ≤HISTORY_MAX_ITEM_BYTES，UTF-8 码点边界对齐），
+	 * 带 truncated 标记与原始字节长度 —— 不让单项撑爆 tail 预算与帧上限 */
+	#clipMessage(message: MessageView): MessageView {
+		const textBytes = Buffer.byteLength(message.text, "utf8");
+		const thinkingBytes = Buffer.byteLength(message.thinking, "utf8");
+		if (textBytes <= HISTORY_MAX_ITEM_BYTES && thinkingBytes <= HISTORY_MAX_ITEM_BYTES) return message;
+		const clip = (s: string, bytes: number): string => {
+			if (bytes <= HISTORY_MAX_ITEM_BYTES) return s;
+			const buf = Buffer.from(s, "utf8");
+			let end = HISTORY_MAX_ITEM_BYTES;
+			while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+			return buf.subarray(0, end).toString("utf8");
+		};
+		return { ...message, text: clip(message.text, textBytes), thinking: clip(message.thinking, thinkingBytes),
+			truncated: true, originalBytes: textBytes + thinkingBytes };
+	}
+
+	/** 从数组尾部向前收集：条数与序列化字节双上限（取更严）；最新一项始终保留，
+	 * 否则配小上限时空会话没有可渲染内容。返回的 oldestIncluded 是首项在原数组中的下标 */
+	#boundedTail(messages: MessageView[], maxItems: number, maxBytes: number): { items: MessageView[]; oldestIncluded: number } {
+		const clipped = messages.map((message) => this.#clipMessage(message));
+		let start = messages.length;
+		let count = 0;
+		let bytes = 0;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const size = Buffer.byteLength(JSON.stringify(clipped[i]), "utf8");
+			if (count > 0 && (count + 1 > maxItems || bytes + size > maxBytes)) break;
+			count++;
+			bytes += size;
+			start = i;
+		}
+		return { items: clipped.slice(start), oldestIncluded: start };
+	}
+
+	/** 对外快照视图：内部 #view 保持全量（权威历史留在服务端），只有出口被裁成有界尾页并附历史元信息 */
+	#outboundView(view: SessionView): SessionView {
+		const { items, oldestIncluded } = this.#boundedTail(view.messages, this.#tailItems, this.#tailBytes);
+		return { ...view, messages: items,
+			history: { total: view.messages.length, oldestIncluded, cursor: oldestIncluded > 0 ? this.#mintCursor(oldestIncluded) : null } };
+	}
+
+	/** S5a2：游标 v2 —— 语义是「messages[idx] 之前的全部条目」，签名与锚点绑定：anchor
+	 * 取 messages[idx-1].id（被游标覆盖范围的最新一条；idx ≥ 1 时必存在，且不会是生成中的
+	 * "live" —— live 恒在数组末尾、只会被包含在尾页内）。常态追加不动该位置；pi-durable
+	 * 压缩会 splice 前缀并前置摘要，重构后锚失配 → 验证固定失效。anchor 随游标携带
+	 * （本就是客户端可见的 MessageView.id，无新增泄漏），验证时与当前数组核对 */
+	#mintCursor(idx: number): string {
+		const anchor = this.#view?.messages[idx - 1]?.id ?? "";
+		const sig = createHmac("sha256", this.#historyCursorKey).update(`${this.sessionId}\u0000history\u0000${idx}\u0000${anchor}`).digest("hex").slice(0, 32);
+		return `v2.${idx}.${anchor}.${sig}`;
+	}
+
+	/** S5a2：invalid=形状/签名不通过（伪造/篡改/跨会话）。签名只证「游标出自本会话且未被
+	 * 改」；「指向的结构是否还在」（锚点与当前权威数组是否一致）由 #historyPage 核对，
+	 * 失配属 stale → 也固定类别、不返回任何数据 */
+	#verifyCursor(cursor: string): { state: "ok"; idx: number; anchor: string } | { state: "invalid" } {
+		const match = /^v2\.(\d{1,12})\.([A-Za-z0-9_-]{1,64})\.([0-9a-f]{32})$/.exec(cursor);
+		if (!match) return { state: "invalid" };
+		const idx = Number(match[1]);
+		const anchor = match[2]!;
+		const expected = createHmac("sha256", this.#historyCursorKey).update(`${this.sessionId}\u0000history\u0000${idx}\u0000${anchor}`).digest("hex").slice(0, 32);
+		const got = Buffer.from(match[3]!, "hex");
+		const want = Buffer.from(expected, "hex");
+		if (got.length !== want.length || !timingSafeEqual(got, want)) return { state: "invalid" };
+		return { state: "ok", idx, anchor };
+	}
+
 	handle(cmd: ClientCommand, actor = this.#opts.actor, _from?: unknown): void {
 		this.#lastActivity = Date.now();
-		if (!cmd || typeof cmd !== "object" || !["prompt", "steer", "approve", "abort"].includes(cmd.type)) {
+		if (!cmd || typeof cmd !== "object" || !["prompt", "steer", "approve", "abort", "history.page"].includes(cmd.type)) {
 			this.#emit({ type: "error", code: "command_failed", message: "非法命令" }); return;
 		}
 		const role = this.#opts.getRole?.(actor);
@@ -293,6 +389,18 @@ export class Session {
 		if (!this.#alive) { this.#emit({ type: "error", code: "agent_error", message: "会话已关闭，请重新接入" }); return; }
 		if (this.#opts.isAuthorized && !this.#opts.isAuthorized(actor)) {
 			this.#emit({ type: "error", code: "command_failed", message: "资源权限已撤销" }); return;
+		}
+		if (cmd.type === "history.page") {
+			// S5a：只读分页 —— 任何成员角色（含 viewer）可读；不进队列（排队语义只对写命令有意义），
+			// 未就绪固定拒绝；错误只定向回发起连接（与分页应答同一通道，不广播）
+			if (!this.#host) { this.#opts.send({ type: "error", code: "command_failed", message: "会话尚未就绪（固定类别）" }, ++this.#seq, _from); return; }
+			void this.#historyPage(cmd, _from).catch((error: unknown) => {
+				// 已知的固定类别拒绝（游标无效/会话不匹配）保留原文；未知异常不透传内部细节
+				const known = error instanceof Error && error.message.includes("固定类别");
+				this.#opts.send({ type: "error", code: "command_failed",
+					message: known ? (error as Error).message : "历史分页失败（固定类别）" }, ++this.#seq, _from);
+			});
+			return;
 		}
 		if (!this.#host) {
 			if (cmd.type === "abort") this.#queued.length = 0;
@@ -379,10 +487,50 @@ export class Session {
 		}
 	}
 
+	/** S5a/S5a2：向更早方向翻一页。游标 HMAC 绑定 sessionId+idx+锚消息 id（timing-safe）。
+	 * idx 边界在「常态追加」下稳定：新消息只追加、既有条目只原地更新（message.end 原地
+	 * 换 id），分页期间的新消息不会造成重复或跳项；但追加-only 不是不变量 —— pi-durable
+	 * 压缩会 splice 权威前缀并前置摘要（vendor view.js:132-138），重构由锚点核对检出，
+	 * 旧游标固定类别失效（不静默错位）。页条数/字节上限与初始 tail 同尺 */
+	async #historyPage(cmd: Extract<ClientCommand, { type: "history.page" }>, from?: unknown): Promise<void> {
+		if (cmd.sessionId !== this.sessionId) throw new Error("会话不匹配（固定类别）");
+		const messages = this.#view?.messages ?? [];
+		const total = messages.length;
+		const verified = this.#verifyCursor(cmd.cursor);
+		if (verified.state === "invalid") throw new Error("游标无效（固定类别）");
+		// 锚点核对：当前数组 idx-1 位置的 id 必须与签发时一致，且 idx 不越界 —— 不一致
+		// 说明权威数组已被重构（如 durable 压缩 splice 前缀），旧游标指向的内容不可再定位
+		if (verified.idx > total || (messages[verified.idx - 1]?.id ?? "") !== verified.anchor) {
+			throw new Error("游标已失效，请重新接入（固定类别）");
+		}
+		const idx = verified.idx;
+		const limit = Math.min(cmd.limit ?? this.#tailItems, this.#tailItems, HISTORY_MAX_PAGE_ITEMS);
+		// 从 idx-1 向更早收集，条数/字节双上限，至少一项（idx>0 时），保证客户端总能前进
+		const items: MessageView[] = [];
+		let start = idx;
+		let bytes = 0;
+		for (let i = idx - 1; i >= 0; i--) {
+			const item = this.#clipMessage(messages[i]!);
+			const size = Buffer.byteLength(JSON.stringify(item), "utf8");
+			if (items.length > 0 && (items.length + 1 > limit || bytes + size > this.#tailBytes)) break;
+			items.unshift(item);
+			bytes += size;
+			start = i;
+		}
+		// 定向应答（只发回发起连接，不广播）：历史对各成员相同，但没必要让所有端都收一份
+		this.#opts.send({ type: "history.page", items, total, oldestIncluded: start,
+			cursor: start > 0 ? this.#mintCursor(start) : null }, ++this.#seq, from);
+	}
+
 	#emit(event: ClientEvent): void {
 		if (this.#view) this.#view = reduce(this.#view, event);
-		if (event.type === "session.snapshot") event.view = { ...event.view, audit: [...this.#audit] };
 		if (event.type === "audit.entry") { this.#audit.push(event.entry); if (this.#audit.length > 100) this.#audit.shift(); }
+		if (event.type === "session.snapshot") {
+			// S5a：内部 #view 吃全量（上面 reduce 已完成），出口换成有界尾页 ——
+			// 长会话/慢端不再被整段历史撑爆单帧（maxFrameBytes 超限会 1009 断连）
+			this.#opts.send({ type: "session.snapshot", view: this.#outboundView({ ...event.view, audit: [...this.#audit] }) }, ++this.#seq);
+			return;
+		}
 		this.#opts.send(event, ++this.#seq);
 	}
 	publish(event: ClientEvent): void { this.#emit(event); }
@@ -396,7 +544,7 @@ export class Session {
 	async snapshotFrame(deliver?: (frame: { seq: number; event: ClientEvent }) => void): Promise<{ seq: number; event: ClientEvent }> {
 		for (;;) {
 			const seq = this.#seq;
-			const view = await this.snapshot();
+			const view = this.#outboundView(await this.snapshot());
 			if (seq === this.#seq) {
 				const frame = { seq, event: { type: "session.snapshot" as const, view } };
 				deliver?.(frame);

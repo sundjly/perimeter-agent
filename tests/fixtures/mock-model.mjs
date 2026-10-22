@@ -9,13 +9,15 @@
  *
  * 用法：node mock-model.mjs <port> <scriptJson>
  * script 形如 [{ "tool": "bash", "args": {...} }, { "text": "done" }]，
- * 第 N 次请求返回第 N 条。
+ * 第 N 次请求返回第 N 条。scriptJson 以 @ 开头时改为从该路径读 JSON 文件
+ * （大脚本经 argv 会撞 E2BIG，S5a 长历史测试用；不以 @ 开头时行为不变）。
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 
 const port = Number(process.argv[2] ?? 0);
-const script = JSON.parse(process.argv[3] ?? "[]");
+const scriptArg = process.argv[3] ?? "[]";
+const script = JSON.parse(scriptArg.startsWith("@") ? readFileSync(scriptArg.slice(1), "utf8") : scriptArg);
 let turn = 0;
 
 function sse(res, obj) {

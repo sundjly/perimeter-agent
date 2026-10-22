@@ -124,6 +124,11 @@ export interface GatewayConfig {
 	receiptTtlMs?: number;
 	/** S3c：prompt 幂等账本条目上限；超限固定拒绝新任务（不淘汰，避免同键重复生成无提示）。默认 10_000 */
 	promptLedgerMaxEntries?: number;
+	/** S5a：初始快照 tail 与每页历史的上限（项数/序列化字节；默认 200 项 / 1MiB，handoff §3.2）。透传给每个 Session */
+	historyTail?: { maxItems?: number; maxBytes?: number };
+	/** S5a2：会话构造后的探针（仅供测试/故障注入：拿到 Session 实例以注入重构快照等；
+	 * 生产不配置，零行为影响；先例 createStageProbe） */
+	sessionProbe?: (session: Session) => void;
 	/**
 	 * S3c：外部持有的审计实例（测试/故障注入缝；生产不配置，走 auditFile 自开）。
 	 * 网关 close 会顺带 close 它（AuditLog.close 幂等）；open 失败语义与自开一致。
@@ -310,6 +315,16 @@ export class Gateway {
 		}
 		if (cfg.promptLedgerMaxEntries !== undefined && (!Number.isSafeInteger(cfg.promptLedgerMaxEntries) || cfg.promptLedgerMaxEntries <= 0)) {
 			throw new Error("配置非法：promptLedgerMaxEntries 必须为正整数");
+		}
+		// S5a：tail 上限配置校验。maxBytes 必须给单项截断与信封留余量，否则快照帧
+		// 必然撞 maxFrameBytes（1009 断连）—— 那正是本机制要消除的失效模式
+		if (cfg.historyTail !== undefined) {
+			for (const [name, value] of Object.entries(cfg.historyTail)) {
+				if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`配置非法：historyTail.${name} 必须为正整数`);
+			}
+			if (cfg.historyTail.maxBytes !== undefined && cfg.historyTail.maxBytes > this.#limits.maxFrameBytes - 256 * 1024) {
+				throw new Error("配置非法：historyTail.maxBytes 过大：必须小于 maxFrameBytes 减去单项截断余量（256KiB）");
+			}
 		}
 
 		if (cfg.mode === "production") {
@@ -1314,6 +1329,8 @@ export class Gateway {
 			policyFile: this.#cfg.policyFile,
 			audit: this.#audit,
 			...(this.#cfg.promptLedgerMaxEntries !== undefined ? { promptLedgerMaxEntries: this.#cfg.promptLedgerMaxEntries } : {}),
+			// S5a：有界 tail/分页上限透传（未配置时用 Session 默认 200 项 / 1MiB）
+			...(this.#cfg.historyTail !== undefined ? { historyTail: this.#cfg.historyTail } : {}),
 			model: this.#cfg.model,
 			// S4c：scoped 签发密钥下发到会话（Session #start 内按调用 mint；未配置时零影响）
 			...(this.#modelScopedKey !== undefined ? { modelScopedKey: this.#modelScopedKey } : {}),
@@ -1368,6 +1385,8 @@ export class Gateway {
 		metas.set(session, { file: metaFile, data: metadata });
 		this.#sessions.set(sessionId, session);
 		this.#owners.set(sessionId, actor);
+		// S5a2：测试/故障注入缝（生产不配置，零行为影响）
+		this.#cfg.sessionProbe?.(session);
 		return { session, metadata };
 	}
 
@@ -2431,6 +2450,15 @@ function attach(ws: WebSocket, session: Session, actor: string, opts: AttachOpts
 				const role = roleOf(meta.data, actor);
 				if (!role || role === "viewer" || role === "approver") { sendError("无权创建会话：只有 owner 与 editor 可创建"); return; }
 				opts.handleCreate?.(conn, cmd, actor);
+				return;
+			}
+			if (cmd.type === "history.page") {
+				// S5a：只读历史分页 —— 与 attach 同一资源门（上方 isAuthorized 已过），任何成员角色
+				// （含 viewer）可读；不写命令审计（高频读操作不刷审计链）。连接与会话一一对应：
+				// 命令里的 sessionId 必须就是本会话，跨会话固定拒绝（不泄漏其他会话的存在性）
+				if (!roleOf(meta.data, actor)) { sendError("无权读取该会话（固定类别）"); return; }
+				if (cmd.sessionId !== session.sessionId) { sendError("history.page 会话不匹配（固定类别）"); return; }
+				session.handle(cmd, actor, conn);
 				return;
 			}
 			session.auditCommand(actor, cmd.type);

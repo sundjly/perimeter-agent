@@ -53,6 +53,11 @@ const handleLine = (line: string): void => {
 	if (!wsOpen) { pendingLines.push(line); return; }
 	if (ws.readyState !== ws.OPEN) return;
 	if (line === "/abort") ws.send(JSON.stringify({ type: "abort" }));
+	else if (line === "/older") {
+		// S5a：向更早翻一页；没有游标（已到最早或快照未带 history）时明确告知
+		if (state.history?.cursor) ws.send(JSON.stringify({ type: "history.page", sessionId: state.sessionId, cursor: state.history.cursor }));
+		else print("没有更早的历史了");
+	}
 	else if (line.startsWith("/share ")) { const [, actor, role] = line.split(" "); ws.send(JSON.stringify({ type: "share", actor, role })); }
 	else if (line.startsWith("/unshare ")) ws.send(JSON.stringify({ type: "unshare", actor: line.slice(9) }));
 	else if (line.startsWith("/approve ")) { const [, approvalId, decision] = line.split(" "); ws.send(JSON.stringify({ type: "approve", approvalId, decision })); }
@@ -61,7 +66,7 @@ const handleLine = (line: string): void => {
 input.on("line", handleLine);
 ws.on("open", () => {
 	wsOpen = true;
-	print(labels.connected, "输入消息；/steer 文本；/approve id allow|deny；/abort；/share actor editor|approver|viewer；/unshare actor");
+	print(labels.connected, "输入消息；/steer 文本；/approve id allow|deny；/abort；/share actor editor|approver|viewer；/unshare actor；/older 加载更早历史");
 	for (const line of pendingLines.splice(0)) handleLine(line); // open 后按序补发排队命令
 	if (pendingCloseAfterFlush) ws.close(); // stdin 已结束：补发完再关（管道输入时序）
 });
@@ -72,9 +77,16 @@ ws.on("message", (raw) => {
 	if (frame.event.type === "usage") print(`token ${state.usage.total} · 缓存 ${state.usage.cacheHitRate === null ? "—" : (state.usage.cacheHitRate * 100).toFixed(1) + "%"}`);
 	if (frame.event.type === "session.snapshot") {
 		if (attached !== state.sessionId + state.role) { print(`会话 ${state.sessionId} · ${state.role}`); attached = state.sessionId + state.role; }
+	}
+	// S5a：快照与分页应答共用同一套已见去重打印（shownMessages 按 id+文本去重），
+	// 向前 prepend 的更早消息依序补印
+	if (frame.event.type === "session.snapshot" || frame.event.type === "history.page") {
 		for (const message of state.messages) if (message.text && message.id !== "live" && shownMessages.get(message.id) !== message.text) {
-			print(message.actor ?? message.role, message.text); shownMessages.set(message.id, message.text);
+			print(message.actor ?? message.role, message.text, message.truncated ? `（已截断，原始 ${message.originalBytes} 字节）` : "");
+			shownMessages.set(message.id, message.text);
 		}
+	}
+	if (frame.event.type === "session.snapshot") {
 		for (const tool of state.tools) if (shownTools.get(tool.callId) !== tool.output) {
 			print(tool.action.tool, tool.action.command ?? tool.action.path, tool.ok === false ? labels.deny : "", tool.output);
 			shownTools.set(tool.callId, tool.output);

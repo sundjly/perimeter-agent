@@ -9,6 +9,7 @@ let state = initialState();
 let ws;
 let connected = false;
 const expanded = new Set();
+let loadingOlder = false;
 function node(tag, text, className = "") {
 	const element = document.createElement(tag);
 	element.textContent = text;
@@ -22,6 +23,18 @@ function render(state) {
 	$("usage").textContent = `token ${state.usage.total} · 缓存 ${state.usage.cacheHitRate == null ? "—" : (100 * state.usage.cacheHitRate).toFixed(1) + "%"}`;
 	const stream = $("stream");
 	const children = [];
+	// S5a：还有更早的历史时置顶「加载更早」（textContent + onclick，CSP 同源约束不变）
+	if (state.history?.cursor) {
+		const older = node("button", labels.loadOlder, "ghost");
+		older.disabled = !connected || loadingOlder;
+		older.onclick = () => {
+			if (loadingOlder || !state.history?.cursor) return;
+			loadingOlder = true;
+			send({ type: "history.page", sessionId: state.sessionId, cursor: state.history.cursor });
+			render(state);
+		};
+		children.push({ order: -Infinity, element: older });
+	}
 	for (const message of state.messages) if (message.text || message.thinking) children.push({ order: message.order ?? 0, element: node("div", `${message.actor ?? (message.role === "user" ? "用户" : "助手")}\n${message.text}`, `msg ${message.role}`) });
 	for (const tool of state.tools) {
 		const card = node("details", "", `tool ${tool.ok === false ? "deny" : "info"}`);
@@ -94,6 +107,8 @@ async function connect() {
 		const frame = JSON.parse(data);
 		if (frame.event) {
 			state = reduce(state, frame.event);
+			// S5a：分页应答（或失败）后恢复按钮；错误也算一次失败尝试，不把按钮卡死
+			if (frame.event.type === "history.page" || frame.event.type === "error") loadingOlder = false;
 			if (state.sessionId) {
 				params.set("session", state.sessionId);
 				history.replaceState(null, "", "?" + params.toString());
